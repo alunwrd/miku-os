@@ -33,7 +33,7 @@ impl MikuFS {
                 self.journal_inode_metadata(new_ino)?;
                 let new_group = ((new_ino - 1) / self.inodes_per_group) as usize;
                 if new_group != group { self.journal_group_metadata(new_group)?; }
-                self.ext3_commit_txn()?;
+                // commit deferred to pdflush
                 Ok(new_ino)
             }
             Err(e) => { self.ext3_abort_txn(); Err(e) }
@@ -71,7 +71,7 @@ impl MikuFS {
                 self.journal_inode_metadata(new_ino)?;
                 let new_group = ((new_ino - 1) / self.inodes_per_group) as usize;
                 if new_group != group { self.journal_group_metadata(new_group)?; }
-                self.ext3_commit_txn()?;
+                // commit deferred to pdflush
                 Ok(new_ino)
             }
             Err(e) => { self.ext3_abort_txn(); Err(e) }
@@ -107,7 +107,7 @@ impl MikuFS {
             Ok(n) => {
                 let group = ((inode_num - 1) / self.inodes_per_group) as usize;
                 self.journal_group_metadata(group)?;
-                self.ext3_commit_txn()?;
+                // commit deferred to pdflush
                 Ok(n)
             }
             Err(e) => { self.ext3_abort_txn(); Err(e) }
@@ -128,7 +128,7 @@ impl MikuFS {
             Ok(n) => {
                 let group = ((inode_num - 1) / self.inodes_per_group) as usize;
                 self.journal_group_metadata(group)?;
-                self.ext3_commit_txn()?;
+                // commit deferred to pdflush
                 Ok(n)
             }
             Err(e) => { self.ext3_abort_txn(); Err(e) }
@@ -173,7 +173,10 @@ impl MikuFS {
         };
 
         match result {
-            Ok(()) => { self.ext3_commit_txn()?; Ok(()) }
+            Ok(()) => {
+                // commit deferred to pdflush
+                Ok(())
+            }
             Err(e) => { self.ext3_abort_txn(); Err(e) }
         }
     }
@@ -216,7 +219,10 @@ impl MikuFS {
         };
 
         match result {
-            Ok(()) => { self.ext3_commit_txn()?; Ok(()) }
+            Ok(()) => {
+                // commit deferred to pdflush
+                Ok(())
+            }
             Err(e) => { self.ext3_abort_txn(); Err(e) }
         }
     }
@@ -246,7 +252,7 @@ impl MikuFS {
                 if new_group != group {
                     self.journal_group_metadata(new_group)?;
                 }
-                self.ext3_commit_txn()?;
+                // commit deferred to pdflush
                 Ok(new_ino)
             }
             Err(e) => {
@@ -285,7 +291,7 @@ impl MikuFS {
 
         match result {
             Ok(()) => {
-                self.ext3_commit_txn()?;
+                // commit deferred to pdflush
                 Ok(())
             }
             Err(e) => {
@@ -320,7 +326,7 @@ impl MikuFS {
 
         match result {
             Ok(()) => {
-                self.ext3_commit_txn()?;
+                // commit deferred to pdflush
                 Ok(())
             }
             Err(e) => {
@@ -358,7 +364,7 @@ impl MikuFS {
 
         match result {
             Ok(()) => {
-                self.ext3_commit_txn()?;
+                // commit deferred to pdflush
                 Ok(())
             }
             Err(e) => {
@@ -416,7 +422,7 @@ impl MikuFS {
                     Ok(_) => {
                         self.journal_inode_metadata(ino)?;
                         self.journal_group_metadata(group)?;
-                        self.ext3_commit_txn()?;
+                        // commit deferred to pdflush
                         Ok(ino)
                     }
                     Err(e) => { self.ext3_abort_txn(); Err(e) }
@@ -462,7 +468,7 @@ impl MikuFS {
                             Ok(_) => {
                                 self.journal_inode_metadata(new_ino)?;
                                 self.journal_group_metadata(new_group)?;
-                                self.ext3_commit_txn()?;
+                                // commit deferred to pdflush
                                 Ok(new_ino)
                             }
                             Err(e) => { self.ext3_abort_txn(); Err(e) }

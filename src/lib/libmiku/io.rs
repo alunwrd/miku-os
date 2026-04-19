@@ -1,104 +1,36 @@
 use crate::sys::*;
 
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn miku_write(fd: u64, buf: *const u8, len: usize) -> i64 {
     unsafe { sc3(SYS_WRITE, fd, buf as u64, len as u64) }
 }
 
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn miku_read(fd: u64, buf: *mut u8, len: usize) -> i64 {
     unsafe { sc3(SYS_READ, fd, buf as u64, len as u64) }
 }
 
-#[no_mangle]
-pub extern "C" fn miku_print(s: *const u8) {
-    if s.is_null() { return; }
-    let len = crate::string::miku_strlen(s);
-    if len > 0 { miku_write(1, s, len); }
-}
-
-#[no_mangle]
-pub extern "C" fn miku_println(s: *const u8) {
-    miku_print(s);
-    miku_write(1, b"\n".as_ptr(), 1);
-}
-
-#[no_mangle]
-pub extern "C" fn miku_puts(s: *const u8) -> i32 {
-    miku_println(s);
-    0
-}
-
-#[no_mangle]
-pub extern "C" fn miku_putchar(c: i32) -> i32 {
-    let b = c as u8;
-    miku_write(1, &b as *const u8, 1);
-    c
-}
-
-#[no_mangle]
-pub extern "C" fn miku_getchar() -> i32 {
-    let mut b: u8 = 0;
-    let n = miku_read(0, &mut b as *mut u8, 1);
-    if n <= 0 { -1 } else { b as i32 }
-}
-
-#[no_mangle]
-pub extern "C" fn miku_readline(buf: *mut u8, max_len: usize) -> i32 {
-    if buf.is_null() || max_len < 2 { return -1; }
-    let mut pos = 0usize;
-    let limit = max_len - 1;
-    loop {
-        let mut byte: u8 = 0;
-        let n = miku_read(0, &mut byte as *mut u8, 1);
-        if n <= 0 {
-            if pos == 0 { return -1; }
-            break;
-        }
-        if byte == b'\n' || byte == b'\r' { break; }
-        if byte == 0x7F || byte == 0x08 {
-            if pos > 0 { pos -= 1; }
-            continue;
-        }
-        if byte < 0x20 { continue; }
-        if pos < limit {
-            unsafe { *buf.add(pos) = byte; }
-            pos += 1;
-        }
+pub fn write_all(fd: u64, data: &[u8]) -> i64 {
+    if data.is_empty() { return 0; }
+    let mut done = 0usize;
+    while done < data.len() {
+        let n = miku_write(fd, unsafe { data.as_ptr().add(done) }, data.len() - done);
+        if n <= 0 { return n; }
+        done += n as usize;
     }
-    unsafe { *buf.add(pos) = 0; }
-    pos as i32
+    done as i64
 }
 
-#[no_mangle]
-pub extern "C" fn miku_getline() -> *mut u8 {
-    let mut cap: usize = 128;
-    let mut buf = crate::heap::miku_malloc(cap);
-    if buf.is_null() { return core::ptr::null_mut(); }
-    let mut pos = 0usize;
-    loop {
-        let mut byte: u8 = 0;
-        let n = miku_read(0, &mut byte as *mut u8, 1);
-        if n <= 0 {
-            if pos == 0 { crate::heap::miku_free(buf); return core::ptr::null_mut(); }
-            break;
-        }
-        if byte == b'\n' || byte == b'\r' { break; }
-        if byte == 0x7F || byte == 0x08 {
-            if pos > 0 { pos -= 1; }
-            continue;
-        }
-        if byte < 0x20 { continue; }
-        if pos + 1 >= cap {
-            let new_cap = cap * 2;
-            let new_buf = crate::heap::miku_realloc(buf, new_cap);
-            if new_buf.is_null() { break; }
-            buf = new_buf;
-            cap = new_cap;
-        }
-        unsafe { *buf.add(pos) = byte; }
-        pos += 1;
+pub fn read_all(fd: u64, buf: &mut [u8]) -> i64 {
+    if buf.is_empty() { return 0; }
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = miku_read(fd, unsafe { buf.as_mut_ptr().add(done) }, buf.len() - done);
+        if n < 0 { return n; }
+        if n == 0 { break; }
+        done += n as usize;
     }
-    unsafe { *buf.add(pos) = 0; }
-    buf
+    done as i64
 }

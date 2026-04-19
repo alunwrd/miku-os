@@ -26,4 +26,6 @@ pub enum FsError {
     JournalFull,
     NotSymlink,
     LinkLoop,
+    InvalidArg,
+    PermissionDenied,
 }

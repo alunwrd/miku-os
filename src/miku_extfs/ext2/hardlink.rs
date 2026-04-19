@@ -35,8 +35,14 @@ impl MikuFS {
         target.set_links_count(target.links_count() + 1);
         let now = self.get_timestamp();
         target.set_ctime(now);
-
         self.write_inode(target_ino, &target)?;
+
+        // update parent dir timestamps
+        let mut parent = self.read_inode(parent_ino)?;
+        parent.set_mtime(now);
+        parent.set_ctime(now);
+        self.write_inode(parent_ino, &parent)?;
+
         Ok(())
     }
 
@@ -54,6 +60,13 @@ impl MikuFS {
         }
 
         self.remove_dir_entry(parent_ino, name)?;
+
+        // update parent dir timestamps
+        let now = self.get_timestamp();
+        let mut parent_inode = self.read_inode(parent_ino)?;
+        parent_inode.set_mtime(now);
+        parent_inode.set_ctime(now);
+        self.write_inode(parent_ino, &parent_inode)?;
 
         let links = inode.links_count();
         if links > 1 {

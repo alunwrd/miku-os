@@ -61,6 +61,19 @@ impl CachedLib {
     }
 }
 
+impl Drop for CachedLib {
+    fn drop(&mut self) {
+        for seg in &self.segments {
+            for &frame in &seg.frames {
+                pmm::free_frame(frame);
+            }
+        }
+        if self.elf_header_frame != 0 {
+            pmm::free_frame(self.elf_header_frame);
+        }
+    }
+}
+
 struct SoLibManager {
     libs: Vec<CachedLib>,
     search_paths: [&'static str; MAX_SEARCH_PATHS],
@@ -151,12 +164,13 @@ pub fn resolve(soname: &str) -> Option<Vec<u8>> {
                 "[solib] loaded '{}' from {} ({} bytes)",
                 soname, path_str, data.len()
             );
-            let ret = data.clone();
             let mut mgr = MANAGER.lock();
             if mgr.libs.len() < MAX_CACHED_LIBS {
+                let ret = data.clone();
                 mgr.libs.push(CachedLib::new(soname, data));
+                return Some(ret);
             }
-            return Some(ret);
+            return Some(data);
         }
     }
 
@@ -183,7 +197,7 @@ pub fn map_into_process(soname: &str, cr3: u64) -> Result<u64, i64> {
         drop(mgr);
         if !found {
             if resolve(soname).is_none() {
-                return Err(-2);
+                return Err(-2); // ENOENT
             }
         }
     }
@@ -201,18 +215,17 @@ pub fn map_into_process(soname: &str, cr3: u64) -> Result<u64, i64> {
 
     let lib = &mut mgr.libs[lib_idx];
     if lib.segments.is_empty() {
-        return Err(-22);
+        return Err(-22); // EINVAL
     }
 
     lib.load_count += 1;
     let lo = lib.lo_vaddr;
     let ehdr_frame = lib.elf_header_frame;
     let total_pages = lib.total_map_pages;
-
     let map_size = (total_pages as u64 + 1) * PAGE_SIZE;
     let base_va = match crate::mmap::kernel_find_free(cr3, map_size) {
         Some(v) => v,
-        None => return Err(-12),
+        None => return Err(-12), // ENOMEM
     };
 
     let aspace = AddressSpace::from_raw(cr3);
@@ -221,22 +234,9 @@ pub fn map_into_process(soname: &str, cr3: u64) -> Result<u64, i64> {
 
     if ehdr_frame != 0 && lo > 0 {
         let flags = PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
-        let frame = match pmm::alloc_frame() {
-            Some(f) => f,
-            None => {
-                let _ = aspace.into_raw();
-                return Err(-12);
-            }
-        };
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (ehdr_frame + hhdm) as *const u8,
-                (frame + hhdm) as *mut u8,
-                PAGE_SIZE as usize,
-            );
-        }
-        if !aspace.map_page(base_va, frame, flags) {
-            pmm::free_frame(frame);
+        pmm::ref_inc(ehdr_frame);
+        if !aspace.map_page(base_va, ehdr_frame, flags) {
+            pmm::ref_dec(ehdr_frame);
             let _ = aspace.into_raw();
             return Err(-12);
         }
@@ -250,24 +250,12 @@ pub fn map_into_process(soname: &str, cr3: u64) -> Result<u64, i64> {
             if seg.pflags & 1 == 0 {
                 flags |= PageTableFlags::NO_EXECUTE;
             }
+
             for (i, &src_frame) in seg.frames.iter().enumerate() {
                 let va = seg_va_start + (i as u64) * PAGE_SIZE;
-                let frame = match pmm::alloc_frame() {
-                    Some(f) => f,
-                    None => {
-                        let _ = aspace.into_raw();
-                        return Err(-12);
-                    }
-                };
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        (src_frame + hhdm) as *const u8,
-                        (frame + hhdm) as *mut u8,
-                        PAGE_SIZE as usize,
-                    );
-                }
-                if !aspace.map_page(va, frame, flags) {
-                    pmm::free_frame(frame);
+                pmm::ref_inc(src_frame);
+                if !aspace.map_page(va, src_frame, flags) {
+                    pmm::ref_dec(src_frame);
                     let _ = aspace.into_raw();
                     return Err(-12);
                 }
@@ -277,6 +265,7 @@ pub fn map_into_process(soname: &str, cr3: u64) -> Result<u64, i64> {
             if seg.pflags & 1 == 0 {
                 flags |= PageTableFlags::NO_EXECUTE;
             }
+            
             for i in 0..seg.num_pages {
                 let va = seg_va_start + (i as u64) * PAGE_SIZE;
                 let frame = match pmm::alloc_frame() {
@@ -286,11 +275,10 @@ pub fn map_into_process(soname: &str, cr3: u64) -> Result<u64, i64> {
                         return Err(-12);
                     }
                 };
+                
                 unsafe {
                     core::ptr::write_bytes((frame + hhdm) as *mut u8, 0, PAGE_SIZE as usize);
-                }
-                if i < seg.frames.len() {
-                    unsafe {
+                    if i < seg.frames.len() {
                         core::ptr::copy_nonoverlapping(
                             (seg.frames[i] + hhdm) as *const u8,
                             (frame + hhdm) as *mut u8,
@@ -298,6 +286,7 @@ pub fn map_into_process(soname: &str, cr3: u64) -> Result<u64, i64> {
                         );
                     }
                 }
+                
                 if !aspace.map_page(va, frame, flags) {
                     pmm::free_frame(frame);
                     let _ = aspace.into_raw();
@@ -307,19 +296,12 @@ pub fn map_into_process(soname: &str, cr3: u64) -> Result<u64, i64> {
         }
     }
 
-    if !crate::mmap::kernel_register_vma(cr3, base_va, base_va + map_size, 5) {
-        crate::serial_println!("[solib] VMA registration failed for '{}'", soname);
-    }
+    crate::mmap::kernel_register_vma(cr3, base_va, base_va + map_size, 5);
+    
     let _ = aspace.into_raw();
 
-    let shared_pages: usize = lib.segments.iter()
-        .filter(|s| !s.writable)
-        .map(|s| s.num_pages)
-        .sum();
-    let private_pages: usize = lib.segments.iter()
-        .filter(|s| s.writable)
-        .map(|s| s.num_pages)
-        .sum();
+    let shared_pages: usize = lib.segments.iter().filter(|s| !s.writable).map(|s| s.num_pages).sum();
+    let private_pages: usize = lib.segments.iter().filter(|s| s.writable).map(|s| s.num_pages).sum();
 
     crate::serial_println!(
         "[solib] mapped '{}' at {:#x} (shared={} private={} pages)",

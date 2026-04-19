@@ -52,6 +52,8 @@ mod solib;
 mod random;
 mod reloc;
 mod vfs_read;
+pub mod signal;
+pub mod mikud;
 
 unsafe extern "C" {
     static _kernel_end: u8;
@@ -69,7 +71,7 @@ unsafe extern "C" fn kernel_main_grub(mb2_phys: u64) -> ! {
 }
 
 fn kernel_main() -> ! {
-    serial_println!("[kern] MikuOS starting (Release v0.1.5)");
+    serial_println!("[kern] MikuOS starting (Release v0.2.0)");
     gdt::init();
     unsafe {
         let cr0: u64;
@@ -126,8 +128,39 @@ fn kernel_main() -> ! {
     boot_step!("Interrupts",              Ok(()));
     timing::calibrate();
     boot_step!("Timer calibration",       Ok(()));
-    scheduler::spawn_named(shell::kbd_thread,   "kbd",   2);
-    scheduler::spawn_named(shell::shell_thread, "shell", 2);
+    // Register services with mikuD
+    {
+        let mut svc = mikud::Service::empty();
+        svc.name = "kbd";
+        svc.description = "keyboard input handler";
+        svc.entry = Some(shell::kbd_thread);
+        svc.restart = mikud::RestartPolicy::Always;
+        svc.target = mikud::Target::MultiUser;
+        svc.priority = 2;
+        svc.restart_delay_ticks = mikud::service::DEFAULT_RESTART_DELAY;
+        svc.flags.critical = true;
+        svc.on_restart = Some(shell::on_kbd_restart);
+        mikud::register_service_ext(svc);
+    }
+    {
+        let mut svc = mikud::Service::empty();
+        svc.name = "shell";
+        svc.description = "interactive shell";
+        svc.entry = Some(shell::shell_thread);
+        svc.restart = mikud::RestartPolicy::Always;
+        svc.target = mikud::Target::MultiUser;
+        svc.priority = 3;
+        svc.restart_delay_ticks = mikud::service::DEFAULT_RESTART_DELAY;
+        svc.flags.critical = true;
+        svc.deps = &["kbd"];
+        svc.on_restart = Some(shell::on_shell_restart);
+        mikud::register_service_ext(svc);
+    }
+
+    // Start mikuD (PID 1 init daemon)
+    scheduler::spawn_named(mikud::mikud_main, "mikud", 1);
+    boot_step!("mikuD init daemon",        Ok(()));
+
     console::clear_screen();
     shell::init();
 

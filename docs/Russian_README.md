@@ -2,11 +2,11 @@
 
 # Miku OS
 
-**Экспериментальное ядро операционной системы на Rust**
+**Экспериментальная ОС на Rust**
 
 *Работает на Rust и нескольких разработчиках :D*
 
-<img src="https://raw.githubusercontent.com/altushkaso2/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
+<img src="https://raw.githubusercontent.com/alunwrd/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
 
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Architecture](https://img.shields.io/badge/arch-x86__64-blue.svg)]()
@@ -17,15 +17,16 @@
 
 ---
 
-> **Документация:** [Russian](docs/Russian_README.md) | [English](docs/English_README.md) | [Japanese](Japanese_README.md)
+> **Документация:** [Russian](Russian_README.md) | [English](English_README.md) | [Japanese](Japanese_README.md)
 
 ---
 
 ## О проекте
 
-**Miku OS** это UNIX-подобная операционная система, разработанная с нуля в `no_std` окружении.
+**Miku OS** это операционная система, разработанная с нуля в `no_std` окружении.
 Не использует стандартную библиотеку (`libc`), полностью контролирует железо и архитектуру памяти.
-ELF динамическая линковка, разделяемые библиотеки и userspace процессы реализованы с нуля.
+ELF динамическая линковка, разделяемые библиотеки, userspace процессы, init-демон (mikuD)
+и управление процессами (fork/exec/wait) реализованы с нуля.
 
 > Весь код написан на Rust. Ассемблер используется только для загрузчика, обработчика syscall и переключения контекста.
 
@@ -45,6 +46,168 @@ ELF динамическая линковка, разделяемые библи
 | **SSE** | CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1 |
 | **Куча** | 32 MB, linked list аллокатор |
 | **Syscall** | SYSCALL/SYSRET через MSR, naked asm обработчик, сохранение R8/R9/R10 |
+| **Сигналы** | SIGKILL (9), SIGTERM (15), SIGCHLD (17), 32-бит битовая маска |
+| **Init** | mikuD (PID 1) - systemd-подобный менеджер сервисов |
+
+---
+
+### mikuD - Init-демон
+
+<details>
+<summary><b>Развернуть</b></summary>
+
+#### Обзор
+
+mikuD это init-демон (PID 1) для MikuOS - полноценный systemd-подобный супервизор сервисов с Unix-style границами. Управляет жизненным циклом сервисов, разрешением зависимостей, таргетами (runlevels), watchdog, уведомлениями, socket activation, таймерами, запуском ELF-бинарников (ExecStart) и graceful shutdown с глобальным таймаутом.
+
+#### Таргеты (уровни работы)
+
+| Таргет | Значение | Описание |
+|:--|:--:|:--|
+| **SysInit** | 0 | Инициализация системы |
+| **MultiUser** | 1 | Многопользовательский режим (по умолчанию) |
+| **Graphical** | 2 | Графический режим |
+| **Rescue** | 3 | Режим восстановления / однопользовательский |
+
+Сервисы активируются когда таргет >= их объявленного таргета. Переключение таргетов запускает автоматическую сверку.
+
+#### Типы сервисов
+
+| Тип | Описание |
+|:--|:--|
+| **Simple** | Долгоживущий сервис (по умолчанию) |
+| **Oneshot** | Выполнить один раз, затем пометить завершенным |
+| **Notify** | Сервис сообщает о готовности через `notify_ready()` |
+| **Forking** | Сервис форкает дочерний процесс |
+
+#### Политики перезапуска
+
+| Политика | Поведение |
+|:--|:--|
+| **Always** | Перезапуск при любом завершении |
+| **Never** | Не перезапускать |
+| **OnFailure** | Перезапуск только если exit code != 0 |
+| **OnSuccess** | Перезапуск только если exit code == 0 |
+| **OnAbnormal** | Перезапуск при сигнале или ненулевом выходе |
+
+#### Типы зависимостей
+
+| Тип | Поведение |
+|:--|:--|
+| **Requires** (deps) | Жесткая зависимость - сервис падает если зависимость падает |
+| **Wants** | Мягкая зависимость - сервис продолжает если зависимость падает |
+| **Conflicts** | Остановить конфликтующий сервис перед запуском |
+
+#### Возможности
+
+| Возможность | Детали |
+|:--|:--|
+| **ExecStart** | Запуск ELF-бинарников с диска как сервисов |
+| **Watchdog** | Сервис должен пинговать в пределах таймаута, иначе перезапуск |
+| **Notify** | Аналог sd_notify - сервис сигнализирует о готовности |
+| **Условия** | ConditionPathExists, ConditionServiceActive, ConditionTargetActive |
+| **Маскирование** | Полный запрет запуска сервиса |
+| **Critical** | Защищенные сервисы не могут быть остановлены пользователем |
+| **Защита от burst** | Максимум 5 перезапусков за 10 секунд |
+| **Graceful shutdown** | Сначала некритичные, затем критичные, 30 сек глобальный таймаут |
+| **Анализ загрузки** | Данные о времени запуска всех сервисов |
+| **Переменные окружения** | До 8 пар key=value на сервис |
+| **Таймауты** | Настраиваемые таймауты запуска/остановки (по умолчанию 10 сек) |
+| **Хуки перезапуска** | Callback перед повторным запуском сервиса |
+| **Isolate** | Переключение таргета с остановкой ненужных сервисов |
+
+#### Журнал (лог событий)
+
+128-записный кольцевой буфер для всех событий mikuD:
+
+| Событие | Символ | Описание |
+|:--|:--:|:--|
+| Started | + | Сервис запущен |
+| Stopped | - | Сервис остановлен |
+| Exited | x | Сервис завершился (с кодом выхода) |
+| Failed | ! | Сервис провалился |
+| DepFailed | d | Ошибка зависимости |
+| ExecFailed | E | Неудача запуска ELF-бинарника |
+| Reloaded | R | SIGHUP перезагрузка |
+| WatchdogTimeout | W | Истечение watchdog |
+| BurstLimit | B | Достигнут лимит перезапусков |
+| Shutdown | S | Инициирован graceful shutdown |
+| TimerFired | F | Срабатывание таймера |
+| SocketActivated | A | Срабатывание socket activation |
+
+События имеют уровни серьезности: info (0), notice (1), warning (2), critical (3).
+
+#### Таймеры
+
+| Тип | Поведение |
+|:--|:--|
+| **Interval** | Срабатывание каждые N тиков |
+| **Oneshot** | Одноразовое срабатывание через N тиков |
+| **Realtime** | Срабатывание каждые N тиков относительно boot time |
+
+Максимум 16 таймеров. Таймеры запускают сервис при срабатывании.
+
+#### Socket Activation
+
+Сервисы могут запускаться по требованию при поступлении соединения на зарегистрированный порт.
+Поддержка Stream (TCP) и Dgram (UDP). Максимум 16 сокетов.
+
+#### Unit-файлы (.service)
+
+INI-формат, загрузка из `/etc/mikud/`:
+
+```ini
+[Unit]
+Description=My service
+After=kbd network
+Wants=logging
+Conflicts=rescue-shell
+ConditionPathExists=/etc/config
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/myservice
+Restart=always
+RestartSec=50
+Priority=5
+WatchdogSec=100
+TimeoutStartSec=2500
+RemainAfterExit=false
+Critical=false
+Environment=LANG=en
+
+[Install]
+WantedBy=multi-user
+```
+
+#### Команды оболочки (sv)
+
+| Команда | Описание |
+|:--|:--|
+| `sv list` | Список всех сервисов (состояние, PID, перезапуски) |
+| `sv status <name>` | Детальный статус + записи журнала |
+| `sv start <name>` | Запуск сервиса |
+| `sv stop <name>` | Остановка сервиса (graceful) |
+| `sv restart <name>` | Перезапуск сервиса |
+| `sv reload <name>` | Отправка SIGHUP для перезагрузки конфигурации |
+| `sv enable <name>` | Включение сервиса |
+| `sv disable <name>` | Выключение сервиса (остановка + деактивация) |
+| `sv mask <name>` | Запрет запуска сервиса |
+| `sv unmask <name>` | Разрешение запуска замаскированного сервиса |
+| `sv force-stop <name>` | Принудительное завершение (даже critical) |
+| `sv journal [name]` | Лог событий (последние 20 или по сервису) |
+| `sv target [name]` | Показ/установка активного таргета |
+| `sv isolate <tgt>` | Переключение таргета, остановка лишних |
+| `sv analyze` | Анализ времени загрузки |
+| `sv tree <name>` | Дерево зависимостей |
+| `sv rdeps <name>` | Обратные зависимости |
+| `sv cat <name>` | Показ unit-конфигурации сервиса |
+| `sv load <path>` | Загрузка .service unit-файла |
+| `sv scan` | Сканирование /etc/mikud/ |
+| `sv timer list` | Список таймеров |
+| `sv timer start/stop <name>` | Управление таймерами |
+
+</details>
 
 ---
 
@@ -165,26 +328,29 @@ ELF динамическая линковка, разделяемые библи
 
 #### Обзор
 
-libmiku это C-совместимая стандартная библиотека для MikuOS. Написана на Rust, экспортирует 79 функций в 12 модулях.
+libmiku это C-совместимая стандартная библиотека для MikuOS. Написана на Rust, 63 модуля, 962 экспортируемые функции.
 Загружается динамически через ld-miku, используется всеми userspace программами.
+Включает POSIX libc-совместимый слой (stdio, stdlib, string.h и т.д.).
 
-#### Модульная структура
+#### Категории модулей
 
-```
-src/lib/libmiku/
-├── lib.rs       объявления модулей, точка входа, panic handler
-├── sys.rs       syscall примитивы (sc0..sc4), константы
-├── proc.rs      exit, getpid, brk, mmap, munmap, tls
-├── io.rs        write, read, print, println, readline
-├── mem.rs       memset, memcpy, memmove, memcmp
-├── num.rs       itoa, utoa, atoi, print_int, print_hex
-├── string.rs    strlen, strcmp, strcpy, strtok, strtol...
-├── heap.rs      malloc, free, realloc, calloc
-├── file.rs      open, close, seek, fsize, read_file
-├── time.rs      sleep, uptime
-├── util.rs      abs, min, max, rand, assert, panic
-└── fmt.rs       printf, snprintf (asm трамплины)
-```
+| Категория | Модули |
+|:--|:--|
+| **Структуры данных** | vec, list, hashmap, treemap, trie, queue, ringbuf, ringbuf2, heap_queue, bitset, channel |
+| **Строки** | string, strbuf, ctype, utf8, format, regex, glob |
+| **I/O** | io, bufio, stdio, file, dir, path |
+| **Числа / математика** | num, math, random, convert, endian, bitops |
+| **Кодирование** | base64, hex, json, csv, ini, lz |
+| **Хэш / криптография** | sha256, checksum, hash, uuid |
+| **Система** | sys, proc, signal, env, errno, args, getopt |
+| **Параллелизм** | sync, channel, event, timer |
+| **Время** | time, datetime |
+| **Память** | mem, heap, arena, pool, slab |
+| **Логирование / тесты** | log, test, panic |
+| **Сортировка** | sort |
+| **libc-совместимость** | libc (fopen/fclose/fread/fwrite/fprintf/fgets/fputs и др., 151 функция) |
+
+> Прежний модуль `util` разбит на три: `math` (abs/min/max/clamp/isqrt/div_ceil/is_prime), `random` (srand/rand/rand_range/rand_bytes) и `panic` (assert_fail/panic/assert_eq/assert_not_null). Имена символов не менялись, ABI-совместимость сохранена.
 
 #### Модуль: io (ввод/вывод)
 
@@ -233,11 +399,14 @@ src/lib/libmiku/
 
 | Функция | Описание |
 |:--|:--|
-| `miku_memset` | Заполнение (8-байт выравнивание) |
-| `miku_memcpy` | Копирование (8-байт выравнивание) |
+| `miku_memset` | Заполнение памяти |
+| `miku_memcpy` | Копирование памяти |
 | `miku_memmove` | Копирование (с перекрытием) |
 | `miku_memcmp` | Сравнение |
 | `miku_bzero` | Обнуление |
+| `miku_memchr` | Поиск байта |
+| `miku_memrchr` | Обратный поиск байта |
+| `miku_memmem` | Поиск последовательности байт |
 
 #### Модуль: heap (динамическая память)
 
@@ -276,7 +445,7 @@ src/lib/libmiku/
 
 | Функция | Описание |
 |:--|:--|
-| `miku_sleep(ticks)` | Сон (~10мс/тик) |
+| `miku_sleep(ticks)` | Сон (~4 мс/тик при 250 Hz) |
 | `miku_sleep_ms(ms)` | Сон в миллисекундах |
 | `miku_uptime()` | Тики с загрузки |
 | `miku_uptime_ms()` | Миллисекунды с загрузки |
@@ -293,14 +462,17 @@ src/lib/libmiku/
 | `miku_set_tls` / `miku_get_tls` | TLS регистр |
 | `miku_map_lib(name, len)` | Маппинг разделяемой библиотеки |
 
-#### Модуль: util (утилиты)
+#### Модули: math, random, panic (бывший util)
 
 | Функция | Описание |
 |:--|:--|
-| `miku_abs` / `miku_min` / `miku_max` / `miku_clamp` | Числовые утилиты |
+| `miku_abs` / `miku_min` / `miku_max` / `miku_clamp` | Числовые утилиты (saturating, без паники на INT64_MIN) |
 | `miku_swap(a, b)` | Обмен значений |
-| `miku_srand(seed)` / `miku_rand()` / `miku_rand_range(lo, hi)` | Псевдослучайные числа (xorshift64) |
+| `miku_isqrt` / `miku_div_ceil` / `miku_is_prime` | Целочисленная математика (overflow-safe) |
+| `miku_srand(seed)` / `miku_rand()` / `miku_rand_range(lo, hi)` | PRNG xorshift64 |
+| `miku_rand_bytes` / `miku_rand_bool` / `miku_rand_uniform` | Расширенные генераторы |
 | `miku_assert_fail(expr, file, line)` | Неудача assert |
+| `miku_assert_eq` / `miku_assert_not_null` | Типизированные проверки |
 | `miku_panic(msg)` | Паника (exit 134) |
 
 </details>
@@ -328,7 +500,7 @@ src/lib/userspace/
 └── src/
     ├── miku.rs             SDK: extern привязки + безопасные обертки
     ├── hello.rs            пример Hello World
-    └── test_full.rs        71 тест
+    └── test_full.rs        1617 тестов
 ```
 
 #### Пример на Rust
@@ -384,21 +556,20 @@ Hello MikuOS!
 
 #### Тестовый набор
 
-71 тест по следующим категориям:
+1617 тестов по следующим категориям:
 
 | Категория | Количество |
 |:--|:--|
-| strings (базовые) | 10 |
-| strings (расширенные) | 14 |
+| strings (базовые/расширенные) | 24 |
 | numbers | 7 |
 | memory | 4 |
 | utilities | 7 |
 | heap | 7 |
 | process | 2 |
-| printf | 6 |
-| snprintf | 5 |
+| printf / snprintf | 11 |
 | time | 5 |
 | file I/O | 3+ |
+| libc-совместимость (stdio) | 1500+ |
 
 </details>
 
@@ -482,6 +653,19 @@ bits 12.. = номер swap слота
 
 ---
 
+### Управление процессами
+
+| Возможность | Описание |
+|:--|:--|
+| **fork()** | COW-клонирование процесса (глубокая копия таблиц страниц) |
+| **exec()** | Замена образа процесса ELF-бинарником |
+| **wait4()** | Ожидание дочернего процесса (блокирующее) |
+| **kill()** | Отправка сигнала процессу (SIGTERM, SIGKILL, SIGCHLD) |
+| **Сбор зомби** | Автоматический через mikuD и wait4 |
+| **Иерархия процессов** | Отслеживание родитель-потомок через ppid |
+
+---
+
 ### Планировщик
 
 | Параметр | Значение |
@@ -493,6 +677,8 @@ bits 12.. = номер swap слота
 | **Стек** | 512 KB на процесс |
 | **Состояния** | Ready / Running / Sleeping / Blocked / Dead |
 | **Реализация** | Lock-free: ISR использует только атомики |
+| **Приоритет** | Шкала 1-20 с взвешенным vruntime |
+| **Аффинность** | Per-process маска CPU |
 
 ---
 
@@ -516,8 +702,37 @@ bits 12.. = номер swap слота
 | **13** | `sys_seek` | Установка смещения в файле |
 | **14** | `sys_fsize` | Получение размера файла |
 | **15** | `sys_map_lib` | Маппинг разделяемой библиотеки |
-| **16** | `sys_sleep` | Сон процесса (~10мс/тик) |
+| **16** | `sys_sleep` | Сон процесса (~4мс/тик) |
 | **17** | `sys_uptime` | Тики с момента загрузки |
+| **18** | `sys_stat` | Информация о файле |
+| **19** | `sys_fstat` | Информация по файловому дескриптору |
+| **20** | `sys_mkdir` | Создание директории |
+| **21** | `sys_rmdir` | Удаление директории |
+| **22** | `sys_unlink` | Удаление файла |
+| **23** | `sys_readdir` | Чтение записей директории |
+| **24** | `sys_rename` | Переименование файла/директории |
+| **25** | `sys_link` | Создание жесткой ссылки |
+| **26** | `sys_chmod` | Изменение прав |
+| **27** | `sys_chown` | Изменение владельца |
+| **28** | `sys_dup` | Дублирование файлового дескриптора |
+| **29** | `sys_dup2` | Дублирование в конкретный fd |
+| **30** | `sys_truncate` | Усечение файла |
+| **31** | `sys_write_file` | Запись содержимого файла |
+| **32** | `sys_symlink` | Создание символической ссылки |
+| **33** | `sys_readlink` | Чтение символической ссылки |
+| **34** | `sys_pipe` | Создание pipe |
+| **35** | `sys_chdir` | Смена директории |
+| **36** | `sys_statfs` | Статистика файловой системы |
+| **37** | `sys_fallocate` | Предварительное выделение места |
+| **38** | `sys_getxattr` | Получение расширенного атрибута |
+| **39** | `sys_setxattr` | Установка расширенного атрибута |
+| **40** | `sys_utimensat` | Установка временных меток |
+| **41** | `sys_fsync` | Сброс файла на диск |
+| **42** | `sys_punch_hole` | Пробивка дыры в файле |
+| **43** | `sys_fork` | Форк процесса |
+| **44** | `sys_wait4` | Ожидание дочернего процесса |
+| **45** | `sys_kill` | Отправка сигнала |
+| **46** | `sys_exec` | Выполнение ELF-бинарника |
 
 Таблица FD управляется per-process (BTreeMap<pid, ProcessFds>).
 
@@ -542,23 +757,36 @@ bits 12.. = номер swap слота
 
 | Уровень | Протоколы |
 |:--|:--|
-| **L2** | Ethernet, ARP (с таблицей кэша) |
+| **L2** | Ethernet, ARP (таблица кэша + валидация заголовков) |
 | **L3** | IPv4, ICMP |
-| **L4** | UDP, TCP (с управлением состоянием соединений) |
-| **Приложение** | DHCP, DNS, NTP, HTTP, HTTP/2, Traceroute |
-| **Безопасность** | TLS 1.3 (ECDHE + RSA + AES-GCM) |
+| **L4** | UDP, TCP (listener + client, state machine, ретрансмиты) |
+| **Приложение** | DHCP, DNS, NTP, HTTP/1.1, HTTP/2 (HPACK), Ping, Traceroute |
+| **Безопасность** | TLS 1.2 / 1.3 (ECDHE + RSA + AES-GCM, constant-time) |
 
 </details>
 
 <details>
-<summary><b>TLS 1.3: полная реализация с нуля</b></summary>
+<summary><b>TLS 1.2 / 1.3: полная реализация с нуля</b></summary>
 
-- ECDH: обмен ключами X25519 (`tls_ecdh.rs`)
-- RSA: парсинг ASN.1/DER сертификатов, проверка PKCS#1 подписей (`tls_rsa.rs`)
+- ECDH: обмен ключами P-256 ECDHE (`tls_ecdh.rs`), constant-time скалярное умножение (always-double-always-add + `cmov`)
+- RSA: парсинг ASN.1/DER сертификатов, PKCS#1 v1.5 (`tls_rsa.rs`), байты паддинга из RDRAND
 - BigNum: собственная реализация больших чисел для RSA 2048-bit (`tls_bignum.rs`)
 - AES-GCM: аутентифицированное симметричное шифрование (`tls_gcm.rs`)
 - SHA-256, HMAC, HKDF: хэширование, вывод ключей (`tls_crypto.rs`)
-- Рукопожатие: ClientHello -> ServerHello -> Certificate -> Finished
+- Рукопожатие: ClientHello -> ServerHello -> Certificate -> [ECDHE] -> Finished (client и server Finished verify_data проверяются)
+- HTTP/2: кадры по RFC 7540 и HPACK по RFC 7541 с корректной таблицей Хаффмана из Приложения B (`http2.rs`)
+
+#### Усиление безопасности
+
+| Угроза | Меры |
+|:--|:--|
+| **RNG** | CSPRNG на RDRAND для ClientHello random, CBC IV, приватного ключа ECDH, паддинга RSA (`random::random_u64`) |
+| **Timing (Lucky13)** | Constant-time сравнение MAC через OR-аккумулятор |
+| **Padding oracle** | Полная проверка паддинга по RFC 5246 — все байты, не только последний |
+| **ECDH timing leak** | `fe_cmov` / `jac_cmov` XOR-маска для выбора поля/точки |
+| **Подмена сервера** | TLS 1.2 `verify_data = PRF(master, "server finished", hs_hash)` проверяется constant-time |
+| **PKCS#1 паддинг** | Ненулевые байты из RDRAND (rejection loop) |
+| **ARP spoofing** | Проверка hw_type / proto_type / hlen / plen до приёма ARP-IPv4 записи |
 
 </details>
 
@@ -677,6 +905,24 @@ bits 12.. = номер swap слота
 
 ### Команды оболочки
 
+#### Управление сервисами (sv)
+
+| Команда | Описание |
+|:--|:--|
+| `sv list` | Список всех сервисов |
+| `sv status <name>` | Детальный статус |
+| `sv start/stop/restart <name>` | Жизненный цикл сервиса |
+| `sv reload <name>` | Отправка SIGHUP |
+| `sv enable/disable <name>` | Включение/выключение |
+| `sv mask/unmask <name>` | Маскирование/размаскирование |
+| `sv force-stop <name>` | Принудительное завершение |
+| `sv journal [name]` | Лог событий |
+| `sv target [name]` | Управление таргетами |
+| `sv analyze` | Анализ загрузки |
+| `sv tree/rdeps <name>` | Информация о зависимостях |
+| `sv load/scan` | Управление unit-файлами |
+| `sv timer list/start/stop` | Управление таймерами |
+
 #### Унифицированные ext команды (автоопределение версии FS)
 
 | Команда | Синтаксис | Описание |
@@ -735,13 +981,74 @@ bits 12.. = номер swap слота
 | `ldconfig` | Обновление кэша разделяемых библиотек |
 | `ldd` | Список кэшированных библиотек |
 
-#### Команды mkfs
+#### Управление процессами
+
+| Команда | Описание |
+|:--|:--|
+| `ps` | Список всех процессов |
+| `top` | Онлайн-монитор процессов |
+| `kill <pid>` | Завершение процесса по PID |
+| `nice <pid> <prio>` | Изменение приоритета (1-20) |
+| `affinity <pid> <mask>` | Установка CPU-аффинности |
+| `swaptest` | Стресс-тест подсистемы swap |
+
+#### Системные команды
+
+| Команда | Описание |
+|:--|:--|
+| `poweroff` / `shutdown` / `halt` | Graceful shutdown через mikuD |
+| `reboot` / `restart` | Graceful reboot через mikuD |
+| `info` | Информация о системе |
+| `memmap` | Карта физической памяти |
+| `heap` | Статистика кучи |
+| `clear` | Очистка экрана |
+| `echo <text>` | Вывод текста |
+| `history` | История команд |
+| `help` | Список команд |
+
+#### mkfs / диски / swap
 
 | Команда | Описание |
 |:--|:--|
 | `mkfs.ext2 <drive>` | Форматирование ext2 |
 | `mkfs.ext3 <drive>` | Форматирование ext3 (с журналом) |
 | `mkfs.ext4 <drive>` | Форматирование ext4 (экстенты + журнал) |
+| `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run форматирование (только layout) |
+| `gpt <drive>` | Показать таблицу GPT |
+| `gpt.init <drive>` | Инициализировать пустой GPT |
+| `gpt.add <drive> <spec>` | Добавить раздел |
+| `gpt.del <drive> <partition>` | Удалить раздел |
+| `mkswap <drive> <partition>` | Создать swap на разделе |
+| `swapon <drive> <partition>` | Активировать swap |
+| `swapon.raw <drive> <start> <size>` | Активировать swap по сырым координатам |
+| `swapon.auto` | Автоподбор и активация swap-разделов |
+| `swapoff` | Деактивировать swap |
+| `swapinfo` | Использование swap |
+| `mkswap.raw <drive> <start> <size>` | Создать сырой swap без GPT |
+
+#### Расширенные атрибуты / флаги
+
+| Команда | Описание |
+|:--|:--|
+| `getxattr <path> <name>` | Прочитать user xattr |
+| `setxattr <path> <name> <value>` | Записать user xattr |
+| `listxattr <path>` | Список всех xattr |
+| `chattr <+/-flags> <path>` | Установить флаги файла (i=immutable, a=append, d=nodump, A=noatime) |
+| `lsattr <path>` | Показать флаги файла |
+| `fiemap <path>` | Карта экстентов файла (ext4) |
+
+#### Сеть
+
+| Команда | Описание |
+|:--|:--|
+| `net <subcmd>` | Сетевой статус / конфигурация |
+| `dhcp` | Получить аренду по DHCP |
+| `ping <ip\|host> [count]` | ICMP echo (резолв через DNS) |
+| `ntp [server]` | Синхронизация времени через NTP |
+| `traceroute` / `tr <host>` | Трассировка маршрута (UDP/ICMP) |
+| `fetch <url\|host> [port]` | Минимальный HTTP/HTTPS-клиент |
+| `wget <url> [-O <file>]` | Скачивание по HTTP(S) |
+| `curl <url> [-X GET\|POST] [-d <data>] [-o <file>] [-I]` | HTTP(S)-клиент |
 
 ---
 
@@ -811,15 +1118,15 @@ cd src/lib/userspace
 ## Автор
 
 <div align="center">
-  <a href="https://github.com/altushkaso2">
-    <img src="https://github.com/altushkaso2.png" width="100" style="border-radius:50%;" alt="altushkaso2">
+  <a href="https://github.com/alunwrd">
+    <img src="https://github.com/alunwrd.png" width="100" style="border-radius:50%;" alt="alunwrd">
   </a>
   <br><br>
-  <a href="https://github.com/altushkaso2"><b>@altushkaso2</b></a>
+  <a href="https://github.com/altushkaso2"><b>@alunwrd</b></a>
   <br>
   <sub>Автор и единственный разработчик Miku OS</sub>
   <br>
-  <sub>Ядро - VFS - MikuFS - ELF - ld-miku - libmiku - Оболочка - Сеть - TLS - Планировщик - PMM - VMM - Swap</sub>
+  <sub>Ядро - VFS - MikuFS - ELF - ld-miku - libmiku - Оболочка - Сеть - TLS - Планировщик - PMM - VMM - Swap - mikuD - Сигналы - fork/exec</sub>
 </div>
 
 ---
@@ -834,7 +1141,7 @@ cd src/lib/userspace
 >
 > Момент, когда ELF загрузчик и динамическая линковка заработали, когда "hello from dynamic linking!"
 > появилось на экране, я не забуду никогда.
-> А когда libmiku прошла все 71 тест, стало ясно что на этой ОС можно запускать настоящие программы.
+> Когда libmiku прошла все 1617 тестов, стало ясно что на этой ОС можно запускать настоящие программы.
 
 <div align="center">
 

@@ -20,11 +20,11 @@ pub fn impl_ls(
 ) {
     use crate::commands::ext2_cmds::with_ext2_pub;
     let path = if path.is_empty() { "/" } else { path };
-    let result = with_ext2_pub(|fs| -> Result<([DirEntry; 64], usize), FsError> {
+    let result = with_ext2_pub(|fs| -> Result<([DirEntry; 256], usize), FsError> {
         let ino = fs.resolve_path(path)?;
         let inode = fs.read_inode(ino)?;
         if !inode.is_directory() { return Err(FsError::NotDirectory); }
-        let mut entries = [const { DirEntry::empty() }; 64];
+        let mut entries = [const { DirEntry::empty() }; 256];
         let count = fs.read_dir(&inode, &mut entries)?;
         Ok((entries, count))
     });

@@ -8,7 +8,7 @@ use x86_64::structures::paging::PageTableFlags;
 
 const PAGE_SIZE: u64 = 4096;
 const PAGE_MASK: u64 = PAGE_SIZE - 1;
-const STACK_PAGES: usize = 128;
+const STACK_PAGES: usize = 256; // 1 mb user stack
 const TLS_VIRT: u64 = 0x0000_0000_4100_0000;
 const PIE_BASE: u64 = 0x0000_4000_0000;
 const INTERP_BASE: u64 = 0x0000_7F00_0000_0000;
@@ -104,7 +104,10 @@ pub fn load(
         }
     }
 
-    apply_relro(&info, load_bias, aspace);
+    // skip RELRO for dynamically linked binaries - ld-miku applies it after relocations
+    if !info.has_interp() {
+        apply_relro(&info, load_bias, aspace);
+    }
 
     let mut brk: u64 = 0;
     for i in 0..info.phdr_count {
@@ -147,7 +150,19 @@ pub fn load(
     let phdr_vaddr = if info.phdr_vaddr != 0 {
         info.phdr_vaddr + load_bias
     } else {
-        0
+        // No PT_PHDR - find LOAD segment that covers e_phoff
+        let mut fallback = 0u64;
+        let phoff = info.ehdr.e_phoff;
+        for i in 0..info.phdr_count {
+            let ph = &info.phdrs[i];
+            if ph.p_type == PT_LOAD && phoff >= ph.p_offset
+                && phoff < ph.p_offset + ph.p_filesz
+            {
+                fallback = ph.p_vaddr + load_bias + (phoff - ph.p_offset);
+                break;
+            }
+        }
+        fallback
     };
 
     let stack_phys = pmm::alloc_frames(STACK_PAGES).ok_or(LoadError::OutOfMemory)?;
@@ -571,6 +586,13 @@ fn setup_stack(
 
     sp &= !15;
 
+    // Pre-adjust for 16-byte alignment after all pushes
+    // Auxv pairs 34 entries (even) NULL's: 2 (even)
+    // argc + 1 (argc word) determines parity, Pad if argc is even
+    if argc % 2 == 0 {
+        sp -= 8;
+    }
+
     let push_auxv = |sp: &mut u64, key: u64, val: u64| {
         push_u64(sp, val);
         push_u64(sp, key);
@@ -594,13 +616,8 @@ fn setup_stack(
     push_auxv(&mut sp, AT_PHENT, info.ehdr.e_phentsize as u64);
     push_auxv(&mut sp, AT_PHDR, phdr_vaddr);
 
-    push_u64(&mut sp, 0);
-    push_u64(&mut sp, 0);
-
-    let total_after = 1 + argc + 2;
-    if total_after % 2 != 0 {
-        push_u64(&mut sp, 0);
-    }
+    push_u64(&mut sp, 0); // envp NULL terminator
+    push_u64(&mut sp, 0); // argv NULL terminator
 
     for i in (0..argc).rev() {
         push_u64(&mut sp, argv_va[i]);

@@ -1,4 +1,4 @@
-# MikuOS ABI v0.1.5
+# MikuOS ABI v0.2.0
 
 Application Binary Interface for MikuOS userspace.
 
@@ -13,15 +13,15 @@ MikuOS is an x86_64 OS. Userspace programs run in Ring 3 and communicate with th
 |        Program (ELF)             |
 |  _start -> _start_main -> code  |
 +----------------------------------+
-|     libmiku.so  (79 functions)  |
-|  string/ mem/ heap/ io/ fmt/    |
-|  file/ time/ proc/ util/        |
+|    libmiku.so  (962 functions)  |
+|  63 modules: string/ mem/ heap/ |
+|  io/ fmt/ file/ libc/ json/...  |
 +----------------------------------+
 |     ld-miku.so  (linker)        |
 |  loads .so, PLT, relocations    |
 +----------------------------------+
 |     MikuOS Kernel               |
-|  syscall nr=0..17               |
+|  syscall nr=0..46, mikuD init   |
 +----------------------------------+
 ```
 
@@ -59,21 +59,25 @@ src/lib/userspace/
 
 ### 2.3 libmiku Structure
 
-```
-src/lib/libmiku/
-├── lib.rs      module declarations, entry, panic handler
-├── sys.rs      syscall primitives (sc0..sc4), constants
-├── proc.rs     exit, getpid, brk, mmap, munmap, tls
-├── io.rs       write, read, print, println, readline
-├── mem.rs      memset, memcpy, memmove, memcmp
-├── num.rs      itoa, utoa, atoi, print_int, print_hex
-├── string.rs   strlen, strcmp, strcpy, strtok, strtol...
-├── heap.rs     malloc, free, realloc, calloc
-├── file.rs     open, close, seek, fsize, read_file
-├── time.rs     sleep, uptime
-├── util.rs     abs, min, max, rand, assert, panic
-└── fmt.rs      printf, snprintf (asm trampolines)
-```
+63 modules, 962 exported functions. Modules:
+
+| Category | Modules |
+|---|---|
+| **Core** | lib, sys, proc, io, mem, num, string, heap, file, time, fmt |
+| **Data structures** | vec, list, hashmap, treemap, trie, queue, ringbuf, ringbuf2, heap_queue, bitset, channel |
+| **Strings** | strbuf, ctype, utf8, format, regex, glob |
+| **I/O** | bufio, stdio, dir, path |
+| **Encoding** | base64, hex, json, csv, ini, lz |
+| **Crypto / hash** | sha256, checksum, hash, uuid |
+| **System** | signal, env, errno, args, getopt |
+| **Concurrency** | sync, event, timer |
+| **Time** | datetime |
+| **Memory** | arena, slab, pool |
+| **Math / RNG / sort** | math, random, convert, endian, bitops, sort |
+| **Diagnostics** | log, test, panic |
+| **libc compat** | libc (fopen/fclose/fread/fwrite/fprintf/fgets/fputs etc., 151 functions) |
+
+> The old `util` module has been split: `math` owns `miku_abs` / `miku_min` / `miku_max` / `miku_clamp` / `miku_swap` / `miku_isqrt` / `miku_div_ceil` / `miku_is_prime`; `random` owns `miku_srand` / `miku_rand` / `miku_rand_range` / `miku_rand_bytes`; `panic` owns `miku_assert_fail` / `miku_panic` / `miku_assert_eq` / `miku_assert_not_null`. Symbol names are unchanged, so existing binaries keep working.
 
 ---
 
@@ -111,6 +115,35 @@ Clobbered:    rcx, r11
 | 15 | map_lib | name | len | | | base / -errno |
 | 16 | sleep | ticks | | | | 0 |
 | 17 | uptime | | | | | ticks |
+| 18 | stat | path | path_len | buf | | 0 / -errno |
+| 19 | fstat | fd | buf | | | 0 / -errno |
+| 20 | mkdir | path | path_len | mode | | 0 / -errno |
+| 21 | rmdir | path | path_len | | | 0 / -errno |
+| 22 | unlink | path | path_len | | | 0 / -errno |
+| 23 | readdir | fd | buf | count | | entries / -errno |
+| 24 | rename | old_path | old_len | new_path | new_len | 0 / -errno |
+| 25 | link | target | target_len | link_path | link_len | 0 / -errno |
+| 26 | chmod | path | path_len | mode | | 0 / -errno |
+| 27 | chown | path | path_len | uid | gid | 0 / -errno |
+| 28 | dup | fd | | | | new_fd / -errno |
+| 29 | dup2 | old_fd | new_fd | | | new_fd / -errno |
+| 30 | truncate | fd | size | | | 0 / -errno |
+| 31 | write_file | fd | buf | len | | bytes / -errno |
+| 32 | symlink | target | target_len | link_path | link_len | 0 / -errno |
+| 33 | readlink | path | path_len | buf | buf_len | len / -errno |
+| 34 | pipe | fds_ptr | | | | 0 / -errno |
+| 35 | chdir | path | path_len | | | 0 / -errno |
+| 36 | statfs | path | path_len | buf | | 0 / -errno |
+| 37 | fallocate | fd | offset | len | | 0 / -errno |
+| 38 | getxattr | path | name | value | size | len / -errno |
+| 39 | setxattr | path | name | value | size | 0 / -errno |
+| 40 | utimensat | path | path_len | times | | 0 / -errno |
+| 41 | fsync | fd | | | | 0 / -errno |
+| 42 | punch_hole | fd | offset | len | | 0 / -errno |
+| 43 | fork | | | | | child_pid / 0 / -errno |
+| 44 | wait4 | pid | status_ptr | options | | pid / -errno |
+| 45 | kill | pid | sig | | | 0 / -errno |
+| 46 | exec | path | path_len | argv | argc | pid / -errno |
 
 ### 3.3 Constants
 
@@ -119,14 +152,25 @@ PROT_READ  = 1
 PROT_WRITE = 2
 PROT_EXEC  = 4
 
+O_READ    = 0
+O_WRITE   = 1
+O_CREATE  = 2
+O_TRUNC   = 4
+O_APPEND  = 8
+
 ENOENT = -2     (file not found)
 EBADF  = -9     (bad file descriptor)
 ENOMEM = -12    (out of memory)
 EFAULT = -14    (bad address)
+EEXIST = -17    (file exists)
 EINVAL = -22    (invalid argument)
 ENOSYS = -38    (syscall does not exist)
 
-PIT frequency: ~100 Hz (1 tick ~= 10 ms)
+SIGKILL = 9
+SIGTERM = 15
+SIGCHLD = 17
+
+PIT frequency: 250 Hz (1 tick ~= 4 ms)
 ```
 
 ### 3.4 File Descriptors
@@ -223,6 +267,14 @@ unsigned long miku_strtoul(const char *s, const char **endptr, int base);
 // BSD-safe
 unsigned long miku_strlcpy(char *dst, const char *src, unsigned long size);
 unsigned long miku_strlcat(char *dst, const char *src, unsigned long size);
+
+// Extended
+char *miku_strndup(const char *s, unsigned long n);      // malloc, caller must free
+unsigned long miku_strnlen(const char *s, unsigned long maxlen);
+int  miku_strcasecmp(const char *a, const char *b);
+int  miku_strncasecmp(const char *a, const char *b, unsigned long n);
+char *miku_strsep(char **stringp, const char *delim);    // BSD-style tokenization
+char *miku_strtok_r(char *s, const char *delim, char **saveptr); // thread-safe strtok
 ```
 
 ### 5.3 Module `num` -- Numbers
@@ -243,6 +295,10 @@ void *miku_memcpy(void *dst, const void *src, unsigned long n);
 void *miku_memmove(void *dst, const void *src, unsigned long n);  // overlap-safe
 int   miku_memcmp(const void *a, const void *b, unsigned long n);
 void  miku_bzero(void *dst, unsigned long n);
+const void *miku_memchr(const void *s, int c, unsigned long n);
+const void *miku_memrchr(const void *s, int c, unsigned long n);  // reverse search
+const void *miku_memmem(const void *haystack, unsigned long hlen,
+                        const void *needle, unsigned long nlen);
 ```
 
 ### 5.5 Module `heap` -- Dynamic Memory
@@ -280,20 +336,20 @@ Implementation: `global_asm!` trampoline saves `rsi`/`rdx`/`rcx`/`r8`/`r9` onto 
 ### 5.7 Module `file` -- File I/O
 
 ```c
-long miku_open(const char *path, unsigned long path_len);
-long miku_open_cstr(const char *path);                    // computes len internally
+long miku_open(const char *path, unsigned long path_len, int flags, int mode);
+long miku_open_cstr(const char *path);                    // computes len internally, O_READ
 long miku_close(long fd);
 long miku_seek(long fd, unsigned long offset);
 long miku_fsize(long fd);
 void *miku_read_file(const char *path, unsigned long *out_size);  // malloc
 ```
 
-Limitation: read-only. No write or create syscalls available.
+Flags: O_READ=0, O_WRITE=1, O_CREATE=2, O_TRUNC=4, O_APPEND=8.
 
 ### 5.8 Module `time` -- Time
 
 ```c
-void miku_sleep(unsigned long ticks);      // ~10 ms per tick
+void miku_sleep(unsigned long ticks);      // ~4 ms per tick (250 Hz PIT)
 void miku_sleep_ms(unsigned long ms);
 unsigned long miku_uptime(void);           // ticks since boot
 unsigned long miku_uptime_ms(void);
@@ -314,19 +370,102 @@ unsigned long miku_get_tls(void);
 long  miku_map_lib(const char *name, unsigned long name_len);
 ```
 
-### 5.10 Module `util` -- Utilities
+### 5.10 Modules `math`, `random`, `panic`
+
+The former `util` module was split in three. All symbols kept their original names.
+
+#### `math` -- Arithmetic helpers (saturating / overflow-safe)
 
 ```c
-long miku_abs(long x);
-long miku_min(long a, long b);
-long miku_max(long a, long b);
-long miku_clamp(long val, long lo, long hi);
-void miku_swap(unsigned long *a, unsigned long *b);
-void miku_srand(unsigned long seed);                              // xorshift64
+long  miku_abs(long x);                            // saturating_abs, safe on INT64_MIN
+long  miku_min(long a, long b);
+long  miku_max(long a, long b);
+long  miku_clamp(long val, long lo, long hi);
+void  miku_swap(unsigned long *a, unsigned long *b);
+unsigned long miku_isqrt(unsigned long n);         // bit-length-seeded Newton, safe on UINT64_MAX
+unsigned long miku_div_ceil(unsigned long a, unsigned long b);
+int   miku_is_prime(unsigned long n);              // trial division, uses miku_isqrt
+```
+
+#### `random` -- PRNG
+
+```c
+void  miku_srand(unsigned long seed);                              // xorshift64
 unsigned long miku_rand(void);
 unsigned long miku_rand_range(unsigned long lo, unsigned long hi); // [lo, hi)
-void miku_assert_fail(const char *expr, const char *file, int line);
-void miku_panic(const char *msg);                                  // noreturn
+unsigned int  miku_rand_u32(void);
+void  miku_rand_bytes(unsigned char *buf, unsigned long len);
+int   miku_rand_bool(void);
+unsigned long miku_rand_uniform(unsigned long bound);              // [0, bound) bias-free
+long  miku_rand_i64(long lo, long hi);
+unsigned int  miku_rand_dice(unsigned int sides);
+unsigned long miku_rand_sample(unsigned long n, unsigned long k, unsigned long *out);
+unsigned long miku_rand_weighted(const unsigned long *weights, unsigned long n);
+void  miku_rand_perm(unsigned long n, unsigned long *out);
+void  miku_rand_shuffle(unsigned char *data, unsigned long count, unsigned long elem_size);
+```
+
+Note: `random` is a userspace PRNG (xorshift). The kernel TLS / ECDH paths use RDRAND-backed CSPRNG internally; that is not exposed via libmiku.
+
+#### `panic` -- Assertions and aborts
+
+```c
+void miku_assert_fail(const char *expr, const char *file, int line);  // noreturn
+void miku_panic(const char *msg);                                     // noreturn
+void miku_assert_eq(long a, long b, const char *file, int line);      // noreturn on mismatch
+void miku_assert_not_null(const void *ptr, const char *name,
+                          const char *file, int line);                // noreturn on NULL
+```
+
+### 5.11 Module `libc` -- POSIX libc Compatibility
+
+151 functions providing C standard library compatibility:
+
+```c
+// stdio
+FILE *fopen(const char *path, const char *mode);   // modes: "r","w","a","r+","w+","a+"
+int   fclose(FILE *f);
+unsigned long fread(void *buf, unsigned long size, unsigned long count, FILE *f);
+unsigned long fwrite(const void *buf, unsigned long size, unsigned long count, FILE *f);
+int   fputc(int c, FILE *f);
+int   fgetc(FILE *f);
+int   fputs(const char *s, FILE *f);
+char *fgets(char *buf, int size, FILE *f);
+int   fprintf(FILE *f, const char *fmt, ...);
+int   fseek(FILE *f, long offset, int whence);
+long  ftell(FILE *f);
+void  rewind(FILE *f);
+int   fflush(FILE *f);
+int   feof(FILE *f);
+int   ferror(FILE *f);
+
+// stdlib
+int   atoi(const char *s);
+long  atol(const char *s);
+long  strtol(const char *s, char **endptr, int base);
+void *malloc(unsigned long size);
+void  free(void *ptr);
+void *realloc(void *ptr, unsigned long size);
+void *calloc(unsigned long count, unsigned long size);
+void  exit(int status);
+void  abort(void);
+int   abs(int x);
+int   rand(void);
+void  srand(unsigned int seed);
+
+// string.h
+void *memcpy(void *dst, const void *src, unsigned long n);
+void *memset(void *dst, int c, unsigned long n);
+void *memmove(void *dst, const void *src, unsigned long n);
+int   memcmp(const void *a, const void *b, unsigned long n);
+unsigned long strlen(const char *s);
+int   strcmp(const char *a, const char *b);
+char *strcpy(char *dst, const char *src);
+char *strcat(char *dst, const char *src);
+char *strchr(const char *s, int c);
+char *strstr(const char *haystack, const char *needle);
+char *strdup(const char *s);
+// ... and more
 ```
 
 ---
@@ -650,14 +789,12 @@ readelf --dyn-syms app | grep miku  # should list miku_* symbols
 
 ## 12. Limitations
 
-- One process at a time (no `fork`/`exec` from userspace)
-- No `pipe`, `dup`, `stat`, or `readdir` syscalls
-- Files are read-only
 - `printf`: max 5 arguments; `%d`/`%x` are 32-bit only
 - Single thread per process
-- No errno -- errors returned as negative values
+- No errno variable -- errors returned as negative values (libc compat layer provides errno)
 - No float support in printf
 - Heap slab does not return memory to the kernel when small blocks are freed
+- No networking syscalls from userspace yet
 
 ---
 

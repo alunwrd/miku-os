@@ -173,13 +173,20 @@ pub fn tls_pad(data: &[u8], out: &mut [u8]) -> usize {
 
 pub fn tls_unpad(data: &[u8]) -> Option<&[u8]> {
     if data.is_empty() { return None; }
-    
+
     let pad_val = *data.last().unwrap() as usize;
     let pad_len = pad_val + 1;
-    
+
     if pad_len > 16 || pad_len > data.len() { return None; }
-    
-    Some(&data[..data.len() - pad_len])
+
+    let pad_start = data.len() - pad_len;
+    let mut diff = 0u8;
+    for b in &data[pad_start..] {
+        diff |= *b ^ pad_val as u8;
+    }
+    if diff != 0 { return None; }
+
+    Some(&data[..pad_start])
 }
 
 pub struct Sha1State {

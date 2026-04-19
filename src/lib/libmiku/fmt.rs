@@ -1,5 +1,3 @@
-use crate::sys::zbuf;
-
 core::arch::global_asm!(
     ".global miku_printf",
     "miku_printf:",
@@ -36,107 +34,121 @@ core::arch::global_asm!(
     "ret",
 );
 
+// dprintf(fd, fmt, ...) - printf to arbitrary file descriptor
+// args: rdi=fd, rsi=fmt, rdx..r9=varargs
+core::arch::global_asm!(
+    ".global miku_dprintf",
+    "miku_dprintf:",
+    "push rbp",
+    "mov rbp, rsp",
+    "and rsp, -16",
+    "sub rsp, 48",
+    "mov [rsp], rdx",
+    "mov [rsp+8], rcx",
+    "mov [rsp+16], r8",
+    "mov [rsp+24], r9",
+    "mov rdx, rsp",
+    "call miku_dprintf_impl",
+    "mov rsp, rbp",
+    "pop rbp",
+    "ret",
+);
+
+// fprintf(fd, fmt, ...) - alias for dprintf
+core::arch::global_asm!(
+    ".global miku_fprintf",
+    "miku_fprintf:",
+    "jmp miku_dprintf",
+);
+
+struct FmtSpec {
+    width: usize,
+    pad_char: u8,
+    left_align: bool,
+    is_long: bool,
+    is_longlong: bool,
+    is_size: bool,
+}
+
+impl FmtSpec {
+    fn new() -> Self {
+        Self {
+            width: 0,
+            pad_char: b' ',
+            left_align: false,
+            is_long: false,
+            is_longlong: false,
+            is_size: false,
+        }
+    }
+}
+
 unsafe fn read_arg(args: *const u64, idx: usize) -> u64 {
     *args.add(idx)
 }
 
-static mut FMT_BUF: [u8; 24] = [0u8; 24];
+fn parse_spec(fmt: *const u8, start: usize) -> (FmtSpec, usize) {
+    let mut spec = FmtSpec::new();
+    let mut i = start;
 
-unsafe fn fmt_int_to_buf(val: i64) -> usize {
-    crate::num::miku_itoa(val, FMT_BUF.as_mut_ptr());
-    crate::string::miku_strlen(FMT_BUF.as_ptr())
-}
+    unsafe {
+        if *fmt.add(i) == b'-' { spec.left_align = true; i += 1; }
+        if *fmt.add(i) == b'0' && !spec.left_align { spec.pad_char = b'0'; i += 1; }
 
-unsafe fn fmt_uint_to_buf(val: u64) -> usize {
-    crate::num::miku_utoa(val, FMT_BUF.as_mut_ptr());
-    crate::string::miku_strlen(FMT_BUF.as_ptr())
-}
+        while *fmt.add(i) >= b'0' && *fmt.add(i) <= b'9' {
+            spec.width = spec.width * 10 + (*fmt.add(i) - b'0') as usize;
+            i += 1;
+        }
 
-unsafe fn fmt_hex_to_buf(val: u64) -> usize {
-    let mut n = val;
-    if n == 0 { FMT_BUF[0] = b'0'; FMT_BUF[1] = 0; return 1; }
-    let mut digits = 0usize;
-    let mut v = n;
-    while v > 0 { digits += 1; v >>= 4; }
-    let mut pos = digits;
-    FMT_BUF[pos] = 0;
-    while n > 0 {
-        pos -= 1;
-        let d = (n & 0xF) as u8;
-        FMT_BUF[pos] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
-        n >>= 4;
+        if *fmt.add(i) == b'l' {
+            i += 1;
+            spec.is_long = true;
+            if *fmt.add(i) == b'l' { i += 1; spec.is_longlong = true; }
+        } else if *fmt.add(i) == b'z' {
+            i += 1;
+            spec.is_size = true;
+        }
     }
-    digits
+
+    (spec, i)
 }
 
-unsafe fn fmt_write_int(val: i64) -> i32 {
-    let len = fmt_int_to_buf(val);
-    crate::io::miku_write(1, FMT_BUF.as_ptr(), len);
-    len as i32
-}
+fn pad_and_emit<E: FnMut(u8)>(emit: &mut E, data: &[u8], spec: &FmtSpec) -> i32 {
+    let data_len = data.len();
+    let pad_count = if spec.width > data_len { spec.width - data_len } else { 0 };
+    let mut written = 0i32;
 
-unsafe fn fmt_write_uint(val: u64) -> i32 {
-    let len = fmt_uint_to_buf(val);
-    crate::io::miku_write(1, FMT_BUF.as_ptr(), len);
-    len as i32
-}
-
-unsafe fn fmt_write_hex(val: u64) -> i32 {
-    let len = fmt_hex_to_buf(val);
-    crate::io::miku_write(1, FMT_BUF.as_ptr(), len);
-    len as i32
-}
-
-unsafe fn fmt_write_ptr(val: u64) -> i32 {
-    crate::io::miku_write(1, b"0x".as_ptr(), 2);
-    let mut n = val;
-    let mut pos = 0usize;
-    while pos < 16 {
-        let shift = (60 - pos * 4) as u32;
-        let d = ((n >> shift) & 0xF) as u8;
-        FMT_BUF[pos] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
-        pos += 1;
+    if !spec.left_align && spec.pad_char == b' ' {
+        for _ in 0..pad_count { emit(b' '); written += 1; }
     }
-    crate::io::miku_write(1, FMT_BUF.as_ptr(), 16);
-    18
+
+    let sign_and_zero_pad = !spec.left_align && spec.pad_char == b'0';
+    if sign_and_zero_pad {
+        if !data.is_empty() && data[0] == b'-' {
+            emit(b'-');
+            written += 1;
+            for _ in 0..pad_count { emit(b'0'); written += 1; }
+            for &b in &data[1..] { emit(b); written += 1; }
+            return written;
+        }
+        for _ in 0..pad_count { emit(b'0'); written += 1; }
+    }
+
+    for &b in data { emit(b); written += 1; }
+
+    if spec.left_align {
+        for _ in 0..pad_count { emit(b' '); written += 1; }
+    }
+
+    written
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn miku_printf_impl(fmt: *const u8, args: *const u64) -> i32 {
     if fmt.is_null() { return -1; }
     let mut written: i32 = 0;
-    let mut i = 0usize;
-    let mut ai = 0usize;
-    loop {
-        let c = *fmt.add(i);
-        if c == 0 { break; }
-        if c == b'%' {
-            i += 1;
-            let spec = *fmt.add(i);
-            match spec {
-                b's' => {
-                    let s = read_arg(args, ai) as *const u8; ai += 1;
-                    if !s.is_null() {
-                        let len = crate::string::miku_strlen(s);
-                        crate::io::miku_write(1, s, len);
-                        written += len as i32;
-                    }
-                }
-                b'd' | b'i' => { let v = read_arg(args, ai) as i32 as i64; ai += 1; written += fmt_write_int(v); }
-                b'u' => { let v = read_arg(args, ai) as u32 as u64; ai += 1; written += fmt_write_uint(v); }
-                b'x' | b'X' => { let v = read_arg(args, ai) as u32 as u64; ai += 1; written += fmt_write_hex(v); }
-                b'c' => { let ch = read_arg(args, ai) as u8; ai += 1; crate::io::miku_write(1, &ch as *const u8, 1); written += 1; }
-                b'p' => { let v = read_arg(args, ai); ai += 1; written += fmt_write_ptr(v); }
-                b'%' => { crate::io::miku_write(1, b"%".as_ptr(), 1); written += 1; }
-                0 => break,
-                _ => { crate::io::miku_write(1, b"%".as_ptr(), 1); crate::io::miku_write(1, &spec as *const u8, 1); written += 2; }
-            }
-        } else {
-            crate::io::miku_write(1, fmt.add(i), 1);
-            written += 1;
-        }
-        i += 1;
-    }
+    let mut emitter = |b: u8| { crate::io::miku_write(1, &b as *const u8, 1); };
+    written = format_core(fmt, args, &mut emitter);
     written
 }
 
@@ -145,31 +157,133 @@ pub unsafe extern "C" fn miku_snprintf_impl(buf: *mut u8, max: usize, fmt: *cons
     if buf.is_null() || max == 0 || fmt.is_null() { return 0; }
     let limit = max - 1;
     let mut out = 0usize;
+    let mut emitter = |b: u8| {
+        if out < limit { *buf.add(out) = b; out += 1; }
+    };
+    let written = format_core(fmt, args, &mut emitter);
+    *buf.add(out) = 0;
+    written
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn miku_dprintf_impl(fd: u64, fmt: *const u8, args: *const u64) -> i32 {
+    if fmt.is_null() { return -1; }
+    let mut emitter = |b: u8| { crate::io::miku_write(fd, &b as *const u8, 1); };
+    format_core(fmt, args, &mut emitter)
+}
+
+unsafe fn format_core<E: FnMut(u8)>(fmt: *const u8, args: *const u64, emit: &mut E) -> i32 {
+    let mut written: i32 = 0;
     let mut i = 0usize;
     let mut ai = 0usize;
-
-    macro_rules! emit { ($b:expr) => { if out < limit { *buf.add(out) = $b; out += 1; } }; }
-    macro_rules! emit_str { ($p:expr, $len:expr) => { let mut _k = 0usize; while _k < $len { emit!(*($p).add(_k)); _k += 1; } }; }
+    let mut num_buf = [0u8; 24];
 
     loop {
         let c = *fmt.add(i);
         if c == 0 { break; }
-        if c == b'%' {
+
+        if c != b'%' {
+            emit(c);
+            written += 1;
             i += 1;
-            let spec = *fmt.add(i);
-            match spec {
-                b's' => { let s = read_arg(args, ai) as *const u8; ai += 1; if !s.is_null() { let mut j = 0usize; while *s.add(j) != 0 { emit!(*s.add(j)); j += 1; } } }
-                b'd' | b'i' => { let v = read_arg(args, ai) as i32 as i64; ai += 1; let len = fmt_int_to_buf(v); emit_str!(FMT_BUF.as_ptr(), len); }
-                b'u' => { let v = read_arg(args, ai) as u32 as u64; ai += 1; let len = fmt_uint_to_buf(v); emit_str!(FMT_BUF.as_ptr(), len); }
-                b'x' | b'X' => { let v = read_arg(args, ai) as u32 as u64; ai += 1; let len = fmt_hex_to_buf(v); emit_str!(FMT_BUF.as_ptr(), len); }
-                b'c' => { let ch = read_arg(args, ai) as u8; ai += 1; emit!(ch); }
-                b'%' => { emit!(b'%'); }
-                0 => break,
-                _ => { emit!(b'%'); emit!(spec); }
+            continue;
+        }
+
+        i += 1;
+        let (spec, new_i) = parse_spec(fmt, i);
+        i = new_i;
+
+        let conv = *fmt.add(i);
+        if conv == 0 { break; }
+
+        match conv {
+            b's' => {
+                let s = read_arg(args, ai) as *const u8;
+                ai += 1;
+                if !s.is_null() {
+                    let len = crate::string::miku_strlen(s);
+                    let slice = core::slice::from_raw_parts(s, len);
+                    written += pad_and_emit(emit, slice, &spec);
+                }
             }
-        } else { emit!(c); }
+            b'd' | b'i' => {
+                let v = if spec.is_longlong || spec.is_long || spec.is_size {
+                    read_arg(args, ai) as i64
+                } else {
+                    read_arg(args, ai) as i32 as i64
+                };
+                ai += 1;
+                crate::num::miku_itoa(v, num_buf.as_mut_ptr());
+                let len = crate::string::miku_strlen(num_buf.as_ptr());
+                written += pad_and_emit(emit, &num_buf[..len], &spec);
+            }
+            b'u' => {
+                let v = if spec.is_longlong || spec.is_long || spec.is_size {
+                    read_arg(args, ai)
+                } else {
+                    read_arg(args, ai) as u32 as u64
+                };
+                ai += 1;
+                crate::num::miku_utoa(v, num_buf.as_mut_ptr());
+                let len = crate::string::miku_strlen(num_buf.as_ptr());
+                written += pad_and_emit(emit, &num_buf[..len], &spec);
+            }
+            b'x' => {
+                let v = if spec.is_longlong || spec.is_long || spec.is_size {
+                    read_arg(args, ai)
+                } else {
+                    read_arg(args, ai) as u32 as u64
+                };
+                ai += 1;
+                let len = crate::num::utoa_hex(v, num_buf.as_mut_ptr());
+                written += pad_and_emit(emit, &num_buf[..len], &spec);
+            }
+            b'X' => {
+                let v = if spec.is_longlong || spec.is_long || spec.is_size {
+                    read_arg(args, ai)
+                } else {
+                    read_arg(args, ai) as u32 as u64
+                };
+                ai += 1;
+                let len = crate::num::utoa_hex_upper(v, num_buf.as_mut_ptr());
+                written += pad_and_emit(emit, &num_buf[..len], &spec);
+            }
+            b'o' => {
+                let v = if spec.is_longlong || spec.is_long || spec.is_size {
+                    read_arg(args, ai)
+                } else {
+                    read_arg(args, ai) as u32 as u64
+                };
+                ai += 1;
+                let len = crate::num::utoa_oct(v, num_buf.as_mut_ptr());
+                written += pad_and_emit(emit, &num_buf[..len], &spec);
+            }
+            b'c' => {
+                let ch = read_arg(args, ai) as u8;
+                ai += 1;
+                let byte_arr = [ch];
+                written += pad_and_emit(emit, &byte_arr, &spec);
+            }
+            b'p' => {
+                let v = read_arg(args, ai);
+                ai += 1;
+                num_buf[0] = b'0';
+                num_buf[1] = b'x';
+                let hex_len = crate::num::utoa_hex(v, num_buf.as_mut_ptr().add(2));
+                let total_len = 2 + hex_len;
+                written += pad_and_emit(emit, &num_buf[..total_len], &spec);
+            }
+            b'%' => {
+                emit(b'%');
+                written += 1;
+            }
+            _ => {
+                emit(b'%');
+                emit(conv);
+                written += 2;
+            }
+        }
         i += 1;
     }
-    *buf.add(out) = 0;
-    out as i32
+    written
 }

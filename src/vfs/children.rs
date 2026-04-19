@@ -4,6 +4,7 @@ use crate::vfs::hash::name_hash;
 use crate::vfs::types::{InodeId, INVALID_ID};
 
 const INITIAL_CAPACITY: usize = 16;
+const CHILD_NAME_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -15,21 +16,49 @@ pub enum SlotState {
 
 #[derive(Clone, Copy)]
 pub struct ChildSlot {
-    pub hash:  u32,
-    pub id:    InodeId,
-    pub state: SlotState,
+    pub hash:     u32,
+    pub id:       InodeId,
+    pub state:    SlotState,
+    pub name_len: u8,
+    pub name:     [u8; CHILD_NAME_LEN],
 }
 
 impl ChildSlot {
     pub const EMPTY: Self = Self {
-        hash:  0,
-        id:    INVALID_ID,
-        state: SlotState::Empty,
+        hash:     0,
+        id:       INVALID_ID,
+        state:    SlotState::Empty,
+        name_len: 0,
+        name:     [0; CHILD_NAME_LEN],
     };
 
     #[inline]
     pub fn used(&self) -> bool {
         self.state == SlotState::Occupied
+    }
+
+    pub fn name_matches(&self, name: &str) -> bool {
+        let slen = self.name_len as usize;
+        if slen == 0 {
+            return false;
+        }
+        let nb = name.as_bytes();
+        if slen <= CHILD_NAME_LEN {
+            nb.len() == slen && nb == &self.name[..slen]
+        } else {
+            // name was truncated at storage time - fall back to hash-only match
+            nb.len() >= CHILD_NAME_LEN && nb[..CHILD_NAME_LEN] == self.name[..]
+        }
+    }
+
+    pub fn set_name(&mut self, name: &str) {
+        let bytes = name.as_bytes();
+        let copy_len = bytes.len().min(CHILD_NAME_LEN);
+        self.name[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        if copy_len < CHILD_NAME_LEN {
+            self.name[copy_len..].fill(0);
+        }
+        self.name_len = bytes.len().min(255) as u8;
     }
 }
 
@@ -87,7 +116,7 @@ impl Children {
         }
         let h = name_hash(name);
 
-        if self.contains_hash_and_id(h, id) {
+        if self.contains_name(h, name) {
             return false;
         }
 
@@ -100,7 +129,11 @@ impl Children {
             match self.slots[idx].state {
                 SlotState::Empty => {
                     let dst = tombstone_idx.unwrap_or(idx);
-                    self.slots[dst] = ChildSlot { hash: h, id, state: SlotState::Occupied };
+                    self.slots[dst] = ChildSlot {
+                        hash: h, id, state: SlotState::Occupied,
+                        name_len: 0, name: [0; CHILD_NAME_LEN],
+                    };
+                    self.slots[dst].set_name(name);
                     self.count += 1;
                     return true;
                 }
@@ -114,7 +147,11 @@ impl Children {
         }
 
         if let Some(idx) = tombstone_idx {
-            self.slots[idx] = ChildSlot { hash: h, id, state: SlotState::Occupied };
+            self.slots[idx] = ChildSlot {
+                hash: h, id, state: SlotState::Occupied,
+                name_len: 0, name: [0; CHILD_NAME_LEN],
+            };
+            self.slots[idx].set_name(name);
             self.count += 1;
             return true;
         }
@@ -122,8 +159,9 @@ impl Children {
         false
     }
 
-    fn contains_hash_and_id(&self, h: u32, id: InodeId) -> bool {
+    fn contains_name(&self, h: u32, name: &str) -> bool {
         let cap = self.cap();
+        if cap == 0 { return false; }
         let start = (h as usize) % cap;
         for i in 0..cap {
             let idx = (start + i) % cap;
@@ -131,13 +169,56 @@ impl Children {
                 SlotState::Empty     => return false,
                 SlotState::Tombstone => continue,
                 SlotState::Occupied  => {
-                    if self.slots[idx].hash == h && self.slots[idx].id == id {
+                    if self.slots[idx].hash == h && self.slots[idx].name_matches(name) {
                         return true;
                     }
                 }
             }
         }
         false
+    }
+
+    pub fn find_by_name(&self, name: &str) -> Option<InodeId> {
+        let h = name_hash(name);
+        let cap = self.cap();
+        if cap == 0 { return None; }
+        let start = (h as usize) % cap;
+        for i in 0..cap {
+            let idx = (start + i) % cap;
+            match self.slots[idx].state {
+                SlotState::Empty     => return None,
+                SlotState::Tombstone => continue,
+                SlotState::Occupied  => {
+                    if self.slots[idx].hash == h && self.slots[idx].name_matches(name) {
+                        return Some(self.slots[idx].id);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn remove_by_name(&mut self, name: &str) -> Option<InodeId> {
+        let h = name_hash(name);
+        let cap = self.cap();
+        if cap == 0 { return None; }
+        let start = (h as usize) % cap;
+        for i in 0..cap {
+            let idx = (start + i) % cap;
+            match self.slots[idx].state {
+                SlotState::Empty     => return None,
+                SlotState::Tombstone => continue,
+                SlotState::Occupied  => {
+                    if self.slots[idx].hash == h && self.slots[idx].name_matches(name) {
+                        let id = self.slots[idx].id;
+                        self.slots[idx].state = SlotState::Tombstone;
+                        if self.count > 0 { self.count -= 1; }
+                        return Some(id);
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn find_by_hash(&self, h: u32) -> ChildHashIter<'_> {

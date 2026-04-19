@@ -2,155 +2,217 @@ use crate::console;
 use crate::shell::SESSION;
 use crate::vfs::{
     self, with_vfs, with_vfs_ro, FileMode, OpenFlags, VNodeKind, VfsError, VfsResult,
-    MAX_VNODES, InodeId, FsType,
+    MAX_VNODES, InodeId, FsType, NAME_LEN,
 };
 use crate::{cprintln, print, print_error, print_success, println, serial_println};
 
-pub fn cmd_ls(path: &str) {
-    let cwd = { SESSION.lock().cwd };
-
-    let mut err    = false;
-    let mut notdir = false;
-
-    let mut vfs_only_names: [[u8; 23]; 32] = [[0; 23]; 32];
-    let mut vfs_only_nlens: [u8; 32]       = [0; 32];
-    let mut vfs_only_kinds: [u8; 32]       = [0; 32];
-    let mut vfs_only_count: usize          = 0;
-
-    let mut pure_vfs_names: [[u8; 23]; 32] = [[0; 23]; 32];
-    let mut pure_vfs_nlens: [u8; 32]       = [0; 32];
-    let mut pure_vfs_kinds: [u8; 32]       = [0; 32];
-    let mut pure_vfs_count: usize          = 0;
-
-    let mut vfs_has_ext_backing = false;
-
-    with_vfs(|vfs| {
-        let did = match vfs.resolve_path(cwd, path) {
-            Ok(v)  => v,
-            Err(_) => { err = true; return; }
-        };
-        if !vfs.nodes[did].is_dir() { notdir = true; return; }
-
-        let node_ext = vfs.nodes[did].ext2_ino;
-        vfs_has_ext_backing = vfs.nodes[did].fs_type == FsType::Ext2 && node_ext != 0;
-
-        let eff = vfs.xm(did);
-        for (_, child_id) in vfs.nodes[eff].children.iter() {
-            let cid = child_id as usize;
-            if cid >= MAX_VNODES || !vfs.nodes[cid].active { continue; }
-            let nm = vfs.nodes[cid].get_name().as_bytes();
-            let l  = nm.len().min(23);
-            let k  = vfs.nodes[cid].kind as u8;
-
-            if vfs.nodes[cid].ext2_ino == 0 && vfs_only_count < 32 {
-                vfs_only_names[vfs_only_count][..l].copy_from_slice(&nm[..l]);
-                vfs_only_nlens[vfs_only_count] = l as u8;
-                vfs_only_kinds[vfs_only_count] = k;
-                vfs_only_count += 1;
-            }
-            if pure_vfs_count < 32 {
-                pure_vfs_names[pure_vfs_count][..l].copy_from_slice(&nm[..l]);
-                pure_vfs_nlens[pure_vfs_count] = l as u8;
-                pure_vfs_kinds[pure_vfs_count] = k;
-                pure_vfs_count += 1;
-            }
+fn print_ls_vnode(name: &str, kind: VNodeKind) {
+    match kind {
+        VNodeKind::Directory => cprintln!(0, 220, 220, "  {}/", name),
+        VNodeKind::Symlink => cprintln!(128, 222, 217, "  {}@", name),
+        VNodeKind::CharDevice | VNodeKind::BlockDevice => {
+            cprintln!(220, 220, 100, "  {}*", name)
         }
+        VNodeKind::Pipe | VNodeKind::Fifo | VNodeKind::Socket => {
+            cprintln!(220, 220, 100, "  {}|", name)
+        }
+        _ => cprintln!(230, 240, 240, "  {}", name),
+    }
+}
+
+fn print_ls_ext(name: &str, file_type: u8) {
+    use crate::miku_extfs::structs::{FT_BLKDEV, FT_CHRDEV, FT_DIR, FT_FIFO, FT_SOCK, FT_SYMLINK};
+
+    match file_type {
+        FT_DIR => cprintln!(0, 220, 220, "  {}/", name),
+        FT_SYMLINK => cprintln!(128, 222, 217, "  {}@", name),
+        FT_CHRDEV | FT_BLKDEV => cprintln!(220, 220, 100, "  {}*", name),
+        FT_FIFO | FT_SOCK => cprintln!(220, 220, 100, "  {}|", name),
+        _ => cprintln!(230, 240, 240, "  {}", name),
+    }
+}
+
+fn ls_ext_dir(dir_ino: u32) -> VfsResult<()> {
+    use crate::miku_extfs::structs::DirEntry as ExtDirEntry;
+
+    let result = crate::commands::ext2_cmds::with_ext2_pub(|fs| -> VfsResult<()> {
+        let inode = fs.read_inode(dir_ino).map_err(|_| VfsError::IoError)?;
+        if !inode.is_directory() {
+            return Err(VfsError::NotDirectory);
+        }
+
+        let mut entries = [const { ExtDirEntry::empty() }; 256];
+        let count = fs.read_dir(&inode, &mut entries).map_err(|_| VfsError::IoError)?;
+
+        serial_println!("[ls_ext] ino={} size={} bs={} entries={}", dir_ino, inode.size(), fs.block_size, count);
+
+        cprintln!(120, 140, 140, "  ./");
+        cprintln!(120, 140, 140, "  ../");
+
+        for i in 0..count {
+            let e = &entries[i];
+            let name = e.name_str();
+            if name == "." || name == ".." {
+                continue;
+            }
+            print_ls_ext(name, e.file_type);
+        }
+
+        Ok(())
     });
 
-    if err    { print_error!("ls: not found"); return; }
-    if notdir { print_error!("ls: not a directory"); return; }
+    match result {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(e),
+        None => Err(VfsError::NotMounted),
+    }
+}
 
-    let abs_path_buf = {
-        let s = SESSION.lock();
-        let base = &s.path[..s.plen];
-        let mut buf = [0u8; 256];
-        let n = base.len().min(255);
-        buf[..n].copy_from_slice(&base[..n]);
-        if !path.is_empty() && path != "." {
-            let mut l = n;
-            if l > 0 && buf[l-1] != b'/' && l < 255 { buf[l] = b'/'; l += 1; }
-            let rb = path.as_bytes();
-            let rl = rb.len().min(255 - l);
-            buf[l..l+rl].copy_from_slice(&rb[..rl]);
-            (buf, l + rl)
-        } else {
-            (buf, n)
+pub fn cmd_ls(path: &str) {
+    let cwd = { SESSION.lock().cwd };
+    let mut overlay_names = [[0u8; NAME_LEN]; 32];
+    let mut overlay_lens = [0u8; 32];
+    let mut overlay_kinds = [VNodeKind::Regular; 32];
+
+    let vfs_info = with_vfs(|vfs| -> VfsResult<(FsType, u32, usize)> {
+        let dir_id = vfs.resolve_path(cwd, path)?;
+        if !vfs.nodes[dir_id].is_dir() {
+            return Err(VfsError::NotDirectory);
+        }
+        let eff = vfs.xm(dir_id);
+        let mut overlay_count = 0usize;
+        for (_, child_id) in vfs.nodes[eff].children.iter() {
+            if overlay_count >= overlay_names.len() {
+                break;
+            }
+            let cid = child_id as usize;
+            if cid >= MAX_VNODES || !vfs.nodes[cid].active || vfs.nodes[cid].ext2_ino != 0 {
+                continue;
+            }
+            let name = vfs.nodes[cid].get_name().as_bytes();
+            let len = name.len().min(NAME_LEN);
+            overlay_names[overlay_count][..len].copy_from_slice(&name[..len]);
+            overlay_lens[overlay_count] = len as u8;
+            overlay_kinds[overlay_count] = vfs.nodes[cid].kind;
+            overlay_count += 1;
+        }
+        Ok((vfs.nodes[dir_id].fs_type, vfs.nodes[dir_id].ext2_ino, overlay_count))
+    });
+
+    let mut overlay_count = 0usize;
+    let ext2_ready = crate::commands::ext2_cmds::is_ext2_ready();
+
+    let ext_lookup = match vfs_info {
+        Ok((fs_type, ext2_ino, n)) => {
+            overlay_count = n;
+            serial_println!("[ls] vfs ok: fs={:?} ext2_ino={} overlay={} ext2_ready={}", fs_type, ext2_ino, n, ext2_ready);
+            if fs_type.is_ext_family() && ext2_ino != 0 {
+                serial_println!("[ls] path A: ext-backed vnode ext2_ino={}", ext2_ino);
+                Some(Ok(ext2_ino))
+            } else if ext2_ready {
+                let abs = make_abs_path(path);
+                let abs_str = unsafe { core::str::from_utf8_unchecked(&abs.0[..abs.1]) };
+                serial_println!("[ls] path B: ext2 resolve '{}'", abs_str);
+                crate::commands::ext2_cmds::with_ext2_pub(|fs| {
+                    let ino = fs.resolve_path(abs_str).map_err(|e| {
+                        serial_println!("[ls] ext2 resolve err: {:?}", e);
+                        VfsError::NotFound
+                    })?;
+                    let inode = fs.read_inode(ino).map_err(|e| {
+                        serial_println!("[ls] ext2 read_inode err: {:?}", e);
+                        VfsError::IoError
+                    })?;
+                    if !inode.is_directory() {
+                        return Err(VfsError::NotDirectory);
+                    }
+                    serial_println!("[ls] ext2 resolved ino={}", ino);
+                    Ok(ino)
+                })
+            } else {
+                serial_println!("[ls] path C: ext2 not ready, vfs-only");
+                None
+            }
+        }
+        Err(VfsError::NotFound) => {
+            serial_println!("[ls] vfs NotFound, trying ext2 (ready={})", ext2_ready);
+            if ext2_ready {
+                let abs = make_abs_path(path);
+                let abs_str = unsafe { core::str::from_utf8_unchecked(&abs.0[..abs.1]) };
+                crate::commands::ext2_cmds::with_ext2_pub(|fs| {
+                    let ino = fs.resolve_path(abs_str).map_err(|_| VfsError::NotFound)?;
+                    let inode = fs.read_inode(ino).map_err(|_| VfsError::IoError)?;
+                    if !inode.is_directory() {
+                        return Err(VfsError::NotDirectory);
+                    }
+                    Ok(ino)
+                })
+            } else {
+                None
+            }
+        }
+        Err(VfsError::NotDirectory) => {
+            print_error!("ls: not a directory");
+            return;
+        }
+        Err(e) => {
+            print_error!("ls: {:?}", e);
+            return;
         }
     };
 
-    let ext_ready = crate::commands::ext2_cmds::is_ext2_ready();
+    if let Some(ext_lookup) = ext_lookup {
+        serial_println!("[ls] ext_lookup={:?}", ext_lookup);
+        match ext_lookup.and_then(ls_ext_dir) {
+            Ok(()) => {
+                serial_println!("[ls] ext ls ok, overlay={}", overlay_count);
+                for i in 0..overlay_count {
+                    let name =
+                        unsafe { core::str::from_utf8_unchecked(&overlay_names[i][..overlay_lens[i] as usize]) };
+                    if name != "." && name != ".." {
+                        print_ls_vnode(name, overlay_kinds[i]);
+                    }
+                }
+                return;
+            }
+            Err(VfsError::NotFound) => {
+                serial_println!("[ls] ext ls NotFound, fallback to vfs");
+            }
+            Err(e) => {
+                print_error!("ls: {:?}", e);
+                serial_println!("[ls] ext ls err: {:?}", e);
+                return;
+            }
+        }
+    }
 
-    let disk_ino: Option<u32> = if ext_ready {
-        let abs_str = unsafe { core::str::from_utf8_unchecked(&abs_path_buf.0[..abs_path_buf.1]) };
-        let lookup = if abs_path_buf.1 == 0 || abs_path_buf.1 == 1 && abs_path_buf.0[0] == b'/' {
-            "/"
-        } else {
-            abs_str
-        };
-        crate::commands::ext2_cmds::with_ext2_pub(|fs| fs.resolve_path(lookup))
-            .and_then(|r| r.ok())
-    } else {
-        None
+    serial_println!("[ls] vfs-only readdir");
+    let mut entries = [vfs::DirEntry::empty(); 256];
+
+    let count = match with_vfs(|vfs| -> VfsResult<usize> {
+        let dir_id = vfs.resolve_path(cwd, path)?;
+        if !vfs.nodes[dir_id].is_dir() {
+            return Err(VfsError::NotDirectory);
+        }
+        vfs.readdir(dir_id, &mut entries)
+    }) {
+        Ok(n) => n,
+        Err(VfsError::NotFound) => {
+            print_error!("ls: not found");
+            return;
+        }
+        Err(VfsError::NotDirectory) => {
+            print_error!("ls: not a directory");
+            return;
+        }
+        Err(e) => {
+            print_error!("ls: {:?}", e);
+            return;
+        }
     };
 
-    let ext_tag = if ext_ready {
-        crate::commands::ext2_cmds::ext_fs_version_tag()
-    } else { "" };
-
-    cprintln!(120, 140, 140, "  ./");
-    cprintln!(120, 140, 140, "  ../");
-
-    if let Some(dir_ino) = disk_ino {
-        use crate::commands::ext2_cmds::with_ext2_pub;
-        use crate::miku_extfs::structs::{DirEntry, FT_DIR, FT_SYMLINK};
-
-        let disk_result = with_ext2_pub(|fs| -> Result<([DirEntry; 64], [u64; 64], usize), crate::miku_extfs::FsError> {
-            let inode = fs.read_inode(dir_ino)?;
-            if !inode.is_directory() { return Err(crate::miku_extfs::FsError::NotDirectory); }
-            let mut entries = [const { DirEntry::empty() }; 64];
-            let n = fs.read_dir(&inode, &mut entries)?;
-            let mut sizes = [0u64; 64];
-            for i in 0..n {
-                if let Ok(ch) = fs.read_inode(entries[i].inode) {
-                    sizes[i] = ch.size() as u64;
-                }
-            }
-            Ok((entries, sizes, n))
-        });
-
-        if let Some(Ok((entries, esizes, n))) = disk_result {
-            for i in 0..n {
-                let name = entries[i].name_str();
-                if name == "." || name == ".." { continue; }
-                match entries[i].file_type {
-                    FT_DIR     => cprintln!(0, 220, 220,   "  {}/ ({})", name, ext_tag),
-                    FT_SYMLINK => cprintln!(128, 222, 217, "  {}@ ({})", name, ext_tag),
-                    _          => cprintln!(230, 240, 240, "  {} ({}) ({}b)", name, ext_tag, esizes[i]),
-                }
-            }
-        }
-
-        for i in 0..vfs_only_count {
-            let nm  = unsafe { core::str::from_utf8_unchecked(&vfs_only_names[i][..vfs_only_nlens[i] as usize]) };
-            let tag = if nm == "proc" || nm == "dev" || nm == "mnt" { "[vfs]" } else { "[ram]" };
-            match vfs_only_kinds[i] {
-                1 => cprintln!(0, 220, 220,   "  {}/ {}", nm, tag),
-                2 => cprintln!(128, 222, 217, "  {}@ {}", nm, tag),
-                _ => cprintln!(230, 240, 240, "  {} {}", nm, tag),
-            }
-        }
-    } else {
-        for i in 0..pure_vfs_count {
-            let nm = unsafe { core::str::from_utf8_unchecked(&pure_vfs_names[i][..pure_vfs_nlens[i] as usize]) };
-            match pure_vfs_kinds[i] {
-                1     => cprintln!(0, 220, 220,   "  {}/", nm),
-                2     => cprintln!(128, 222, 217, "  {}@", nm),
-                3 | 4 => cprintln!(220, 220, 100, "  {}*", nm),
-                5     => cprintln!(220, 220, 100, "  {}|", nm),
-                6     => cprintln!(220, 220, 100, "  {}=", nm),
-                _     => cprintln!(230, 240, 240, "  {}", nm),
-            }
-        }
+    serial_println!("[ls] vfs readdir: {} entries", count);
+    for i in 0..count {
+        print_ls_vnode(entries[i].get_name(), entries[i].kind);
     }
 }
 
@@ -233,7 +295,7 @@ pub fn cmd_cd(arg: &str) {
             cwd as InodeId,
             dirname,
             VNodeKind::Directory,
-            FsType::Ext2,
+            crate::commands::ext2_cmds::active_fs_type(),
             FileMode::new(0o755),
             0, 0, ts,
         );
@@ -269,12 +331,6 @@ pub fn cmd_mkdir(name: &str) {
 
 pub fn cmd_touch(name: &str) {
     let cwd = SESSION.lock().cwd;
-    let parent_fs = with_vfs(|v| v.nodes[cwd].fs_type);
-
-    if parent_fs == FsType::Ext2 && crate::commands::ext2_cmds::is_ext2_ready() {
-        cmd_exttouch(name);
-        return;
-    }
 
     with_vfs(|v| match v.resolve_path(cwd, name) {
         Ok(_) => {}
@@ -388,11 +444,6 @@ pub fn cmd_write(name: &str, text: &str) {
         let fl = OpenFlags(OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE);
         match v.open(cwd, name, fl, FileMode::default_file()) {
             Ok(fd) => {
-                let vid = v.fd_table.get(fd).map(|f| f.vnode_id as usize).unwrap_or(0);
-                if vid != 0 {
-                    v.nodes[vid].fs_type = FsType::TmpFS;
-                    v.nodes[vid].ext2_ino = 0;
-                }
                 match v.write(fd, text.as_bytes()) {
                     Ok(n) => print_success!("\nWrote {} bytes", n),
                     Err(e) => print_error!("write: {:?}", e),
@@ -421,14 +472,18 @@ pub fn cmd_stat(path: &str) {
                 fs.resolve_path(abs_str).ok()
             }).flatten();
             match ino {
-                Some(ino) => (FsType::Ext2, ino, unsafe { core::mem::zeroed() }),
+                Some(ino) => (
+                    crate::commands::ext2_cmds::active_fs_type(),
+                    ino,
+                    unsafe { core::mem::zeroed() },
+                ),
                 None => { print_error!("stat: not found"); return; }
             }
         }
         Err(e) => { print_error!("stat: {:?}", e); return; }
     };
 
-    let fs_name: &str = if fs_type == FsType::Ext2 && crate::commands::ext2_cmds::is_ext2_ready() {
+    let fs_name: &str = if fs_type.is_ext_family() && crate::commands::ext2_cmds::is_ext2_ready() {
         ext_version()
     } else {
         match fs_type {
@@ -439,7 +494,7 @@ pub fn cmd_stat(path: &str) {
         }
     };
 
-    if fs_type == FsType::Ext2 && ext2_ino != 0 && crate::commands::ext2_cmds::is_ext2_ready() {
+    if fs_type.is_ext_family() && ext2_ino != 0 && crate::commands::ext2_cmds::is_ext2_ready() {
         let disk = crate::commands::ext2_cmds::with_ext2_pub(|fs| {
             fs.read_inode(ext2_ino).ok()
         }).flatten();
@@ -488,7 +543,7 @@ pub fn cmd_rm(path: &str) {
             print_error!("rm: permission denied (read-only fs)");
             return;
         }
-        Ok((_, FsType::Ext2, ext_ino)) => {
+        Ok((_, ft, ext_ino)) if ft.is_ext_family() => {
             if ext_ino != 0 {
                 ext_rm(path);
             }
@@ -535,14 +590,14 @@ pub fn cmd_rm_rf(path: &str) {
         Ok((_, _, FsType::ProcFS)) | Ok((_, _, FsType::DevFS)) => {
             print_error!("rm -rf: permission denied (read-only fs)");
         }
-        Ok((_, VNodeKind::Directory, FsType::Ext2)) => {
+        Ok((_, VNodeKind::Directory, ft)) if ft.is_ext_family() => {
             crate::commands::ext2_cmds::cmd_ext2_rm_rf(path);
             let _ = with_vfs(|v| v.rmdir(cwd, path));
         }
         Ok((_, VNodeKind::Directory, _)) => {
             recursive_rm(cwd, path);
         }
-        Ok((_, _, FsType::Ext2)) => {
+        Ok((_, _, ft)) if ft.is_ext_family() => {
             ext_rm(path);
             let _ = with_vfs(|v| v.unlink(cwd, path));
         }
@@ -633,7 +688,7 @@ pub fn cmd_rmdir(path: &str) {
 
     let ext_info = with_vfs(|v| {
         let id = v.resolve_path(cwd, path).ok()?;
-        if v.nodes[id].fs_type == crate::vfs::FsType::Ext2 && v.nodes[id].ext2_ino != 0 {
+        if v.nodes[id].fs_type.is_ext_family() && v.nodes[id].ext2_ino != 0 {
             Some(v.nodes[id].ext2_ino)
         } else {
             None
@@ -664,7 +719,7 @@ pub fn cmd_mv(old: &str, new: &str) {
     });
 
     match node_info {
-        Ok((FsType::Ext2, _)) => {
+        Ok((ft, _)) if ft.is_ext_family() => {
             let abs_old = make_abs_path(old);
             let abs_old_str = unsafe { core::str::from_utf8_unchecked(&abs_old.0[..abs_old.1]) };
             let new_name = new.rsplit('/').next().unwrap_or(new);
@@ -811,7 +866,7 @@ pub fn cmd_umount(path: &str) {
             return Err(VfsError::InvalidArgument);
         }
 
-        vfs.evict_ext2_children(id);
+        vfs.evict_children_recursive(id);
         vfs.nodes[id].fs_type = FsType::TmpFS;
         vfs.nodes[id].ext2_ino = 0;
         vfs.nodes[id].children_loaded = false;
@@ -846,6 +901,9 @@ fn mount_ext2_to_vfs(mountpoint: &str) {
             Ok(id) => {
                 if !vfs.nodes[id].is_dir() {
                     return Err(VfsError::NotDirectory);
+                }
+                if !vfs.nodes[id].children.is_empty() || vfs.nodes[id].fs_type.is_ext_family() {
+                    vfs.evict_children_recursive(id);
                 }
                 id
             }

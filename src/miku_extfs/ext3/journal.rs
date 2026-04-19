@@ -279,7 +279,7 @@ impl MikuFS {
             offset += 8;
         }
         let desc_disk_block = self.journal_block_to_disk(self.txn_desc_pos)?;
-        self.write_block_data(desc_disk_block, &desc[..bs])?;
+        self.write_block_direct_nocache(desc_disk_block, &desc[..bs])?;
 
         for i in 0..tag_count {
             let fs_block = self.txn_tags[i].fs_block;
@@ -288,18 +288,22 @@ impl MikuFS {
             self.read_block_into(fs_block, &mut buf[..bs])?;
             let jdb = self.journal_block_to_disk(journal_pos)?;
             if jdb != 0 {
-                self.write_block_data(jdb, &buf[..bs])?;
+                self.write_block_direct_nocache(jdb, &buf[..bs])?;
             }
         }
 
         self.ext3_write_revoke_block()?;
+
+        // Journal blocks written direct to disk (no cache pollution).
+        // FS data blocks stay in cache - pdflush writes lazily.
+        // No sync_dirty_blocks, no flush_drive = fast commit.
 
         let mut commit = [0u8; 4096];
         commit[0..4].copy_from_slice(&JBD_MAGIC.to_be_bytes());
         commit[4..8].copy_from_slice(&JBD_COMMIT_BLOCK.to_be_bytes());
         commit[8..12].copy_from_slice(&self.journal_seq.to_be_bytes());
         let commit_disk_block = self.journal_block_to_disk(self.journal_pos)?;
-        self.write_block_data(commit_disk_block, &commit[..bs])?;
+        self.write_block_direct_nocache(commit_disk_block, &commit[..bs])?;
         self.journal_pos = self.advance_journal_pos(self.journal_pos);
 
         self.mark_journal_dirty_fast()?;
@@ -313,6 +317,18 @@ impl MikuFS {
     }
 
 	fn mark_journal_dirty_fast(&mut self) -> Result<(), FsError> {
+        let disk_blk = self.journal_block_to_disk(0)?;
+        if disk_blk == 0 { return Err(FsError::CorruptedFs); }
+        let bs = self.block_size as usize;
+        let mut buf = [0u8; 4096];
+        self.read_block_into(disk_blk, &mut buf[..bs])?;
+        buf[24..28].copy_from_slice(&self.journal_seq.to_be_bytes());
+        buf[28..32].copy_from_slice(&self.txn_desc_pos.to_be_bytes());
+        self.write_block_data_direct(disk_blk, &buf[..bs])?;
+        Ok(())
+    }
+
+    fn mark_journal_dirty_cached(&mut self) -> Result<(), FsError> {
         let disk_blk = self.journal_block_to_disk(0)?;
         if disk_blk == 0 { return Err(FsError::CorruptedFs); }
         let bs = self.block_size as usize;
@@ -456,6 +472,27 @@ impl MikuFS {
         }
         let revoke_disk_block = self.journal_block_to_disk(self.journal_pos)?;
         self.write_block_data_direct(revoke_disk_block, &revoke_data[..bs])?;
+        self.journal_pos = self.advance_journal_pos(self.journal_pos);
+        self.txn_revoke_count = 0;
+        Ok(())
+    }
+
+    pub fn ext3_write_revoke_block_cached(&mut self) -> Result<(), FsError> {
+        if self.txn_revoke_count == 0 { return Ok(()); }
+        let bs = self.block_size as usize;
+        let mut revoke_data = [0u8; 4096];
+        revoke_data[0..4].copy_from_slice(&JBD_MAGIC.to_be_bytes());
+        revoke_data[4..8].copy_from_slice(&JBD_REVOKE_BLOCK.to_be_bytes());
+        revoke_data[8..12].copy_from_slice(&self.journal_seq.to_be_bytes());
+        let count = self.txn_revoke_count as usize;
+        let record_size = 16 + count * 4;
+        revoke_data[12..16].copy_from_slice(&(record_size as u32).to_be_bytes());
+        for i in 0..count {
+            let offset = 16 + i * 4;
+            revoke_data[offset..offset+4].copy_from_slice(&self.txn_revokes[i].to_be_bytes());
+        }
+        let revoke_disk_block = self.journal_block_to_disk(self.journal_pos)?;
+        self.write_block_data(revoke_disk_block, &revoke_data[..bs])?;
         self.journal_pos = self.advance_journal_pos(self.journal_pos);
         self.txn_revoke_count = 0;
         Ok(())

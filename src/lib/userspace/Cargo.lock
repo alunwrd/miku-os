@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "miku-app"
+name = "miku-apps"
 version = "0.0.1"

@@ -102,10 +102,9 @@ impl PathWalker {
         parent: usize,
         name: &str,
     ) -> VfsResult<usize> {
-        let h = name_hash(name);
-        for candidate_id in nodes[parent].children.find_by_hash(h) {
-            let cid = candidate_id as usize;
-            if cid < MAX_VNODES && nodes[cid].active && nodes[cid].name_eq(name) {
+        if let Some(id) = nodes[parent].children.find_by_name(name) {
+            let cid = id as usize;
+            if cid < MAX_VNODES && nodes[cid].active {
                 return Ok(cid);
             }
         }

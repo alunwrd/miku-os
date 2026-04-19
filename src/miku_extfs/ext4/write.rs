@@ -45,6 +45,12 @@ impl MikuFS {
         if !inode.is_regular() {
             return Err(FsError::NotRegularFile);
         }
+        if inode.has_flag(EXT4_IMMUTABLE_FL) {
+            return Err(FsError::ReadOnlyFs);
+        }
+        if inode.has_flag(EXT4_APPEND_FL) && offset < inode.size() {
+            return Err(FsError::ReadOnlyFs);
+        }
         let bs = self.block_size as usize;
         let mut done = 0usize;
         while done < data.len() {
@@ -69,6 +75,7 @@ impl MikuFS {
         }
         let now = self.get_timestamp();
         inode.set_mtime(now);
+        inode.set_ctime(now);
         self.write_inode(inode_num, &inode)?;
         Ok(done)
     }
@@ -93,6 +100,13 @@ impl MikuFS {
         inode.init_file_ext4(mode, 0, 0, now);
         self.write_inode(new_ino, &inode)?;
         self.add_dir_entry(parent_ino, name, new_ino, FT_REG_FILE)?;
+
+        // update parent dir timestamps
+        let mut parent_inode = self.read_inode(parent_ino)?;
+        parent_inode.set_mtime(now);
+        parent_inode.set_ctime(now);
+        self.write_inode(parent_ino, &parent_inode)?;
+
         Ok(new_ino)
     }
 
@@ -144,6 +158,7 @@ impl MikuFS {
         let links = parent_inode.links_count() + 1;
         parent_inode.set_links_count(links);
         parent_inode.set_mtime(now);
+        parent_inode.set_ctime(now);
         self.write_inode(parent_ino, &parent_inode)?;
 
         let gidx = ((new_ino - 1) / self.inodes_per_group) as usize;
@@ -170,6 +185,7 @@ impl MikuFS {
         inode.set_blocks(0);
         let now = self.get_timestamp();
         inode.set_mtime(now);
+        inode.set_ctime(now);
         self.write_inode(inode_num, &inode)?;
         Ok(())
     }
@@ -179,17 +195,40 @@ impl MikuFS {
             Some(ino) => ino,
             None => return Err(FsError::NotFound),
         };
-        let inode = self.read_inode(target_ino)?;
+        let mut inode = self.read_inode(target_ino)?;
         if inode.is_directory() {
             return Err(FsError::IsDirectory);
         }
-        if inode.uses_extents() {
-            self.ext4_free_extent_blocks(&inode)?;
-        } else if !inode.is_symlink() || !inode.is_fast_symlink() {
-            self.free_all_blocks(&inode)?;
-        }
-        self.free_inode(target_ino)?;
+
         self.remove_dir_entry(parent_ino, name)?;
+
+        let links = inode.links_count();
+        if links <= 1 {
+            // last link - free blocks and inode
+            if inode.uses_extents() {
+                self.ext4_free_extent_blocks(&inode)?;
+            } else if !inode.is_symlink() || !inode.is_fast_symlink() {
+                self.free_all_blocks(&inode)?;
+            }
+            let now = self.get_timestamp();
+            inode.set_dtime(now);
+            self.write_inode(target_ino, &inode)?;
+            self.free_inode(target_ino)?;
+        } else {
+            // decrement link count
+            inode.set_links_count(links - 1);
+            let now = self.get_timestamp();
+            inode.set_ctime(now);
+            self.write_inode(target_ino, &inode)?;
+        }
+
+        // update parent dir timestamps
+        let now = self.get_timestamp();
+        let mut parent_inode = self.read_inode(parent_ino)?;
+        parent_inode.set_mtime(now);
+        parent_inode.set_ctime(now);
+        self.write_inode(parent_ino, &parent_inode)?;
+
         Ok(())
     }
 
@@ -219,12 +258,44 @@ impl MikuFS {
             parent_inode.set_links_count(links - 1);
         }
         parent_inode.set_mtime(now);
+        parent_inode.set_ctime(now);
         self.write_inode(parent_ino, &parent_inode)?;
         let gidx = ((target_ino - 1) / self.inodes_per_group) as usize;
         if gidx < 32 {
             self.groups[gidx].dec_used_dirs();
             self.flush_group_desc(gidx)?;
         }
+        Ok(())
+    }
+
+    // preallocate blocks for a file (fallocate)
+    pub fn ext4_fallocate(
+        &mut self,
+        inode_num: u32,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), FsError> {
+        let mut inode = self.read_inode(inode_num)?;
+        if !inode.is_regular() {
+            return Err(FsError::NotRegularFile);
+        }
+        let bs = self.block_size as u64;
+        let start_block = (offset / bs) as u32;
+        let end_block = ((offset + len + bs - 1) / bs) as u32;
+
+        for logical in start_block..end_block {
+            self.ext4_ensure_block(&mut inode, inode_num, logical)?;
+            inode = self.read_inode(inode_num)?;
+        }
+
+        let new_end = offset + len;
+        if new_end > inode.size() {
+            inode.set_size_full(new_end);
+        }
+        let now = self.get_timestamp();
+        inode.set_mtime(now);
+        inode.set_ctime(now);
+        self.write_inode(inode_num, &inode)?;
         Ok(())
     }
 

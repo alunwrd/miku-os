@@ -120,12 +120,49 @@ where
     STATE.lock().active_fs().map(f)
 }
 
+fn invalidate_vfs_ext_mounts() {
+    let mut dropped_any = false;
+
+    crate::vfs::core::with_vfs(|vfs| {
+        for id in 0..crate::vfs::MAX_VNODES {
+            if !vfs.nodes[id].active {
+                continue;
+            }
+            if !vfs.nodes[id].fs_type.is_ext_family() {
+                continue;
+            }
+            if !vfs.nodes[id].is_dir() || vfs.nodes[id].ext2_ino != EXT2_ROOT_INO {
+                continue;
+            }
+
+            vfs.evict_children_recursive(id);
+            vfs.nodes[id].fs_type = crate::vfs::FsType::TmpFS;
+            vfs.nodes[id].ext2_ino = 0;
+            vfs.nodes[id].children_loaded = false;
+            dropped_any = true;
+        }
+
+        if dropped_any {
+            vfs.ext2_mount_active = false;
+        }
+    });
+
+    if dropped_any {
+        let mut s = crate::shell::SESSION.lock();
+        s.cwd = 0;
+        s.path[0] = b'/';
+        s.plen = 1;
+    }
+}
+
 pub fn force_unmount() {
     let mut state = STATE.lock();
     let slot = state.active_slot;
     state.ready[slot] = false;
     state.slots[slot].block_cache = None;
     state.slots[slot].journal_inode_cached = None;
+    drop(state);
+    invalidate_vfs_ext_mounts();
 }
 
 pub fn cmd_fs_list() {
@@ -192,6 +229,8 @@ pub fn cmd_fs_umount(args: &str) {
         crate::print_warn!("  slot {} is already empty", slot);
         return;
     }
+    let _ = state.slots[slot].sync();
+    state.slots[slot].mark_clean_unmount();
     let _ = state.slots[slot].flush_all_dirty_metadata();
     state.ready[slot] = false;
     state.slots[slot].block_cache = None;
@@ -204,6 +243,8 @@ pub fn cmd_fs_umount(args: &str) {
             println!("  active slot switched to {}", other);
         }
     }
+    drop(state);
+    invalidate_vfs_ext_mounts();
 }
 
 fn resolve_parent_and_name<'a>(fs: &mut MikuFS, path: &'a str) -> Result<(u32, &'a str), FsError> {
@@ -245,17 +286,24 @@ fn make_ata_drive(idx: usize) -> AtaDrive {
 
 pub fn invalidate_drive_mounts(drive_idx: usize, start_lba: u32) {
     let mut state = STATE.lock();
+    let mut invalidated_any = false;
     for i in 0..MAX_MOUNTS {
         if state.ready[i] && state.drive_idx[i] == drive_idx && state.start_lba[i] == start_lba {
             let _ = state.slots[i].flush_all_dirty_metadata();
             state.ready[i] = false;
             state.slots[i].block_cache = None;
             state.slots[i].journal_inode_cached = None;
+            invalidated_any = true;
             serial_println!(
                 "[miku_extfs] slot {} invalidated (drive {} lba {} reformatted)",
                 i, drive_idx, start_lba
             );
         }
+    }
+    drop(state);
+
+    if invalidated_any {
+        invalidate_vfs_ext_mounts();
     }
 }
 
@@ -444,6 +492,17 @@ fn try_mount(drive_index: usize, start_lba: u32) -> bool {
         }
     }
 
+    // cleanup orphan inodes left by unclean shutdown
+    match state.slots[slot].cleanup_orphans() {
+        Ok(0) => {}
+        Ok(n) => serial_println!("[mount] cleaned {} orphan inodes", n),
+        Err(e) => serial_println!("[mount] orphan cleanup failed: {:?}", e),
+    }
+
+    // update mount state in superblock
+    state.slots[slot].update_mount_state();
+    let _ = state.slots[slot].flush_all_dirty_metadata();
+
     let total_inodes = state.slots[slot].superblock.inodes_count();
     let free_blocks  = state.slots[slot].superblock.free_blocks_count();
     let free_inodes  = state.slots[slot].superblock.free_inodes_count();
@@ -461,11 +520,11 @@ fn try_mount(drive_index: usize, start_lba: u32) -> bool {
 
 pub fn cmd_ext2_ls(path: &str) {
     let path = if path.is_empty() { "/" } else { path };
-    let result = with_ext2(|fs| -> Result<([DirEntry; 64], usize), FsError> {
+    let result = with_ext2(|fs| -> Result<([DirEntry; 256], usize), FsError> {
         let ino = fs.resolve_path(path)?;
         let inode = fs.read_inode(ino)?;
         if !inode.is_directory() { return Err(FsError::NotDirectory); }
-        let mut entries = [const { DirEntry::empty() }; 64];
+        let mut entries = [const { DirEntry::empty() }; 256];
         let count = fs.read_dir(&inode, &mut entries)?;
         Ok((entries, count))
     });
@@ -1008,4 +1067,158 @@ pub fn cmd_ext4_write(path: &str, text: &str) {
     }
     let render_us = render_sw.elapsed_us();
     crate::serial_println!("[timing] ext4write disk={}ms render={}us", disk_ms, render_us);
+}
+
+pub fn cmd_fiemap(path: &str) {
+    if path.is_empty() { println!("Usage: fiemap <path>"); return; }
+    let result = with_ext2(|fs| -> Result<(), FsError> {
+        let ino = fs.resolve_path(path)?;
+        let mut extents = [(0u32, 0u32, 0u32); 64];
+        let count = fs.ext4_fiemap(ino, &mut extents)?;
+        println!("  File extent map for inode {}:", ino);
+        if count == 0 {
+            println!("  (no extents / empty file)");
+        }
+        let mut total_blocks = 0u32;
+        for i in 0..count {
+            let (logical, phys, len) = extents[i];
+            println!("    [{:2}] logical={:<6} phys={:<8} len={}", i, logical, phys, len);
+            total_blocks += len;
+        }
+        println!("  {} extents, {} blocks total", count, total_blocks);
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(e)) => print_error!("  fiemap: {:?}", e),
+        None         => print_error!("  ext2 not mounted"),
+    }
+}
+
+pub fn cmd_getxattr(path: &str, name: &str) {
+    if path.is_empty() || name.is_empty() { println!("Usage: getxattr <path> <name>"); return; }
+    let result = with_ext2(|fs| -> Result<(), FsError> {
+        let ino = fs.resolve_path(path)?;
+        let mut buf = [0u8; 256];
+        let len = fs.get_xattr(ino, crate::miku_extfs::xattr::XATTR_INDEX_USER, name, &mut buf)?;
+        if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+            println!("  {}=\"{}\"", name, s);
+        } else {
+            println!("  {} = [{} bytes]", name, len);
+        }
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(FsError::NotFound)) => print_error!("  xattr '{}' not found", name),
+        Some(Err(e)) => print_error!("  getxattr: {:?}", e),
+        None         => print_error!("  ext2 not mounted"),
+    }
+}
+
+pub fn cmd_setxattr(path: &str, name: &str, value: &str) {
+    if path.is_empty() || name.is_empty() { println!("Usage: setxattr <path> <name> <value>"); return; }
+    let result = with_ext2(|fs| -> Result<(), FsError> {
+        let ino = fs.resolve_path(path)?;
+        fs.set_xattr(ino, crate::miku_extfs::xattr::XATTR_INDEX_USER, name, value.as_bytes())
+    });
+    match result {
+        Some(Ok(())) => print_success!("  xattr '{}' set", name),
+        Some(Err(e)) => print_error!("  setxattr: {:?}", e),
+        None         => print_error!("  ext2 not mounted"),
+    }
+}
+
+pub fn cmd_listxattr(path: &str) {
+    if path.is_empty() { println!("Usage: listxattr <path>"); return; }
+    let result = with_ext2(|fs| -> Result<(), FsError> {
+        let ino = fs.resolve_path(path)?;
+        let list = fs.read_xattrs(ino)?;
+        if list.count == 0 {
+            println!("  (no extended attributes)");
+        }
+        for i in 0..list.count {
+            let e = &list.entries[i];
+            let ns = match e.name_index {
+                1 => "user",
+                2 => "system.posix_acl_access",
+                3 => "system.posix_acl_default",
+                4 => "trusted",
+                6 => "security",
+                7 => "system",
+                _ => "unknown",
+            };
+            if let Ok(val) = core::str::from_utf8(&e.value[..e.value_len as usize]) {
+                println!("  {}.{}=\"{}\"", ns, e.name_str(), val);
+            } else {
+                println!("  {}.{} = [{} bytes]", ns, e.name_str(), e.value_len);
+            }
+        }
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(e)) => print_error!("  listxattr: {:?}", e),
+        None         => print_error!("  ext2 not mounted"),
+    }
+}
+
+pub fn cmd_chattr(flags_str: &str, path: &str) {
+    let result = with_ext2(|fs| -> Result<(), FsError> {
+        let ino = fs.resolve_path(path)?;
+        let inode = fs.read_inode(ino)?;
+        let mut flags = inode.flags();
+        let adding = flags_str.starts_with('+');
+        let removing = flags_str.starts_with('-');
+        if !adding && !removing {
+            return Err(FsError::InvalidArg);
+        }
+        let chars = &flags_str[1..];
+        for c in chars.bytes() {
+            let flag = match c {
+                b'i' => EXT4_IMMUTABLE_FL,
+                b'a' => EXT4_APPEND_FL,
+                b'd' => EXT4_NODUMP_FL,
+                b'A' => EXT4_NOATIME_FL,
+                _ => continue,
+            };
+            if adding { flags |= flag; } else { flags &= !flag; }
+        }
+        let mut inode = fs.read_inode(ino)?;
+        inode.set_flags(flags);
+        let now = fs.get_timestamp();
+        inode.set_ctime(now);
+        fs.write_inode(ino, &inode)
+    });
+    match result {
+        Some(Ok(())) => print_success!("  flags updated"),
+        Some(Err(e)) => print_error!("  chattr: {:?}", e),
+        None         => print_error!("  ext2 not mounted"),
+    }
+}
+
+pub fn cmd_lsattr(path: &str) {
+    if path.is_empty() { println!("Usage: lsattr <path>"); return; }
+    let result = with_ext2(|fs| -> Result<(), FsError> {
+        let ino = fs.resolve_path(path)?;
+        let inode = fs.read_inode(ino)?;
+        let f = inode.flags();
+        let mut attrs = [b'-'; 8];
+        if f & EXT4_IMMUTABLE_FL != 0 { attrs[0] = b'i'; }
+        if f & EXT4_APPEND_FL != 0 { attrs[1] = b'a'; }
+        if f & EXT4_NODUMP_FL != 0 { attrs[2] = b'd'; }
+        if f & EXT4_NOATIME_FL != 0 { attrs[3] = b'A'; }
+        if f & EXT4_EXTENTS_FL != 0 { attrs[4] = b'e'; }
+        if f & EXT4_INDEX_FL != 0 { attrs[5] = b'I'; }
+        if f & EXT4_HUGE_FILE_FL != 0 { attrs[6] = b'h'; }
+        if f & EXT4_INLINE_DATA_FL != 0 { attrs[7] = b'N'; }
+        let s = core::str::from_utf8(&attrs).unwrap_or("--------");
+        println!("  {} {}", s, path);
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(e)) => print_error!("  lsattr: {:?}", e),
+        None         => print_error!("  ext2 not mounted"),
+    }
 }

@@ -35,8 +35,7 @@ pub fn read_from_vfs(path: &str) -> Option<Vec<u8>> {
         use crate::vfs::types::{OpenFlags, FileMode};
         let fl = OpenFlags(OpenFlags::READ);
         let fd = vfs.open(0, path, fl, FileMode::default_file()).ok()?;
-        let vid = vfs.fd_table.get(fd).ok()?.vnode_id as usize;
-        let size = vfs.nodes[vid].size as usize;
+        let size = vfs.fstat(fd).ok()?.size as usize;
         if size == 0 {
             let _ = vfs.close(fd);
             return None;
@@ -106,6 +105,7 @@ pub fn read_file_strict(path: &str) -> Result<Vec<u8>, ReadError> {
             return Err(FsError::NotRegularFile);
         }
         let total = inode.size() as usize;
+        crate::serial_println!("[vfs_read] '{}' ino={} size={} blocks={}", path, ino, total, inode.blocks());
         if total == 0 {
             return Ok(Vec::new());
         }
@@ -115,9 +115,14 @@ pub fn read_file_strict(path: &str) -> Result<Vec<u8>, ReadError> {
             let chunk = READ_CHUNK.min(total - offset);
             let n = fs.read_file(&inode, offset as u64, &mut buf[offset..offset + chunk])?;
             if n == 0 {
+                crate::serial_println!("[vfs_read] warning: read_file returned 0 at offset {}/{}", offset, total);
                 break;
             }
             offset += n;
+        }
+        if offset < total {
+            crate::serial_println!("[vfs_read] warning: only read {}/{} bytes, truncating", offset, total);
+            buf.truncate(offset);
         }
         Ok(buf)
     });

@@ -1,3 +1,5 @@
+extern crate alloc;
+use alloc::collections::BTreeMap;
 use spin::Mutex;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -249,4 +251,57 @@ pub fn free_frames(phys: u64, count: usize) {
 pub fn stats() -> (usize, usize) {
     let p = PMM.lock();
     (p.used, p.total)
+}
+
+//  refcount for COW pages //
+// Only pages with refcount >= 2 are tracked. Absent = refcount 1
+
+static REFCOUNTS: Mutex<BTreeMap<u64, u16>> = Mutex::new(BTreeMap::new());
+
+pub fn ref_inc(phys: u64) {
+    let frame = phys & !0xFFF;
+    let mut rc = REFCOUNTS.lock();
+    let entry = rc.entry(frame).or_insert(1);
+    *entry = entry.saturating_add(1);
+}
+
+pub fn ref_dec(phys: u64) -> u16 {
+    let frame = phys & !0xFFF;
+    let mut rc = REFCOUNTS.lock();
+    if let Some(count) = rc.get_mut(&frame) {
+        *count = count.saturating_sub(1);
+        let val = *count;
+        if val <= 1 {
+            rc.remove(&frame);
+        }
+        val
+    } else {
+        0
+    }
+}
+
+pub fn ref_get(phys: u64) -> u16 {
+    let frame = phys & !0xFFF;
+    let rc = REFCOUNTS.lock();
+    rc.get(&frame).copied().unwrap_or(1)
+}
+
+pub fn free_frame_cow(phys: u64) {
+    let frame = phys & !0xFFF;
+    let should_free = {
+        let mut rc = REFCOUNTS.lock();
+        if let Some(count) = rc.get_mut(&frame) {
+            *count = count.saturating_sub(1);
+            let val = *count;
+            if val <= 1 {
+                rc.remove(&frame);
+            }
+            val == 0
+        } else {
+            true
+        }
+    };
+    if should_free {
+        free_frame(phys);
+    }
 }

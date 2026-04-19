@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use x86_64::structures::paging::PageTableFlags;
 use crate::vmm::AddressSpace;
 
@@ -18,6 +18,19 @@ pub const STATE_BLOCKED:  u8 = 3;
 pub const STATE_DEAD:     u8 = 4;
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
+
+/// Callee-saved registers preserved across syscall entry, needed by fork()
+pub struct SavedSyscallRegs {
+    pub rbp: u64,
+    pub rbx: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub r8:  u64,
+    pub r9:  u64,
+    pub r10: u64,
+}
 
 pub fn pid_range() -> u64 {
     NEXT_PID.load(Ordering::Relaxed)
@@ -51,6 +64,13 @@ pub struct Process {
     pub stack:           Box<[u8]>,
     pub user_stack_phys: Option<u64>,
     pub brk:             AtomicU64,
+
+    // fork/process hierarchy //
+    pub ppid:        AtomicU64,
+    pub exit_code:   AtomicU64,
+    pub pending_sig: AtomicU32,
+    pub wait_target: AtomicU64,
+    pub collected:   AtomicBool,
 }
 
 impl Process {
@@ -82,15 +102,20 @@ impl Process {
             stack,
             user_stack_phys:  None,
             brk:              AtomicU64::new(0),
+            ppid:             AtomicU64::new(0),
+            exit_code:        AtomicU64::new(0),
+            pending_sig:      AtomicU32::new(0),
+            wait_target:      AtomicU64::new(0),
+            collected:        AtomicBool::new(false),
         })
     }
 
     pub fn new_idle(cr3: u64, tick: u64) -> Box<Self> {
         let stack = vec![0u8; DEFAULT_STACK_SIZE].into_boxed_slice();
         Box::new(Self {
-            pid:             0,
-            name:            "idle",
-            is_idle:         true,
+            pid: 0,
+            name: "idle",
+            is_idle: true,
             priority:        AtomicU8::new(20),
             cpu_mask:        CPU_ALL,
             cr3,
@@ -112,6 +137,11 @@ impl Process {
             stack,
             user_stack_phys:  None,
             brk:              AtomicU64::new(0),
+            ppid:             AtomicU64::new(0),
+            exit_code:        AtomicU64::new(0),
+            pending_sig:      AtomicU32::new(0),
+            wait_target:      AtomicU64::new(0),
+            collected:        AtomicBool::new(false),
         })
     }
 
@@ -193,6 +223,85 @@ impl Process {
         let top = p.stack_top();
         p.rsp.store(build_user_frame(top, entry, user_rsp), Ordering::Relaxed);
         Some(p)
+    }
+
+    /// Create a child process for fork(). Builds an iretq-compatible kernel frame
+    /// so the child can be scheduled normally by the timer ISR
+    /// Child sees RAX=0 (fork returns 0 in child)
+    pub fn new_fork(
+        parent_pid: u64,
+        child_cr3: u64,
+        child_user_stack_phys: Option<u64>,
+        child_brk: u64,
+        user_rip: u64,
+        user_rsp: u64,
+        user_rflags: u64,
+        saved_regs: &SavedSyscallRegs,
+    ) -> Box<Self> {
+        let tick  = crate::interrupts::get_tick();
+        let stack = vec![0u8; DEFAULT_STACK_SIZE].into_boxed_slice();
+        let mut p = Box::new(Self {
+            pid:             NEXT_PID.fetch_add(1, Ordering::SeqCst),
+            name:            "forked",
+            is_idle:         false,
+            priority:        AtomicU8::new(10),
+            cpu_mask:        CPU_ALL,
+            cr3:             child_cr3,
+            wall_start_tick: tick,
+            rsp:              AtomicU64::new(0),
+            state:            AtomicU8::new(STATE_READY),
+            sleep_until:      AtomicU64::new(0),
+            blocked_cause:    AtomicPtr::new(null_mut()),
+            vruntime:         AtomicU64::new(0),
+            cpu_time:         AtomicU64::new(0),
+            window_cpu_ticks: AtomicU64::new(0),
+            window_start:     AtomicU64::new(tick),
+            last_run_tick:    AtomicU64::new(tick),
+            preempt_count:    AtomicU64::new(0),
+            sleep_count:      AtomicU64::new(0),
+            switch_in_count:  AtomicU64::new(0),
+            rq_next:          AtomicPtr::new(null_mut()),
+            on_rq:            AtomicBool::new(false),
+            stack,
+            user_stack_phys:  child_user_stack_phys,
+            brk:              AtomicU64::new(child_brk),
+            ppid:             AtomicU64::new(parent_pid),
+            exit_code:        AtomicU64::new(0),
+            pending_sig:      AtomicU32::new(0),
+            wait_target:      AtomicU64::new(0),
+            collected:        AtomicBool::new(false),
+        });
+
+        // Build timer-ISR-compatible frame for child (20 u64 slots = 0xA0 bytes)
+        // Layout: [rax,rbx,rcx,rdx,rsi,rdi,rbp,r8,r9,r10,r11,r12,r13,r14,r15, rip,cs,rflags,rsp,ss]
+        let child_top = p.stack_top();
+        let child_rsp = child_top - FRAME_SIZE;
+        unsafe {
+            let f = child_rsp as *mut u64;
+            f.add(0).write(0);                // rax = 0 (fork returns 0 in child)
+            f.add(1).write(saved_regs.rbx);
+            f.add(2).write(0);                // rcx (clobbered by syscall)
+            f.add(3).write(0);                // rdx (clobbered by syscall)
+            f.add(4).write(0);                // rsi (clobbered by syscall)
+            f.add(5).write(0);                // rdi (clobbered by syscall)
+            f.add(6).write(saved_regs.rbp);
+            f.add(7).write(saved_regs.r8);
+            f.add(8).write(saved_regs.r9);
+            f.add(9).write(saved_regs.r10);
+            f.add(10).write(0);               // r11 (clobbered by syscall)
+            f.add(11).write(saved_regs.r12);
+            f.add(12).write(saved_regs.r13);
+            f.add(13).write(saved_regs.r14);
+            f.add(14).write(saved_regs.r15);
+            // iretq frame
+            f.add(15).write(user_rip);
+            f.add(16).write(crate::gdt::user_code_selector().0 as u64);
+            f.add(17).write(user_rflags | 0x200); // ensure IF is set
+            f.add(18).write(user_rsp);
+            f.add(19).write(crate::gdt::user_data_selector().0 as u64);
+        }
+        p.rsp.store(child_rsp, Ordering::Relaxed);
+        p
     }
 
     pub fn cleanup_user_address_space(&mut self) {

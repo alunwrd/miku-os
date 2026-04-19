@@ -5,6 +5,7 @@ pub mod ext3;
 pub mod ext4;
 pub mod reader;
 pub mod structs;
+pub mod xattr;
 
 use ext3::journal::TxnTag;
 use reader::DiskReader;
@@ -238,6 +239,28 @@ impl MikuFS {
         Ok(())
     }
 
+    // flush a single dirty cache slot to disk before eviction
+    fn flush_evict_victim(&mut self) -> Result<(), FsError> {
+        let victim = match self.block_cache {
+            Some(ref c) => c.evict_victim(),
+            None => None,
+        };
+        if let Some((blk, slot)) = victim {
+            let bs = self.block_size as usize;
+            let mut buf = [0u8; 4096];
+            if let Some(ref c) = self.block_cache {
+                c.get_block_data(slot, &mut buf[..bs]);
+            }
+            let spb = self.sectors_per_block() as u8;
+            let base_lba = self.block_to_lba(blk);
+            self.reader.write_block(base_lba, &buf[..bs], spb)?;
+            if let Some(ref mut c) = self.block_cache {
+                c.mark_clean(slot);
+            }
+        }
+        Ok(())
+    }
+
     pub fn read_block_into(&mut self, block_num: u32, buf: &mut [u8]) -> Result<(), FsError> {
         if !self.is_valid_block(block_num) {
             return Err(FsError::InvalidInode);
@@ -247,6 +270,8 @@ impl MikuFS {
                 return Ok(());
             }
         }
+        // flush dirty victim before put() evicts it
+        self.flush_evict_victim()?;
         let spb = self.sectors_per_block() as u8;
         let base_lba = self.block_to_lba(block_num);
         let bs = self.block_size as usize;
@@ -254,6 +279,28 @@ impl MikuFS {
         if let Some(ref mut c) = self.block_cache {
             if buf.len() >= bs {
                 c.put(block_num, &buf[..bs]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Write block to disk without touching the block cache.
+    /// Used for journal blocks to avoid polluting/evicting FS data.
+    pub fn write_block_direct_nocache(&mut self, block_num: u32, data: &[u8]) -> Result<(), FsError> {
+        let spb = self.sectors_per_block() as u8;
+        let base_lba = self.block_to_lba(block_num);
+        let bs = self.block_size as usize;
+        let len = data.len().min(bs);
+        if len == bs {
+            self.reader.write_block(base_lba, &data[..bs], spb)?;
+        } else {
+            for s in 0..spb as u32 {
+                let offset = (s * 512) as usize;
+                if offset >= len { break; }
+                let mut sector = [0u8; 512];
+                let end = (offset + 512).min(len);
+                sector[..end - offset].copy_from_slice(&data[offset..end]);
+                self.reader.write_sector(base_lba + s, &sector)?;
             }
         }
         Ok(())
@@ -278,6 +325,8 @@ impl MikuFS {
                 self.reader.write_sector(base_lba + s, &sector)?;
             }
         }
+        // flush dirty victim before put() evicts it
+        self.flush_evict_victim()?;
         if let Some(ref mut c) = self.block_cache {
             if len >= bs {
                 c.put(block_num, &data[..bs]);
@@ -298,6 +347,9 @@ impl MikuFS {
         if needs_flush {
             self.sync_dirty_blocks()?;
         }
+
+        // flush dirty victim before put_dirty() evicts it
+        self.flush_evict_victim()?;
 
         if let Some(ref mut c) = self.block_cache {
             if data.len() >= bs {
@@ -343,6 +395,135 @@ impl MikuFS {
         } else {
             (crate::vfs::procfs::uptime_ticks() / crate::interrupts::PIT_HZ as u64) as u32
         }
+    }
+
+    // orphan inode cleanup - walk the orphan linked list in the superblock
+    // and free any inodes with links_count == 0
+    pub fn cleanup_orphans(&mut self) -> Result<u32, FsError> {
+        let mut ino = self.superblock.last_orphan();
+        if ino == 0 {
+            return Ok(0);
+        }
+        let mut cleaned = 0u32;
+        let max_inodes = self.superblock.inodes_count();
+        let mut iterations = 0u32;
+
+        while ino != 0 && ino <= max_inodes && iterations < 1024 {
+            iterations += 1;
+            let inode = match self.read_inode(ino) {
+                Ok(i) => i,
+                Err(_) => break,
+            };
+            // dtime field stores next orphan inode in the list
+            let next_orphan = inode.dtime();
+
+            if inode.links_count() == 0 {
+                // free blocks and inode
+                if inode.is_directory() || inode.is_regular() {
+                    if inode.uses_extents() {
+                        let _ = self.ext4_free_extent_blocks(&inode);
+                    } else if !inode.is_symlink() || !inode.is_fast_symlink() {
+                        let _ = self.free_all_blocks(&inode);
+                    }
+                }
+                let _ = self.free_inode(ino);
+                cleaned += 1;
+                crate::serial_println!("[orphan] cleaned inode {}", ino);
+            } else {
+                // truncate to 0 if it's a truncated-but-open file
+                if inode.size() > 0 && inode.is_regular() {
+                    if inode.uses_extents() {
+                        let _ = self.ext4_truncate(ino);
+                    } else {
+                        let _ = self.ext2_truncate(ino);
+                    }
+                    cleaned += 1;
+                    crate::serial_println!("[orphan] truncated inode {}", ino);
+                }
+            }
+            ino = next_orphan;
+        }
+
+        // clear orphan list head in superblock
+        self.superblock.write_u32(232, 0);
+        self.flush_superblock()?;
+
+        if cleaned > 0 {
+            crate::serial_println!("[orphan] cleaned {} orphan inodes", cleaned);
+        }
+        Ok(cleaned)
+    }
+
+    // get physical block for inode_num + logical block (convenience)
+    pub fn get_file_block_any(&mut self, inode_num: u32, logical: u32) -> Result<u32, FsError> {
+        let inode = self.read_inode(inode_num)?;
+        if inode.uses_extents() {
+            self.get_file_block_extent(&inode, logical)
+        } else {
+            self.get_file_block(&inode, logical)
+        }
+    }
+
+    pub fn touch_atime(&mut self, inode_num: u32) -> Result<(), FsError> {
+        let mut inode = self.read_inode(inode_num)?;
+        // respect noatime flag on inode
+        if inode.has_flag(structs::EXT4_NOATIME_FL) {
+            return Ok(());
+        }
+        let now = self.get_timestamp();
+        if inode.atime() == now {
+            return Ok(()); // no-op if already current second
+        }
+        // relatime: only update if atime < mtime or atime is older than 1 day
+        let mtime = inode.mtime();
+        let atime = inode.atime();
+        if atime >= mtime && now.saturating_sub(atime) < 86400 {
+            return Ok(());
+        }
+        inode.set_atime(now);
+        self.write_inode(inode_num, &inode)
+    }
+
+    // utimensat - set atime/mtime explicitly
+    // atime_val/mtime_val: 0 = leave unchanged, u32::MAX = set to current time
+    pub fn utimensat(
+        &mut self,
+        inode_num: u32,
+        atime_val: u32,
+        mtime_val: u32,
+    ) -> Result<(), FsError> {
+        let mut inode = self.read_inode(inode_num)?;
+        let now = self.get_timestamp();
+        if atime_val == u32::MAX {
+            inode.set_atime(now);
+        } else if atime_val != 0 {
+            inode.set_atime(atime_val);
+        }
+        if mtime_val == u32::MAX {
+            inode.set_mtime(now);
+        } else if mtime_val != 0 {
+            inode.set_mtime(mtime_val);
+        }
+        inode.set_ctime(now); // ctime always updated on utimensat
+        self.write_inode(inode_num, &inode)
+    }
+
+    // update superblock mount state
+    pub fn update_mount_state(&mut self) {
+        let now = self.get_timestamp();
+        let count = self.superblock.mnt_count().wrapping_add(1);
+        self.superblock.write_u16(52, count);  // s_mnt_count
+        self.superblock.write_u32(44, now);    // s_mtime (last mount time)
+        self.superblock.write_u16(58, 2);      // s_state = EXT2_ERROR_FS (not cleanly unmounted)
+        self.superblock_dirty = true;
+    }
+
+    // mark filesystem as cleanly unmounted
+    pub fn mark_clean_unmount(&mut self) {
+        let now = self.get_timestamp();
+        self.superblock.write_u32(48, now);    // s_wtime (last write time)
+        self.superblock.write_u16(58, 1);      // s_state = EXT2_VALID_FS
+        self.superblock_dirty = true;
     }
 
     pub fn init_cache(&mut self) {

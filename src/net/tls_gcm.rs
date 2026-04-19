@@ -99,9 +99,7 @@ pub fn aes128gcm_seal(
         }
     }
 
-    let mut ciphertext_only = [0u8; 16384];
-    ciphertext_only[..ct_len].copy_from_slice(&out[..ct_len]);
-    let tag_raw = ghash(&h, aad, &ciphertext_only[..ct_len]);
+    let tag_raw = ghash(&h, aad, &out[..ct_len]);
 
     let mut tag = [0u8; 16];
     for i in 0..16 { tag[i] = tag_raw[i] ^ ectr0[i]; }

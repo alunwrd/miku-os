@@ -5,11 +5,11 @@ resolver = "2"
 [package]
 name        = "miku-os-release"
 license     = "MIT"
-version     = "0.1.4"
+version     = "0.2.0"
 edition     = "2021"
 authors     = ["altushkaso2"]
-description = "Experimental Unix-like OS in Rust"
-repository  = "https://github.com/altushkaso2/miku-os"
+description = "Experimental OS in Rust"
+repository  = "https://github.com/alunwrd/miku-os"
 
 [dependencies]
 volatile              = "0.2.6"

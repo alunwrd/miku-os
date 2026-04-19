@@ -27,12 +27,13 @@ unsafe fn read_u64_u(p: *const u8) -> u64 {
 pub extern "C" fn dynlinker_main(sp: *const u64) -> ! {
     let argc = unsafe { *sp } as usize;
 
-    let mut p = unsafe { sp.add(1 + argc + 1) };
+    // scan past argv[] to find NULL terminator
+    let mut p = unsafe { sp.add(1) };
     unsafe {
-        while *p != 0 {
-            p = p.add(1);
-        }
-        p = p.add(1);
+        while *p != 0 { p = p.add(1); } // skip argv entries
+        p = p.add(1);                    // skip argv NULL
+        while *p != 0 { p = p.add(1); } // skip envp entries
+        p = p.add(1);                    // skip envp NULL
     }
 
     let mut phdr_va:   u64 = 0;
@@ -69,12 +70,21 @@ pub extern "C" fn dynlinker_main(sp: *const u64) -> ! {
 
     apply_relocations(exe_base, di.rela_va,   di.rela_sz,   &di);
     export_symbols(exe_base, &di);
+
+    util::print(b"[ld-miku] jmprel: ");
+    util::print_usize((di.jmprel_sz / 24) as usize);
+    util::println(b" entries");
+
     apply_relocations(exe_base, di.jmprel_va, di.jmprel_sz, &di);
+
+    util::println(b"[ld-miku] jmprel done");
+
     apply_relro(exe_base, phdr_va, phnum, phent);
 
     setup_tls(exe_base, phdr_va, phnum, phent);
 
     call_init(&di);
+    print_stats();
 
     util::print(b"[ld-miku] -> ");
     util::print_hex(exe_entry);

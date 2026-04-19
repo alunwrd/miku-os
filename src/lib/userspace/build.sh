@@ -7,7 +7,7 @@ BIN_DIR="target/$TARGET/release"
 
 BINS="${@:-test_full hello}"
 
-echo "=== MikuOS Rust SDK build ==="
+echo "Build"
 
 for bin in $BINS; do
     echo "[*] Building $bin..."
@@ -27,9 +27,4 @@ for bin in $BINS; do
     fi
 done
 
-echo ""
-echo "Done! In MikuOS:"
-echo "  ext4mount 3"
-for bin in $BINS; do
-    echo "  exec $bin"
-done
+echo "Done."

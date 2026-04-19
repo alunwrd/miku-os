@@ -435,7 +435,7 @@ impl TcpSocket {
             if sock.state == TcpState::Closed {
                 return None;
             }
-            if crate::vfs::procfs::uptime_ticks().wrapping_sub(start) >= 90 {
+            if crate::vfs::procfs::uptime_ticks().wrapping_sub(start) >= 1000 {
                 return None;
             }
             core::hint::spin_loop();
@@ -516,7 +516,7 @@ impl TcpSocket {
     }
 
     pub fn recv_wait(&mut self, _timeout_iters: usize) -> &[u8] {
-        let max_ticks = 90u64;
+        let max_ticks = 1000u64;
         let start = crate::vfs::procfs::uptime_ticks();
         loop {
             if CTRL_C.load(Ordering::SeqCst) { break; }
@@ -533,7 +533,7 @@ impl TcpSocket {
     }
 
     pub fn recv_all(&mut self, _timeout_iters: usize) -> &[u8] {
-        let max_ticks = 90u64;
+        let max_ticks = 1000u64;
         let mut start = crate::vfs::procfs::uptime_ticks();
         loop {
             if CTRL_C.load(Ordering::SeqCst) { break; }
@@ -561,7 +561,7 @@ impl TcpSocket {
             loop {
                 self.recv_one();
                 if self.state == TcpState::Closed { break; }
-                if crate::vfs::procfs::uptime_ticks().wrapping_sub(start) >= 36 { break; }
+                if crate::vfs::procfs::uptime_ticks().wrapping_sub(start) >= 500 { break; }
                 core::hint::spin_loop();
             }
         } else if self.state == TcpState::CloseWait {
@@ -572,7 +572,7 @@ impl TcpSocket {
             loop {
                 self.recv_one();
                 if self.state == TcpState::Closed { break; }
-                if crate::vfs::procfs::uptime_ticks().wrapping_sub(start) >= 36 { break; }
+                if crate::vfs::procfs::uptime_ticks().wrapping_sub(start) >= 500 { break; }
                 core::hint::spin_loop();
             }
         }

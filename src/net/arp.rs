@@ -67,6 +67,14 @@ pub fn parse(buf: &[u8]) -> Option<([u8; 4], [u8; 6], u16)> {
     if buf.len() < 28 {
         return None;
     }
+    let hw_type = u16::from_be_bytes([buf[0], buf[1]]);
+    let proto_type = u16::from_be_bytes([buf[2], buf[3]]);
+    if hw_type != HW_ETHERNET || proto_type != PROTO_IPV4 {
+        return None;
+    }
+    if buf[4] != 6 || buf[5] != 4 {
+        return None;
+    }
     let op = u16::from_be_bytes([buf[6], buf[7]]);
     let mut sender_mac = [0u8; 6];
     let mut sender_ip = [0u8; 4];

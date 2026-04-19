@@ -24,7 +24,7 @@ pub fn cmd_info() {
     let used_ram_kb   = pmm_used * 4 + heap_used / 1024;
     let free_ram_kb   = usable_ram_kb.saturating_sub(used_ram_kb);
 
-    cprintln!(57, 197, 187,  "  MikuOS v0.1.5");
+    cprintln!(57, 197, 187,  "  MikuOS v0.2.0");
     cprintln!(230, 240, 240, "  VNodes: {}/{}", vn, crate::vfs::MAX_VNODES);
     cprintln!(230, 240, 240, "  Mounts: {}", mn);
     cprintln!(230, 240, 240, "  Heap:   {} / {} KB", heap_used / 1024, heap_total / 1024);
@@ -100,21 +100,34 @@ pub fn cmd_heap() {
 }
 
 pub fn cmd_poweroff() {
-    crate::serial_println!("[kern] poweroff requested - syncing filesystems...");
-    if crate::commands::ext2_cmds::is_ext2_ready() {
-        crate::commands::ext2_cmds::with_ext2_pub(|fs| {
-            if fs.has_dirty_data() {
-                let _ = fs.periodic_sync();
-                crate::serial_println!("[kern] filesystem synced");
-            }
-        });
+    crate::serial_println!("[kern] poweroff requested");
+    cprintln!(220, 200, 80, "  shutting down...");
+
+    // Sync filesystems before stopping services
+    sync_filesystems();
+
+    // Graceful shutdown via mikuD (stops all services in order)
+    if crate::mikud::is_running() {
+        crate::mikud::poweroff();
+    } else {
+        crate::power::shutdown();
     }
-    crate::serial_println!("[kern] poweroff");
-    crate::power::shutdown();
 }
 
 pub fn cmd_reboot() {
-    crate::serial_println!("[kern] reboot requested - syncing filesystems...");
+    crate::serial_println!("[kern] reboot requested");
+    cprintln!(220, 200, 80, "  rebooting...");
+
+    sync_filesystems();
+
+    if crate::mikud::is_running() {
+        crate::mikud::reboot();
+    } else {
+        crate::power::reboot();
+    }
+}
+
+fn sync_filesystems() {
     if crate::commands::ext2_cmds::is_ext2_ready() {
         crate::commands::ext2_cmds::with_ext2_pub(|fs| {
             if fs.has_dirty_data() {
@@ -123,8 +136,6 @@ pub fn cmd_reboot() {
             }
         });
     }
-    crate::serial_println!("[kern] reboot");
-    crate::power::reboot();
 }
 
 pub fn cmd_help() {
@@ -197,16 +208,27 @@ pub fn cmd_help() {
     cprintln!(128, 222, 217, "  traceroute <host>        trace route to host");
     cprintln!(128, 222, 217, "  net send <ip> <port> <m> send udp packet");
 
+    cprintln!(57, 197, 187, "  mikuD (init daemon):");
+    cprintln!(128, 222, 217, "  sv list|status|start|stop|restart|reload <name>");
+    cprintln!(128, 222, 217, "  sv enable|disable|mask|unmask|force-stop <name>");
+    cprintln!(128, 222, 217, "  sv journal [name]        show event log");
+    cprintln!(128, 222, 217, "  sv target [name]         show/set target");
+    cprintln!(128, 222, 217, "  sv isolate <target>      switch target");
+    cprintln!(128, 222, 217, "  sv analyze               boot timing");
+    cprintln!(128, 222, 217, "  sv tree|rdeps <name>     dependency info");
+    cprintln!(128, 222, 217, "  sv load|scan             load unit files");
+    cprintln!(128, 222, 217, "  sv timer|socket          manage units");
+
     cprintln!(57, 197, 187, "  System:");
     cprintln!(128, 222, 217, "  ps                      thread list (CPU/RAM/stack)");
-    cprintln!(128, 222, 217, "  swaptest                 fill RAM and verify swap works");
+    cprintln!(128, 222, 217, "  top                      realtime process monitor");
     cprintln!(128, 222, 217, "  nice <pid> <1-20>       change priority");
     cprintln!(128, 222, 217, "  affinity <pid> <mask>   set CPU affinity");
     cprintln!(128, 222, 217, "  kill <pid>              kill thread");
     cprintln!(128, 222, 217, "  heap                     heap allocator info");
     cprintln!(128, 222, 217, "  memmap                 physical memory map");
-    cprintln!(128, 222, 217, "  reboot                   restart system");
-    cprintln!(128, 222, 217, "  poweroff                 shutdown system");
+    cprintln!(128, 222, 217, "  reboot                   restart system (graceful)");
+    cprintln!(128, 222, 217, "  poweroff                 shutdown system (graceful)");
     println!("  exec <path>     - load and run ELF binary");
 }
 

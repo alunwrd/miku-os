@@ -32,7 +32,7 @@ pub fn proc_read(name: &str, buf: &mut [u8], vnode_used: usize) -> VfsResult<usi
     let mut tmp = [0u8; 192];
     let len = match name {
         "version" => {
-            let s = b"MikuOS v0.1.5 (x86_64)\nbuilt with love <3\n";
+            let s = b"MikuOS v0.2.0 (x86_64)\nbuilt with love <3\n";
             let l = s.len().min(192);
             tmp[..l].copy_from_slice(&s[..l]);
             l
@@ -47,7 +47,7 @@ pub fn proc_read(name: &str, buf: &mut [u8], vnode_used: usize) -> VfsResult<usi
         "meminfo" => format_meminfo(&mut tmp, vnode_used, MAX_VNODES, MAX_DATA_PAGES),
         "mounts" => format_mounts(&mut tmp),
         "cpuinfo" => {
-            let s = b"arch: x86_64\nvendor: unknown\nfeatures: vfs tmpfs devfs procfs ext2 ext3\n";
+            let s = b"arch: x86_64\nvendor: unknown\nfeatures: vfs tmpfs devfs procfs ext2 ext3 ext4\n";
             let l = s.len().min(192);
             tmp[..l].copy_from_slice(&s[..l]);
             l

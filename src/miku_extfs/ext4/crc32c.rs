@@ -35,41 +35,41 @@ pub fn crc32c_le(seed: u32, data: &[u8]) -> u32 {
 
 pub fn ext4_superblock_csum(uuid: &[u8], sb_data: &[u8]) -> u32 {
     let crc = crc32c(0xFFFFFFFF, uuid);
-    crc32c(crc ^ 0xFFFFFFFF, sb_data)
+    crc32c(crc, sb_data)
 }
 
 pub fn ext4_group_desc_csum(uuid: &[u8], group: u32, gd_data: &[u8]) -> u16 {
     let crc = crc32c(0xFFFFFFFF, uuid);
     let gb = group.to_le_bytes();
-    let crc = crc32c(crc ^ 0xFFFFFFFF, &gb);
-    let result = crc32c(crc ^ 0xFFFFFFFF, gd_data);
+    let crc = crc32c(crc, &gb);
+    let result = crc32c(crc, gd_data);
     (result & 0xFFFF) as u16
 }
 
 pub fn ext4_inode_csum(uuid: &[u8], inode_num: u32, gen: u32, inode_data: &[u8]) -> u32 {
     let crc = crc32c(0xFFFFFFFF, uuid);
     let ino_bytes = inode_num.to_le_bytes();
-    let crc = crc32c(crc ^ 0xFFFFFFFF, &ino_bytes);
+    let crc = crc32c(crc, &ino_bytes);
     let gen_bytes = gen.to_le_bytes();
-    let crc = crc32c(crc ^ 0xFFFFFFFF, &gen_bytes);
-    crc32c(crc ^ 0xFFFFFFFF, inode_data)
+    let crc = crc32c(crc, &gen_bytes);
+    crc32c(crc, inode_data)
 }
 
 pub fn ext4_extent_csum(uuid: &[u8], inode_num: u32, extent_data: &[u8]) -> u32 {
     let crc = crc32c(0xFFFFFFFF, uuid);
     let ino_bytes = inode_num.to_le_bytes();
-    let crc = crc32c(crc ^ 0xFFFFFFFF, &ino_bytes);
-    crc32c(crc ^ 0xFFFFFFFF, extent_data)
+    let crc = crc32c(crc, &ino_bytes);
+    crc32c(crc, extent_data)
 }
 
 pub fn ext4_dirent_csum(uuid: &[u8], inode_num: u32, dir_data: &[u8]) -> u32 {
     let crc = crc32c(0xFFFFFFFF, uuid);
     let ino_bytes = inode_num.to_le_bytes();
-    let crc = crc32c(crc ^ 0xFFFFFFFF, &ino_bytes);
-    crc32c(crc ^ 0xFFFFFFFF, dir_data)
+    let crc = crc32c(crc, &ino_bytes);
+    crc32c(crc, dir_data)
 }
 
 pub fn ext4_bitmap_csum(uuid: &[u8], bitmap_data: &[u8]) -> u32 {
     let crc = crc32c(0xFFFFFFFF, uuid);
-    crc32c(crc ^ 0xFFFFFFFF, bitmap_data)
+    crc32c(crc, bitmap_data)
 }

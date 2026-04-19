@@ -66,19 +66,18 @@ pub fn rsa_pkcs1_encrypt(key: &RsaPublicKey, data: &[u8], out: &mut [u8; 256]) -
     em[0] = 0x00;
     em[1] = 0x02;
     let ps_len = k - 3 - data.len();
-    
-    let mut rng = crate::vfs::procfs::uptime_ticks()
-        .wrapping_mul(0x5851_F42D_4C95_7F2D)
-        .wrapping_add(0x1405_7B7E_F767_814F);
-        
-    for i in 0..ps_len {
-        loop {
-            rng = rng.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(1);
-            let v = (rng >> 33) as u8;
-            if v != 0 { em[2 + i] = v; break; }
+
+    let mut i = 0;
+    while i < ps_len {
+        let r = crate::random::random_u64().to_le_bytes();
+        for &b in r.iter() {
+            if b != 0 && i < ps_len {
+                em[2 + i] = b;
+                i += 1;
+            }
         }
     }
-    
+
     em[2 + ps_len] = 0x00;
     em[3 + ps_len..3 + ps_len + data.len()].copy_from_slice(data);
 

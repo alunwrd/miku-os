@@ -53,10 +53,32 @@ pub fn print_hex(v: u64) {
     print(&buf);
 }
 
+// print unsigned decimal number
+pub fn print_usize(v: usize) {
+    if v == 0 {
+        print(b"0");
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut n = v;
+    let mut i = 20;
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    print(&buf[i..20]);
+}
+
 pub fn panic(msg: &[u8]) -> ! {
-    print(b"[ld-miku] FATAL: ");
+    print(b"[ld-miku] fatal: ");
     println(msg);
     syscall::exit(1);
+}
+
+pub fn warn(msg: &[u8]) {
+    print(b"[ld-miku] warn: ");
+    println(msg);
 }
 
 pub fn cstr_to_bytes(ptr: *const u8) -> &'static [u8] {

@@ -13,7 +13,7 @@ impl MikuFS {
         }
         let size = inode.size_lo() as usize;
         let off = offset as usize;
-        if off >= size {
+        if off >= size || off >= 60 {
             return Ok(0);
         }
         let avail = size - off;

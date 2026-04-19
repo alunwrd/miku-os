@@ -328,17 +328,9 @@ pub fn reap_dead() {
         });
         if !collectable { continue; }
 
-        if let Some(mut p) = table.remove(&pid) {
+        if let Some(p) = table.remove(&pid) {
             drop(table);
-            crate::mmap::vma_cleanup(p.cr3);
-            if let Some(phys) = p.user_stack_phys.take() {
-                crate::pmm::free_frames(phys, crate::process::USER_STACK_PAGES);
-            }
-            if p.cr3 != 0 && p.cr3 != crate::vmm::kernel_cr3() {
-                let mut aspace = crate::vmm::AddressSpace { cr3: p.cr3 };
-                aspace.free_address_space();
-            }
-            crate::serial_println!("[sched] reaped pid={}", pid);
+            free_process_resources(p, pid);
         }
     }
 }
@@ -353,6 +345,31 @@ pub fn spawn_named(entry: fn() -> !, name: &'static str, priority: u8) -> u64 {
     reap_dead();
     add_process(p);
     pid
+}
+
+pub fn spawn_named_child_of(parent_pid: u64, entry: fn() -> !, name: &'static str, priority: u8) -> u64 {
+    let mut p = Process::new_kernel_named(entry, name, priority);
+    p.ppid.store(parent_pid, Ordering::Relaxed);
+    let pid = p.pid;
+    reap_dead();
+    add_process(p);
+    pid
+}
+
+pub fn spawn_child_of(parent_pid: u64, entry: fn() -> !) -> u64 {
+    spawn_named_child_of(parent_pid, entry, "kthread", 10)
+}
+
+pub fn spawn_named_child(entry: fn() -> !, name: &'static str, priority: u8) -> u64 {
+    let parent = current_pid();
+    spawn_named_child_of(parent, entry, name, priority)
+}
+
+pub fn set_parent(pid: u64, new_parent: u64) {
+    let table = PROC_TABLE.lock();
+    if let Some(p) = table.get(&pid) {
+        p.ppid.store(new_parent, Ordering::Relaxed);
+    }
 }
 
 pub fn add_user_process(p: Box<Process>) -> u64 {
@@ -379,14 +396,31 @@ pub fn current_pid() -> u64 {
     CURRENT_PID.load(Ordering::Relaxed)
 }
 
+/// Expose raw process pointer for signal delivery (interrupts must be disabled by caller).
+pub unsafe fn proc_index_raw(pid: u64) -> *mut Process {
+    PROC_INDEX.get_raw(pid)
+}
+
 pub fn kill(pid: u64) {
-    interrupts::without_interrupts(|| {
+    kill_with_code(pid, 0);
+}
+
+pub fn kill_with_code(pid: u64, code: u64) {
+    let ppid = interrupts::without_interrupts(|| {
         let ptr = unsafe { PROC_INDEX.get_raw(pid) };
-        if ptr.is_null() { return; }
-        unsafe { &*ptr }.state.store(STATE_DEAD, Ordering::Relaxed);
+        if ptr.is_null() { return 0u64; }
+        let p = unsafe { &*ptr };
+        p.exit_code.store(code, Ordering::Relaxed);
+        p.state.store(STATE_DEAD, Ordering::Relaxed);
         unsafe { RUN_QUEUE.remove_raw(pid) };
-        crate::serial_println!("[sched] kill pid={}", pid);
+        crate::serial_println!("[sched] kill pid={} code={}", pid, code);
+        p.ppid.load(Ordering::Relaxed)
     });
+
+    // Wake parent if it's blocking on wait4
+    if ppid != 0 {
+        wakeup(ppid);
+    }
 }
 
 pub fn wakeup(pid: u64) {
@@ -429,6 +463,13 @@ pub fn yield_now() {
         if ptr.is_null() { return; }
         let p = unsafe { &*ptr };
         if p.state.load(Ordering::Relaxed) == STATE_RUNNING {
+            // bump vruntime to at least MIN_VRUNTIME so yielding processes
+            // don't starve other READY processes with higher vruntime
+            let min_vr = MIN_VRUNTIME.load(Ordering::Relaxed);
+            let cur_vr = p.vruntime.load(Ordering::Relaxed);
+            if cur_vr < min_vr {
+                p.vruntime.store(min_vr, Ordering::Relaxed);
+            }
             p.state.store(STATE_READY, Ordering::Relaxed);
             unsafe { RUN_QUEUE.push_raw(ptr) };
         }
@@ -494,6 +535,26 @@ pub fn get_stats() -> Vec<ThreadStat> {
     }
     out.sort_by_key(|s| s.pid);
     out
+}
+
+pub fn debug_dump_all() {
+    let max = pid_range().min(MAX_PROCS as u64) as usize;
+    let arr = unsafe { &*PROC_INDEX.0.get() };
+    for i in 0..max {
+        let ptr = arr[i];
+        if ptr.is_null() { continue; }
+        let p = unsafe { &*ptr };
+        let state = p.state.load(Ordering::Relaxed);
+        let state_str = match state {
+            STATE_READY => "READY",
+            STATE_RUNNING => "RUN",
+            STATE_SLEEPING => "SLEEP",
+            STATE_BLOCKED => "BLOCK",
+            STATE_DEAD => "DEAD",
+            _ => "?",
+        };
+        crate::serial_println!("[debug] pid={} state={}", i, state_str);
+    }
 }
 
 #[inline(always)]
@@ -668,4 +729,81 @@ unsafe extern "C" fn software_context_switch() {
         "ret",
         sched = sym schedule_from_isr,
     )
+}
+
+// fork/wait4 helpers //
+
+/// Find a zombie child of `parent_pid`. If `target_pid` == u64::MAX, any child
+pub fn find_zombie_child(parent_pid: u64, target_pid: u64) -> Option<(u64, u64)> {
+    let table = PROC_TABLE.lock();
+    for (&pid, p) in table.iter() {
+        if p.ppid.load(Ordering::Relaxed) != parent_pid { continue; }
+        if target_pid != u64::MAX && pid != target_pid { continue; }
+        if p.state.load(Ordering::Relaxed) == STATE_DEAD && !p.collected.load(Ordering::Relaxed) {
+            let code = p.exit_code.load(Ordering::Relaxed);
+            p.collected.store(true, Ordering::Relaxed);
+            return Some((pid, code));
+        }
+    }
+    None
+}
+
+/// Reap a collected zombie (free resources)
+pub fn reap_zombie(pid: u64) {
+    reap_specific(pid);
+}
+
+fn free_process_resources(mut p: Box<Process>, pid: u64) {
+    crate::mmap::vma_cleanup(p.cr3);
+    if let Some(phys) = p.user_stack_phys.take() {
+        crate::pmm::free_frames(phys, crate::process::USER_STACK_PAGES);
+    }
+    if p.cr3 != 0 && p.cr3 != crate::vmm::kernel_cr3() {
+        let mut aspace = crate::vmm::AddressSpace { cr3: p.cr3 };
+        aspace.free_address_space();
+    }
+    crate::serial_println!("[sched] reaped pid={}", pid);
+}
+
+fn reap_specific(pid: u64) {
+    PROC_INDEX.clear(pid);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+
+    let mut table = PROC_TABLE.lock();
+    if let Some(p) = table.remove(&pid) {
+        drop(table);
+        free_process_resources(p, pid);
+    }
+}
+
+/// Check if `parent_pid` has any living (non-dead) or zombie children
+pub fn has_children(parent_pid: u64) -> bool {
+    let table = PROC_TABLE.lock();
+    table.iter().any(|(_, p)| p.ppid.load(Ordering::Relaxed) == parent_pid)
+}
+
+/// Check if a process exists (alive or zombie)
+pub fn process_exists(pid: u64) -> bool {
+    interrupts::without_interrupts(|| {
+        let ptr = unsafe { PROC_INDEX.get_raw(pid) };
+        !ptr.is_null()
+    })
+}
+
+/// Update the CR3 of a running process (used by exec)
+pub fn update_process_cr3(pid: u64, new_cr3: u64) {
+    interrupts::without_interrupts(|| {
+        let ptr = unsafe { PROC_INDEX.get_raw(pid) };
+        if ptr.is_null() { return; }
+        unsafe { (*ptr).cr3 = new_cr3; }
+    });
+}
+
+/// Get the parent PID of a process
+pub fn get_ppid(pid: u64) -> u64 {
+    interrupts::without_interrupts(|| {
+        let ptr = unsafe { PROC_INDEX.get_raw(pid) };
+        if ptr.is_null() { return 0; }
+        unsafe { &*ptr }.ppid.load(Ordering::Relaxed)
+    })
 }

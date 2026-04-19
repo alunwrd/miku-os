@@ -3,6 +3,8 @@ pub const MAX_DENTRIES: usize = 128;
 pub const MAX_MOUNTS: usize = 8;
 pub const MAX_FDS: usize = 32;
 pub const MAX_OPEN_FILES: usize = 32;
+// Syscall layer handles 0/1/2 as stdin/stdout/stderr //
+pub const RESERVED_STDIO_FDS: usize = 3;
 pub const MAX_DATA_PAGES: usize = 128;
 pub const MAX_XATTRS_PER_NODE: usize = 8;
 pub const MAX_LOCKS: usize = 16;
@@ -153,6 +155,17 @@ impl FsType {
     #[inline]
     pub fn is_ext_family(self) -> bool {
         matches!(self, FsType::Ext2 | FsType::Ext3 | FsType::Ext4)
+    }
+
+    pub fn magic(self) -> u32 {
+        match self {
+            FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => 0xEF53,
+            FsType::TmpFS  => 0x01021994,
+            FsType::DevFS  => 0x1373,
+            FsType::ProcFS => 0x9FA0,
+            FsType::PipeFS => 0x50495045,
+            FsType::CowFS  => 0xC0FF,
+        }
     }
 
     pub fn as_str(self) -> &'static str {

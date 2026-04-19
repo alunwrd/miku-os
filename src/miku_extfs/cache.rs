@@ -102,6 +102,30 @@ impl BlockCache {
         };
     }
 
+    // Returns (block_num, slot_index, data_offset) for a dirty block
+    // that needs to be flushed before eviction. Returns None if no
+    // dirty eviction is pending.
+    pub fn evict_victim(&self) -> Option<(u32, usize)> {
+        // only needed when all slots are valid and no clean LRU exists
+        let has_empty = self.entries.iter().any(|e| !e.valid);
+        if has_empty { return None; }
+
+        // check if there's a clean LRU candidate
+        let has_clean = self.entries.iter().any(|e| e.valid && !e.dirty);
+        if has_clean { return None; }
+
+        // all entries dirty - the LRU dirty one will be evicted next
+        let mut lru_idx = 0;
+        let mut lru_val = u64::MAX;
+        for i in 0..self.count {
+            if self.entries[i].last_access < lru_val {
+                lru_val = self.entries[i].last_access;
+                lru_idx = i;
+            }
+        }
+        Some((self.entries[lru_idx].block_num, lru_idx))
+    }
+
     pub fn get_dirty_blocks(&self) -> Vec<(u32, usize)> {
         let mut out = Vec::new();
         for i in 0..self.count {

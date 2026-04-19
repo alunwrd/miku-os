@@ -46,9 +46,10 @@ impl Ipv4Header {
     }
 
     pub fn payload<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
-        let end = self.total_len as usize;
-        let end = end.min(buf.len());
-        &buf[self.ihl as usize..end]
+        let start = self.ihl as usize;
+        let end = (self.total_len as usize).min(buf.len());
+        if end < start { return &[]; }
+        &buf[start..end]
     }
 }
 

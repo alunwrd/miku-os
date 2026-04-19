@@ -17,7 +17,8 @@
       "--dynamic-linker=/lib/ld-miku.so",
       "--no-as-needed",
       "-rpath",
-      "/lib"
+      "/lib",
+      "-T/home/altushkaso2/miku-os/src/lib/userspace/linker.ld"
     ]
   },
   "relocation-model": "static",

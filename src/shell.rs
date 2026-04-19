@@ -190,7 +190,7 @@ lazy_static! {
 
 pub fn init() {
     serial_println!("[shell] init");
-    cprintln!(57, 197, 187, "MikuOS v0.1.5");
+    cprintln!(57, 197, 187, "MikuOS v0.2.0");
     prompt();
 }
 
@@ -467,4 +467,32 @@ pub fn shell_thread() -> ! {
             crate::scheduler::sleep(CMD_POLL_TICKS);
         }
     }
+}
+
+/// Called by mikuD before restarting the shell service
+/// Resets pending command buffer and redraws prompt so the user
+/// sees a clean shell after restart
+pub fn on_shell_restart() {
+    {
+        let mut p = PENDING.lock();
+        p.ready = false;
+        p.len = 0;
+    }
+    {
+        let mut sh = SHELL.lock();
+        sh.len = 0;
+        sh.cursor = 0;
+        sh.browsing = false;
+    }
+    // Clear foreground process (if any was running when shell died)
+    crate::user_stdin::clear_foreground();
+    serial_println!("[shell] reinit after restart");
+    prompt();
+}
+
+/// Called by mikuD before restarting the kbd service
+/// Drains stale scancodes from the stdin buffer
+pub fn on_kbd_restart() {
+    while crate::stdin::pop().is_some() {}
+    serial_println!("[kbd] reinit after restart");
 }

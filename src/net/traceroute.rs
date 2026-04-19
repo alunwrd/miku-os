@@ -145,7 +145,8 @@ pub fn run(hostname: &str, target_ip: &[u8; 4]) {
 
                 let icmp_type = icmp[0];
 
-                let rtt_us = rdtsc().wrapping_sub(t_start_rtt) / 2500;
+                let khz = crate::timing::tsc_khz().max(1);
+                let rtt_us = rdtsc().wrapping_sub(t_start_rtt) * 1000 / khz;
                 let rtt_ms_i = rtt_us / 1000;
                 let rtt_ms_f = (rtt_us % 1000) / 100;
 

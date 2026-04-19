@@ -367,6 +367,22 @@ pub fn execute(input: &str) {
         "ext4du"     => ext4_cmds::cmd_ext4_du(a1),
         "ext4fsck"   => ext4_cmds::cmd_ext4_fsck(),
 
+        "fiemap"     => ext2_cmds::cmd_fiemap(a1),
+        "getxattr"   => { if a1.is_empty() || a2.is_empty() { println!("Usage: getxattr <path> <name>"); } else { ext2_cmds::cmd_getxattr(a1, a2); } }
+        "setxattr"   => {
+            let val = if rest.len() > a1.len() + a2.len() + 1 {
+                rest[a1.len()..].trim_start()[a2.len()..].trim_start()
+            } else { "" };
+            if a1.is_empty() || a2.is_empty() { println!("Usage: setxattr <path> <name> <value>"); }
+            else { ext2_cmds::cmd_setxattr(a1, a2, val); }
+        }
+        "listxattr"  => ext2_cmds::cmd_listxattr(a1),
+        "chattr"     => {
+            if a1.is_empty() || a2.is_empty() { println!("Usage: chattr <+/-flags> <path>  (i=immutable, a=append, d=nodump, A=noatime)"); }
+            else { ext2_cmds::cmd_chattr(a1, a2); }
+        }
+        "lsattr"     => ext2_cmds::cmd_lsattr(a1),
+
         "mkfs.ext2" => {
             if a1.is_empty() { println!("Usage: mkfs.ext2 <drive 0-3>"); }
             else { mkfs_cmds::cmd_mkfs_ext2(rest); }
@@ -442,6 +458,8 @@ pub fn execute(input: &str) {
                 crate::print_error!("  invalid pid");
             }
         }
+
+        "sv" => cmd_sv(a1, a2, a3),
 
         "net"  => { crate::net::poll(); crate::net::cmd_net(rest); }
         "dhcp" => crate::net::cmd_dhcp(),
@@ -584,4 +602,444 @@ fn parse_ip(s: &str) -> Option<[u8; 4]> {
     let mut p = s.split('.');
     Some([p.next()?.parse().ok()?, p.next()?.parse().ok()?,
           p.next()?.parse().ok()?, p.next()?.parse().ok()?])
+}
+
+fn cmd_sv_socket(args: &str) {
+    let (subcmd, rest) = args.split_once(' ').unwrap_or((args, ""));
+    let rest = rest.trim();
+
+    match subcmd {
+        "list" | "ls" | "" => {
+            let sockets = crate::mikud::list_sockets();
+            if sockets.is_empty() {
+                crate::println!("  no sockets registered");
+                return;
+            }
+            crate::cprintln!(100, 220, 150, "  {:<14} {:<14} {:<8} {:<8} {}",
+                "NAME", "SERVICE", "TYPE", "PORT", "CONNS");
+            for s in &sockets {
+                crate::println!("  {:<14} {:<14} {:<8} {:<8} {}",
+                    s.name, s.service, s.socket_type, s.port, s.connections);
+            }
+        }
+        "stop" => {
+            if rest.is_empty() { crate::println!("Usage: sv socket stop <name>"); return; }
+            if crate::mikud::stop_socket(rest) {
+                crate::cprintln!(100, 220, 150, "  socket '{}' stopped", rest);
+            } else {
+                crate::print_error!("  socket '{}' not found", rest);
+            }
+        }
+        "remove" | "rm" => {
+            if rest.is_empty() { crate::println!("Usage: sv socket remove <name>"); return; }
+            if crate::mikud::remove_socket(rest) {
+                crate::cprintln!(100, 220, 150, "  socket '{}' removed", rest);
+            } else {
+                crate::print_error!("  socket '{}' not found", rest);
+            }
+        }
+        _ => {
+            crate::println!("Usage: sv socket <list|stop|remove> [name]");
+        }
+    }
+}
+
+fn cmd_sv_timer(args: &str) {
+    let (subcmd, rest) = args.split_once(' ').unwrap_or((args, ""));
+    let rest = rest.trim();
+
+    match subcmd {
+        "list" | "ls" | "" => {
+            let timers = crate::mikud::list_timers();
+            if timers.is_empty() {
+                crate::println!("  no timers registered");
+                return;
+            }
+            crate::cprintln!(100, 220, 150, "  {:<14} {:<14} {:<10} {:<10} {}",
+                "NAME", "SERVICE", "TYPE", "INTERVAL", "FIRES");
+            for t in &timers {
+                crate::println!("  {:<14} {:<14} {:<10} {:<10} {}",
+                    t.name, t.service, t.timer_type, t.interval_ticks, t.fire_count);
+            }
+        }
+        "stop" => {
+            if rest.is_empty() { crate::println!("Usage: sv timer stop <name>"); return; }
+            if crate::mikud::stop_timer(rest) {
+                crate::cprintln!(100, 220, 150, "  timer '{}' stopped", rest);
+            } else {
+                crate::print_error!("  timer '{}' not found", rest);
+            }
+        }
+        "start" => {
+            if rest.is_empty() { crate::println!("Usage: sv timer start <name>"); return; }
+            if crate::mikud::start_timer(rest) {
+                crate::cprintln!(100, 220, 150, "  timer '{}' started", rest);
+            } else {
+                crate::print_error!("  timer '{}' not found", rest);
+            }
+        }
+        "remove" | "rm" => {
+            if rest.is_empty() { crate::println!("Usage: sv timer remove <name>"); return; }
+            if crate::mikud::remove_timer(rest) {
+                crate::cprintln!(100, 220, 150, "  timer '{}' removed", rest);
+            } else {
+                crate::print_error!("  timer '{}' not found", rest);
+            }
+        }
+        _ => {
+            crate::println!("Usage: sv timer <list|start|stop|remove> [name]");
+        }
+    }
+}
+
+fn cmd_sv(subcmd: &str, name: &str, extra: &str) {
+    match subcmd {
+        "list" | "ls" | "" => {
+            let services = crate::mikud::list_services();
+            if services.is_empty() {
+                crate::println!("  no services registered");
+                return;
+            }
+            crate::cprintln!(100, 220, 150, "  {:<12} {:<10} {:<8} {}", "NAME", "STATE", "PID", "RESTARTS");
+            for svc in &services {
+                let pid_str = if svc.pid != 0 {
+                    alloc::format!("{}", svc.pid)
+                } else {
+                    alloc::string::String::from("-")
+                };
+                crate::println!("  {:<12} {:<10} {:<8} {}", svc.name, svc.state, pid_str, svc.restarts);
+            }
+        }
+        "start" => {
+            if name.is_empty() { crate::println!("Usage: sv start <name>"); return; }
+            if crate::mikud::start_service(name) {
+                crate::cprintln!(100, 220, 150, "  started '{}'", name);
+            } else {
+                crate::print_error!("  service '{}' not found", name);
+            }
+        }
+        "stop" => {
+            if name.is_empty() { crate::println!("Usage: sv stop <name>"); return; }
+            if crate::mikud::stop_service(name) {
+                crate::cprintln!(100, 220, 150, "  stopped '{}'", name);
+            } else {
+                crate::print_error!("  service '{}' not found", name);
+            }
+        }
+        "restart" => {
+            if name.is_empty() { crate::println!("Usage: sv restart <name>"); return; }
+            if crate::mikud::restart_service(name) {
+                crate::cprintln!(100, 220, 150, "  restarted '{}'", name);
+            } else {
+                crate::print_error!("  service '{}' not found", name);
+            }
+        }
+        "status" => {
+            if name.is_empty() { crate::println!("Usage: sv status <name>"); return; }
+            let services = crate::mikud::list_services();
+            if let Some(svc) = services.iter().find(|svc| svc.name == name) {
+                // State line with color
+                let state_color = match svc.state {
+                    "running" | "activating" => (100, 220, 150),
+                    "failed" => (255, 80, 80),
+                    "stopped" | "dead" => (160, 160, 160),
+                    "starting" | "reloading" | "stopping" => (220, 200, 80),
+                    _ => (200, 200, 200),
+                };
+                crate::cprintln!(state_color.0, state_color.1, state_color.2,
+                    "  {} - {}", svc.name, svc.state);
+                if !svc.description.is_empty() {
+                    crate::println!("    Description: {}", svc.description);
+                }
+                crate::println!("    Type:        {}", svc.svc_type);
+                crate::println!("    Target:      {}", svc.target);
+                let pid_str = if svc.pid != 0 {
+                    alloc::format!("{}", svc.pid)
+                } else {
+                    alloc::string::String::from("-")
+                };
+                crate::println!("    PID:         {}", pid_str);
+                if let Some(path) = svc.exec_start_path {
+                    crate::println!("    ExecStart:   {}", path);
+                }
+                crate::println!("    Restart:     {} (count={})", svc.restart, svc.restarts);
+                crate::println!("    Exit code:   {}", svc.last_exit_code);
+                if !svc.deps.is_empty() {
+                    crate::print!("    Requires:    ");
+                    for d in svc.deps { crate::print!("{} ", d); }
+                    crate::println!();
+                }
+                if !svc.wants.is_empty() {
+                    crate::print!("    Wants:       ");
+                    for w in svc.wants { crate::print!("{} ", w); }
+                    crate::println!();
+                }
+                if !svc.conflicts.is_empty() {
+                    crate::print!("    Conflicts:   ");
+                    for c in svc.conflicts { crate::print!("{} ", c); }
+                    crate::println!();
+                }
+                if svc.watchdog_ticks > 0 {
+                    crate::println!("    Watchdog:    {} ticks", svc.watchdog_ticks);
+                }
+                if svc.critical {
+                    crate::cprintln!(255, 200, 80, "    Flags:       critical");
+                }
+                if svc.masked {
+                    crate::cprintln!(160, 160, 160, "    Flags:       masked");
+                }
+                // Recent journal entries for this service
+                let entries = crate::mikud::journal::entries_for_service(name);
+                if !entries.is_empty() {
+                    crate::println!("    Journal:");
+                    let start = if entries.len() > 5 { entries.len() - 5 } else { 0 };
+                    for e in &entries[start..] {
+                        crate::println!("      t={} {} pid={} code={}",
+                            e.tick, e.event.as_str(), e.pid, e.code);
+                    }
+                }
+            } else {
+                crate::print_error!("  service '{}' not found", name);
+            }
+        }
+        "journal" | "log" => {
+            let entries = if name.is_empty() {
+                crate::mikud::journal::recent(20)
+            } else {
+                crate::mikud::journal::entries_for_service(name)
+            };
+            if entries.is_empty() {
+                crate::println!("  no journal entries");
+                return;
+            }
+            crate::cprintln!(100, 220, 150, "  {:<8} {:<3} {:<12} {:<8} {}", "TICK", "E", "SERVICE", "PID", "CODE");
+            for e in &entries {
+                crate::println!("  {:<8} {:<3} {:<12} {:<8} {}",
+                    e.tick, e.event.symbol(), e.service, e.pid, e.code);
+            }
+            crate::println!("  ({} total events)", crate::mikud::journal::total_events());
+        }
+        "enable" => {
+            if name.is_empty() { crate::println!("Usage: sv enable <name>"); return; }
+            if crate::mikud::enable_service(name) {
+                crate::cprintln!(100, 220, 150, "  enabled '{}'", name);
+            } else {
+                crate::print_error!("  service '{}' not found", name);
+            }
+        }
+        "disable" => {
+            if name.is_empty() { crate::println!("Usage: sv disable <name>"); return; }
+            if crate::mikud::disable_service(name) {
+                crate::cprintln!(100, 220, 150, "  disabled '{}'", name);
+            } else {
+                crate::print_error!("  service '{}' not found", name);
+            }
+        }
+        "reload" => {
+            if name.is_empty() { crate::println!("Usage: sv reload <name>"); return; }
+            if crate::mikud::reload_service(name) {
+                crate::cprintln!(100, 220, 150, "  reloaded '{}' (SIGHUP)", name);
+            } else {
+                crate::print_error!("  failed to reload '{}'", name);
+            }
+        }
+        "mask" => {
+            if name.is_empty() { crate::println!("Usage: sv mask <name>"); return; }
+            if crate::mikud::mask_service(name) {
+                crate::cprintln!(100, 220, 150, "  masked '{}'", name);
+            } else {
+                crate::print_error!("  failed to mask '{}'", name);
+            }
+        }
+        "unmask" => {
+            if name.is_empty() { crate::println!("Usage: sv unmask <name>"); return; }
+            if crate::mikud::unmask_service(name) {
+                crate::cprintln!(100, 220, 150, "  unmasked '{}'", name);
+            } else {
+                crate::print_error!("  failed to unmask '{}'", name);
+            }
+        }
+        "force-stop" | "kill" => {
+            if name.is_empty() { crate::println!("Usage: sv force-stop <name>"); return; }
+            if crate::mikud::force_stop_service(name) {
+                crate::cprintln!(100, 220, 150, "  force-stopped '{}'", name);
+            } else {
+                crate::print_error!("  failed to force-stop '{}'", name);
+            }
+        }
+        "target" => {
+            if name.is_empty() {
+                // Show current and default target
+                crate::println!("  current: {}", crate::mikud::target_name());
+                crate::println!("  default: {}", crate::mikud::default_target().as_str());
+                let (phase, done) = crate::mikud::boot_state();
+                crate::println!("  phase:   {} (boot {})", phase, if done { "complete" } else { "in progress" });
+                crate::println!("  services: {}/{} active",
+                    crate::mikud::active_service_count(), crate::mikud::service_count());
+            } else if name == "isolate" {
+                crate::println!("Usage: sv target isolate <sysinit|multi-user|graphical|rescue>");
+            } else {
+                // Try to set target
+                if crate::mikud::set_target_name(name) {
+                    crate::cprintln!(100, 220, 150, "  target -> {}", name);
+                } else {
+                    crate::print_error!("  unknown target '{}' (sysinit|multi-user|graphical|rescue)", name);
+                }
+            }
+        }
+        "analyze" => {
+            let timings = crate::mikud::boot_analyze();
+            if timings.is_empty() {
+                crate::println!("  no boot data");
+                return;
+            }
+            crate::cprintln!(100, 220, 150, "  {:<14} {:<12} {:<10} {}",
+                "SERVICE", "TARGET", "START", "DURATION");
+            for t in &timings {
+                let dur = if t.duration_ticks == 0 {
+                    alloc::string::String::from("instant")
+                } else {
+                    alloc::format!("{} ticks", t.duration_ticks)
+                };
+                crate::println!("  {:<14} {:<12} {:<10} {}", t.name, t.target, t.start_tick, dur);
+            }
+        }
+        "tree" => {
+            if name.is_empty() { crate::println!("Usage: sv tree <name>"); return; }
+            let tree = crate::mikud::dependency_tree(name);
+            if tree.is_empty() {
+                crate::print_error!("  service '{}' not found", name);
+                return;
+            }
+            for (dep_name, depth) in &tree {
+                let indent = "  ".repeat(*depth as usize + 1);
+                let marker = if *depth == 0 { "*" } else { "-" };
+                let state = crate::mikud::service_state(dep_name)
+                    .map(|s| s.as_str())
+                    .unwrap_or("?");
+                crate::println!("{}{} {} ({})", indent, marker, dep_name, state);
+            }
+        }
+        "rdeps" => {
+            if name.is_empty() { crate::println!("Usage: sv rdeps <name>"); return; }
+            let deps = crate::mikud::reverse_deps(name);
+            if deps.is_empty() {
+                crate::println!("  no services depend on '{}'", name);
+            } else {
+                crate::println!("  services that depend on '{}':", name);
+                for d in &deps {
+                    let state = crate::mikud::service_state(d)
+                        .map(|s| s.as_str())
+                        .unwrap_or("?");
+                    crate::println!("    {} ({})", d, state);
+                }
+            }
+        }
+        "load" => {
+            if name.is_empty() { crate::println!("Usage: sv load <path.service>"); return; }
+            crate::mikud::unit::load_unit_file(name);
+        }
+        "scan" => {
+            crate::mikud::unit::scan_unit_dir();
+        }
+        "isolate" => {
+            if name.is_empty() {
+                crate::println!("Usage: sv isolate <sysinit|multi-user|graphical|rescue>");
+                return;
+            }
+            match crate::mikud::Target::from_str(name) {
+                Some(target) => {
+                    crate::mikud::isolate_target(target);
+                    crate::cprintln!(100, 220, 150, "  isolated to target '{}'", name);
+                }
+                None => {
+                    crate::print_error!("  unknown target '{}' (sysinit|multi-user|graphical|rescue)", name);
+                }
+            }
+        }
+        "timer" => {
+            let timer_args = if extra.is_empty() {
+                alloc::string::String::from(name)
+            } else {
+                alloc::format!("{} {}", name, extra)
+            };
+            cmd_sv_timer(&timer_args);
+        }
+        "socket" | "sock" => {
+            let sock_args = if extra.is_empty() {
+                alloc::string::String::from(name)
+            } else {
+                alloc::format!("{} {}", name, extra)
+            };
+            cmd_sv_socket(&sock_args);
+        }
+        "cat" => {
+            if name.is_empty() { crate::println!("Usage: sv cat <name>"); return; }
+            // Show unit file summary from registered service
+            let services = crate::mikud::list_services();
+            if let Some(svc) = services.iter().find(|s| s.name == name) {
+                crate::cprintln!(100, 220, 150, "  [Unit]");
+                if !svc.description.is_empty() {
+                    crate::println!("  Description={}", svc.description);
+                }
+                if !svc.deps.is_empty() {
+                    crate::print!("  Requires=");
+                    for d in svc.deps { crate::print!("{} ", d); }
+                    crate::println!();
+                }
+                if !svc.wants.is_empty() {
+                    crate::print!("  Wants=");
+                    for w in svc.wants { crate::print!("{} ", w); }
+                    crate::println!();
+                }
+                if !svc.conflicts.is_empty() {
+                    crate::print!("  Conflicts=");
+                    for c in svc.conflicts { crate::print!("{} ", c); }
+                    crate::println!();
+                }
+                crate::cprintln!(100, 220, 150, "  [Service]");
+                crate::println!("  Type={}", svc.svc_type);
+                if let Some(path) = svc.exec_start_path {
+                    crate::println!("  ExecStart={}", path);
+                }
+                crate::println!("  Restart={}", svc.restart);
+                if svc.watchdog_ticks > 0 {
+                    crate::println!("  WatchdogSec={}", svc.watchdog_ticks);
+                }
+                if svc.critical {
+                    crate::println!("  Critical=true");
+                }
+                if svc.masked {
+                    crate::println!("  # MASKED");
+                }
+                crate::cprintln!(100, 220, 150, "  [Install]");
+                crate::println!("  WantedBy={}", svc.target);
+            } else {
+                crate::print_error!("  service '{}' not found", name);
+            }
+        }
+        _ => {
+            crate::println!("Usage: sv <command> [name]");
+            crate::println!("  list          - list all services");
+            crate::println!("  status <name> - detailed service status");
+            crate::println!("  cat <name>    - show service unit config");
+            crate::println!("  start <name>  - start a service");
+            crate::println!("  stop <name>   - stop a service");
+            crate::println!("  restart <name> - restart a service");
+            crate::println!("  reload <name> - send SIGHUP to service");
+            crate::println!("  enable/disable <name> - enable/disable service");
+            crate::println!("  mask/unmask <name> - prevent/allow service start");
+            crate::println!("  force-stop <name> - force kill (even critical)");
+            crate::println!("  journal [name] - show event log");
+            crate::println!("  target [name] - show/set active target");
+            crate::println!("  isolate <tgt> - switch target, stop unneeded");
+            crate::println!("  analyze       - boot timing analysis");
+            crate::println!("  tree <name>   - dependency tree");
+            crate::println!("  rdeps <name>  - reverse dependencies");
+            crate::println!("  load <path>   - load .service unit file");
+            crate::println!("  scan          - scan /etc/mikud/ for units");
+            crate::println!("  timer         - manage timer units");
+            crate::println!("  socket        - manage socket units");
+        }
+    }
 }

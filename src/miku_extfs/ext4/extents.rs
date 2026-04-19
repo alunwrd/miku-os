@@ -500,4 +500,121 @@ impl MikuFS {
         }
         Ok(total)
     }
+
+    // fiemap - return the extent map for a file
+    // returns array of (logical_block, physical_block, length) tuples
+    pub fn ext4_fiemap(
+        &mut self,
+        inode_num: u32,
+        extents: &mut [(u32, u32, u32)],
+    ) -> Result<usize, FsError> {
+        let inode = self.read_inode(inode_num)?;
+        if !inode.uses_extents() {
+            // for non-extent files, build a simple block map
+            let size = inode.size();
+            let bs = self.block_size as u64;
+            let total_blocks = ((size + bs - 1) / bs) as u32;
+            let mut count = 0usize;
+            let mut logical = 0u32;
+            while logical < total_blocks && count < extents.len() {
+                let phys = self.get_file_block(&inode, logical)?;
+                if phys != 0 {
+                    // try to merge with previous extent
+                    if count > 0 {
+                        let (pl, pp, plen) = extents[count - 1];
+                        if logical == pl + plen && phys == pp + plen {
+                            extents[count - 1].2 += 1;
+                            logical += 1;
+                            continue;
+                        }
+                    }
+                    extents[count] = (logical, phys, 1);
+                    count += 1;
+                }
+                logical += 1;
+            }
+            return Ok(count);
+        }
+
+        // extent-based file: read directly from extent tree
+        let header = inode.extent_header();
+        if !header.valid() {
+            return Err(FsError::CorruptedFs);
+        }
+
+        if header.depth == 0 {
+            let mut count = 0usize;
+            for i in 0..header.entries as usize {
+                if count >= extents.len() { break; }
+                let ext = inode.extent_at(i);
+                extents[count] = (ext.block, ext.start() as u32, ext.actual_len());
+                count += 1;
+            }
+            return Ok(count);
+        }
+
+        // multi-level tree: collect leaf extents
+        let mut count = 0usize;
+        self.ext4_fiemap_tree(&inode, header.depth, &mut count, extents)?;
+        Ok(count)
+    }
+
+    fn ext4_fiemap_tree(
+        &mut self,
+        inode: &Inode,
+        depth: u16,
+        count: &mut usize,
+        extents: &mut [(u32, u32, u32)],
+    ) -> Result<(), FsError> {
+        let header = inode.extent_header();
+        for i in 0..header.entries as usize {
+            if *count >= extents.len() { return Ok(()); }
+            let idx = inode.extent_idx_at(i);
+            let leaf = idx.leaf() as u32;
+            if leaf == 0 { continue; }
+            self.ext4_fiemap_node(leaf, depth - 1, count, extents)?;
+        }
+        Ok(())
+    }
+
+    fn ext4_fiemap_node(
+        &mut self,
+        block_num: u32,
+        depth: u16,
+        count: &mut usize,
+        extents: &mut [(u32, u32, u32)],
+    ) -> Result<(), FsError> {
+        let bs = self.block_size as usize;
+        let mut buf = [0u8; 4096];
+        self.read_block_into(block_num, &mut buf[..bs])?;
+
+        let magic = u16::from_le_bytes([buf[0], buf[1]]);
+        let entries = u16::from_le_bytes([buf[2], buf[3]]);
+        if magic != EXT4_EXT_MAGIC { return Err(FsError::CorruptedFs); }
+
+        if depth == 0 {
+            for i in 0..entries as usize {
+                if *count >= extents.len() { return Ok(()); }
+                let base = 12 + i * 12;
+                let ee_block = u32::from_le_bytes([buf[base], buf[base+1], buf[base+2], buf[base+3]]);
+                let ee_len = u16::from_le_bytes([buf[base+4], buf[base+5]]);
+                let ee_start_hi = u16::from_le_bytes([buf[base+6], buf[base+7]]);
+                let ee_start_lo = u32::from_le_bytes([buf[base+8], buf[base+9], buf[base+10], buf[base+11]]);
+                let actual_len = if ee_len > 32768 { ee_len - 32768 } else { ee_len } as u32;
+                let phys = (ee_start_lo as u64 | ((ee_start_hi as u64) << 32)) as u32;
+                extents[*count] = (ee_block, phys, actual_len);
+                *count += 1;
+            }
+        } else {
+            for i in 0..entries as usize {
+                if *count >= extents.len() { return Ok(()); }
+                let base = 12 + i * 12;
+                let leaf_lo = u32::from_le_bytes([buf[base+4], buf[base+5], buf[base+6], buf[base+7]]);
+                if leaf_lo != 0 {
+                    self.ext4_fiemap_node(leaf_lo, depth - 1, count, extents)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }

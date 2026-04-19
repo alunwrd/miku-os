@@ -6,7 +6,7 @@
 
 *Powered by Rust and a few developers :D*
 
-<img src="https://raw.githubusercontent.com/altushkaso2/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
+<img src="https://raw.githubusercontent.com/alunwrd/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
 
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Architecture](https://img.shields.io/badge/arch-x86__64-blue.svg)]()
@@ -17,15 +17,15 @@
 
 ---
 
-> **Documentation:** [Russian](docs/Russian_README.md) | [English](docs/English_README.md) | [Japanese](Japanese_README.md)
+> **Documentation:** [Russian](Russian_README.md) | [English](English_README.md) | [Japanese](Japanese_README.md)
 
 ---
 
 ## About
 
-**Miku OS** is a UNIX-like operating system developed from scratch in a `no_std` environment.
+**Miku OS** is a operating system developed from scratch in a `no_std` environment.
 It does not use any standard library (`libc`), maintaining full control over hardware and memory architecture.
-ELF dynamic linking, shared libraries, and userspace processes are implemented from scratch.
+ELF dynamic linking, shared libraries, userspace processes, an init daemon (mikuD), and process management (fork/exec/wait) are implemented from scratch.
 
 > All code is written in Rust. Assembly is only used for the bootloader, syscall handler, and context switching.
 
@@ -45,6 +45,167 @@ ELF dynamic linking, shared libraries, and userspace processes are implemented f
 | **SSE** | CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1 |
 | **Heap** | 32 MB, linked list allocator |
 | **Syscall** | SYSCALL/SYSRET via MSR, naked asm handler, R8/R9/R10 preservation |
+| **Signals** | SIGKILL (9), SIGTERM (15), SIGCHLD (17), 32-bit bitmask |
+| **Init** | mikuD (PID 1) - systemd-like service supervisor |
+
+---
+
+### mikuD - Init Daemon
+
+<details>
+<summary><b>Expand</b></summary>
+
+#### Overview
+
+mikuD is the init daemon (PID 1) for MikuOS - a full systemd-like service supervisor with Unix-style boundaries. It manages service lifecycle, dependency resolution, targets (runlevels), watchdog, notifications, socket activation, timers, ELF binary execution (ExecStart), and graceful shutdown with global timeout.
+
+#### Targets (Runlevels)
+
+| Target | Value | Description |
+|:--|:--:|:--|
+| **SysInit** | 0 | System initialization |
+| **MultiUser** | 1 | Multi-user mode (default) |
+| **Graphical** | 2 | Graphical mode |
+| **Rescue** | 3 | Rescue / single-user mode |
+
+Services activate when target >= their declared target. Target transitions trigger automatic reconciliation.
+
+#### Service Types
+
+| Type | Description |
+|:--|:--|
+| **Simple** | Long-running service (default) |
+| **Oneshot** | Execute once, then mark completed |
+| **Notify** | Service reports readiness via `notify_ready()` |
+| **Forking** | Service forks child process |
+
+#### Restart Policies
+
+| Policy | Behavior |
+|:--|:--|
+| **Always** | Restart on any exit |
+| **Never** | Never restart |
+| **OnFailure** | Restart only if exit code != 0 |
+| **OnSuccess** | Restart only if exit code == 0 |
+| **OnAbnormal** | Restart on signal or non-zero exit |
+
+#### Dependency Types
+
+| Type | Behavior |
+|:--|:--|
+| **Requires** (deps) | Hard dependency - service fails if dep fails |
+| **Wants** | Soft dependency - service continues if dep fails |
+| **Conflicts** | Stop conflicting service before starting |
+
+#### Features
+
+| Feature | Details |
+|:--|:--|
+| **ExecStart** | Launch ELF binaries from disk as services |
+| **Watchdog** | Service must ping within timeout or gets restarted |
+| **Notify** | sd_notify analog - service signals readiness |
+| **Conditions** | ConditionPathExists, ConditionServiceActive, ConditionTargetActive |
+| **Masking** | Completely prevent a service from starting |
+| **Critical** | Protected services cannot be stopped by user |
+| **Burst protection** | Max 5 restarts per 10 sec window |
+| **Graceful shutdown** | Stop non-critical first, then critical, 30 sec global timeout |
+| **Boot analysis** | Timing data for all services started during boot |
+| **Environment vars** | Up to 8 key=value pairs per service |
+| **Timeout** | Configurable start/stop timeouts (default 10 sec) |
+| **On-restart hooks** | Callback before service re-entry (shell reinit) |
+| **Isolate** | Switch target and stop everything not in it |
+
+#### Journal (Event Log)
+
+128-entry ring buffer logging all mikuD events:
+
+| Event | Symbol | Description |
+|:--|:--:|:--|
+| Started | + | Service started |
+| Stopped | - | Service stopped |
+| Exited | x | Service exited (with exit code) |
+| Failed | ! | Service failed |
+| DepFailed | d | Dependency failure |
+| ExecFailed | E | ELF binary launch failed |
+| Reloaded | R | SIGHUP reload |
+| WatchdogTimeout | W | Watchdog expired |
+| BurstLimit | B | Restart rate limit hit |
+| Shutdown | S | Graceful shutdown initiated |
+| TimerFired | F | Timer unit fired |
+| SocketActivated | A | Socket activation triggered |
+
+Events have severity levels: info (0), notice (1), warning (2), critical (3).
+
+#### Timer Units
+
+| Type | Behavior |
+|:--|:--|
+| **Interval** | Fire every N ticks repeatedly |
+| **Oneshot** | Fire once after N ticks, then disable |
+| **Realtime** | Fire every N ticks aligned to boot time |
+
+Max 16 timers. Timers trigger service start on fire.
+
+#### Socket Activation
+
+Services can be started on-demand when a connection arrives on a registered port.
+Supports Stream (TCP) and Dgram (UDP) socket types. Max 16 sockets.
+
+#### Unit Files (.service)
+
+INI-like format loaded from `/etc/mikud/`:
+
+```ini
+[Unit]
+Description=My service
+After=kbd network
+Wants=logging
+Conflicts=rescue-shell
+ConditionPathExists=/etc/config
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/myservice
+Restart=always
+RestartSec=50
+Priority=5
+WatchdogSec=100
+TimeoutStartSec=2500
+RemainAfterExit=false
+Critical=false
+Environment=LANG=en
+
+[Install]
+WantedBy=multi-user
+```
+
+#### Shell Commands (sv)
+
+| Command | Description |
+|:--|:--|
+| `sv list` | List all services with state, PID, restarts |
+| `sv status <name>` | Detailed status + journal entries |
+| `sv start <name>` | Start a service |
+| `sv stop <name>` | Stop a service (graceful) |
+| `sv restart <name>` | Restart a service |
+| `sv reload <name>` | Send SIGHUP for config reload |
+| `sv enable <name>` | Enable service |
+| `sv disable <name>` | Disable service (stop + deactivate) |
+| `sv mask <name>` | Prevent service from starting |
+| `sv unmask <name>` | Allow masked service to start |
+| `sv force-stop <name>` | Force kill (even critical services) |
+| `sv journal [name]` | Show event log (last 20 or per service) |
+| `sv target [name]` | Show/set active target |
+| `sv analyze` | Boot timing analysis |
+| `sv tree <name>` | Dependency tree visualization |
+| `sv rdeps <name>` | Reverse dependencies |
+| `sv cat <name>` | Show service unit config |
+| `sv load <path>` | Load .service unit file |
+| `sv scan` | Scan /etc/mikud/ for unit files |
+| `sv timer list` | List timer units |
+| `sv timer start/stop <name>` | Control timers |
+
+</details>
 
 ---
 
@@ -165,26 +326,28 @@ The kernel parses ELF segments and maps the shared library directly into the pro
 
 #### Overview
 
-libmiku is a C-compatible standard library for MikuOS. Written in Rust, it exports 79 functions across 12 modules.
+libmiku is a C-compatible standard library for MikuOS. Written in Rust, it provides 63 modules and 962 exported functions covering everything from basic I/O to data structures, cryptography, parsing, and a full POSIX libc compatibility layer (stdio, stdlib, string.h, etc.).
 Dynamically loaded by ld-miku, used by all userspace programs.
 
-#### Modular Structure
+#### Module Categories
 
-```
-src/lib/libmiku/
-├── lib.rs       module declarations, entry point, panic handler
-├── sys.rs       syscall primitives (sc0..sc4), constants
-├── proc.rs      exit, getpid, brk, mmap, munmap, tls
-├── io.rs        write, read, print, println, readline
-├── mem.rs       memset, memcpy, memmove, memcmp
-├── num.rs       itoa, utoa, atoi, print_int, print_hex
-├── string.rs    strlen, strcmp, strcpy, strtok, strtol...
-├── heap.rs      malloc, free, realloc, calloc
-├── file.rs      open, close, seek, fsize, read_file
-├── time.rs      sleep, uptime
-├── util.rs      abs, min, max, rand, assert, panic
-└── fmt.rs       printf, snprintf (asm trampolines)
-```
+| Category | Modules |
+|:--|:--|
+| **Data Structures** | vec, list, hashmap, treemap, trie, queue, ringbuf, ringbuf2, heap_queue, bitset, channel |
+| **Strings** | string, strbuf, ctype, utf8, format, regex, glob |
+| **I/O** | io, bufio, stdio, file, dir, path |
+| **Numbers / Math** | num, math, random, convert, endian, bitops |
+| **Encoding** | base64, hex, json, csv, ini, lz |
+| **Crypto / Hash** | sha256, checksum, hash, uuid |
+| **System** | sys, proc, signal, env, errno, args, getopt |
+| **Concurrency** | sync, channel, event, timer |
+| **Time** | time, datetime |
+| **Memory** | mem, heap, arena, pool, slab |
+| **Logging / Testing** | log, test, panic |
+| **Sorting** | sort |
+| **libc compat** | libc (fopen/fclose/fread/fwrite/fprintf/fgets/fputs etc., 151 functions) |
+
+> The previous `util` module was split into `math` (abs/min/max/clamp/isqrt/div_ceil/is_prime), `random` (srand/rand/rand_range/rand_bytes) and `panic` (assert_fail/panic/assert_eq/assert_not_null). Calls like `miku_abs` / `miku_rand_range` remain ABI-compatible.
 
 #### Module: io (Input/Output)
 
@@ -233,11 +396,14 @@ src/lib/libmiku/
 
 | Function | Description |
 |:--|:--|
-| `miku_memset` | Memory fill (8-byte aligned optimization) |
-| `miku_memcpy` | Memory copy (8-byte aligned optimization) |
+| `miku_memset` | Memory fill |
+| `miku_memcpy` | Memory copy |
 | `miku_memmove` | Memory copy (overlap-safe) |
 | `miku_memcmp` | Memory comparison |
 | `miku_bzero` | Zero fill |
+| `miku_memchr` | Byte search |
+| `miku_memrchr` | Reverse byte search |
+| `miku_memmem` | Byte sequence search |
 
 #### Module: heap (Dynamic Memory)
 
@@ -276,7 +442,7 @@ Implementation: `global_asm!` trampoline saves rsi/rdx/rcx/r8/r9 to stack. No XM
 
 | Function | Description |
 |:--|:--|
-| `miku_sleep(ticks)` | Sleep (~10ms/tick) |
+| `miku_sleep(ticks)` | Sleep (~4 ms/tick at 250 Hz) |
 | `miku_sleep_ms(ms)` | Sleep in milliseconds |
 | `miku_uptime()` | Ticks since boot |
 | `miku_uptime_ms()` | Milliseconds since boot |
@@ -293,16 +459,6 @@ Implementation: `global_asm!` trampoline saves rsi/rdx/rcx/r8/r9 to stack. No XM
 | `miku_set_tls` / `miku_get_tls` | TLS register |
 | `miku_map_lib(name, len)` | Map shared library |
 
-#### Module: util (Utilities)
-
-| Function | Description |
-|:--|:--|
-| `miku_abs` / `miku_min` / `miku_max` / `miku_clamp` | Numeric utilities |
-| `miku_swap(a, b)` | Swap values |
-| `miku_srand(seed)` / `miku_rand()` / `miku_rand_range(lo, hi)` | Pseudorandom numbers (xorshift64) |
-| `miku_assert_fail(expr, file, line)` | Assertion failure |
-| `miku_panic(msg)` | Panic (exit 134) |
-
 </details>
 
 ---
@@ -316,54 +472,6 @@ Implementation: `global_asm!` trampoline saves rsi/rdx/rcx/r8/r9 to stack. No XM
 
 MikuOS provides a Rust SDK for developing userspace programs in a `no_std` environment.
 C is also supported.
-
-#### SDK Structure
-
-```
-src/lib/userspace/
-├── Cargo.toml              crate configuration
-├── build.rs                auto-generates stub libmiku.so
-├── build.sh                build + deploy script
-├── x86_64-miku-app.json    target specification
-└── src/
-    ├── miku.rs             SDK: extern bindings + safe wrappers
-    ├── hello.rs            Hello World example
-    └── test_full.rs        71 tests
-```
-
-#### Rust Example
-
-```rust
-#![no_std]
-#![no_main]
-
-#[path = "miku.rs"]
-mod miku;
-
-#[no_mangle]
-pub extern "C" fn _start_main() -> ! {
-    miku::println("Hello MikuOS!");
-    miku::exit(0);
-}
-
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! { miku::exit(1); }
-```
-
-#### Build and Deploy
-
-```bash
-cd ~/miku-os/src/lib/userspace
-./build.sh hello        # build + copy to data.img
-```
-
-#### Running in MikuOS
-
-```
-miku@os:/ $ ext4mount 3
-miku@os:/ $ exec hello
-Hello MikuOS!
-```
 
 #### Safe Wrappers (miku.rs)
 
@@ -384,21 +492,20 @@ Use `_start_main`, not `_start`. `miku.rs` contains a `global_asm!` trampoline t
 
 #### Test Suite
 
-71 tests across the following categories:
+1617 tests across the following categories:
 
 | Category | Count |
 |:--|:--|
-| strings (basic) | 10 |
-| strings (extended) | 14 |
+| strings (basic/extended) | 24 |
 | numbers | 7 |
 | memory | 4 |
 | utilities | 7 |
 | heap | 7 |
 | process | 2 |
-| printf | 6 |
-| snprintf | 5 |
+| printf / snprintf | 11 |
 | time | 5 |
 | file I/O | 3+ |
+| libc compat (stdio) | 1500+ |
 
 </details>
 
@@ -434,6 +541,7 @@ Use `_start_main`, not `_start`. `miku.rs` contains a `global_asm!` trampoline t
 - `mark_swapped()`: write swap PTE when evicting a page
 - Ring 0 / ring 3 mapping support
 - Address space creation and destruction for user processes
+- Per-process address space for fork/exec
 
 </details>
 
@@ -482,6 +590,19 @@ Additional check: slot number != 0 (false positive prevention)
 
 ---
 
+### Process Management
+
+| Feature | Description |
+|:--|:--|
+| **fork()** | Full COW-style process cloning via deep page table copy |
+| **exec()** | Replace process image with ELF binary |
+| **wait4()** | Wait for child process (blocking) |
+| **kill()** | Send signal to process (SIGTERM, SIGKILL, SIGCHLD) |
+| **Zombie reaping** | Automatic via mikuD and wait4 |
+| **Process hierarchy** | Parent-child tracking via ppid |
+
+---
+
 ### Scheduler
 
 | Parameter | Value |
@@ -493,6 +614,8 @@ Additional check: slot number != 0 (false positive prevention)
 | **Stack** | 512 KB per process |
 | **States** | Ready / Running / Sleeping / Blocked / Dead |
 | **Implementation** | Lock-free: ISR uses atomics only |
+| **Priority** | 1-20 scale with weighted vruntime |
+| **Affinity** | Per-process CPU mask |
 
 ---
 
@@ -516,8 +639,37 @@ Additional check: slot number != 0 (false positive prevention)
 | **13** | `sys_seek` | Set file offset |
 | **14** | `sys_fsize` | Get file size |
 | **15** | `sys_map_lib` | Direct shared library mapping |
-| **16** | `sys_sleep` | Sleep process (~10ms/tick) |
+| **16** | `sys_sleep` | Sleep process (~4ms/tick) |
 | **17** | `sys_uptime` | Get ticks since boot |
+| **18** | `sys_stat` | File stat |
+| **19** | `sys_fstat` | File descriptor stat |
+| **20** | `sys_mkdir` | Create directory |
+| **21** | `sys_rmdir` | Remove directory |
+| **22** | `sys_unlink` | Remove file |
+| **23** | `sys_readdir` | Read directory entries |
+| **24** | `sys_rename` | Rename file/directory |
+| **25** | `sys_link` | Create hard link |
+| **26** | `sys_chmod` | Change permissions |
+| **27** | `sys_chown` | Change ownership |
+| **28** | `sys_dup` | Duplicate file descriptor |
+| **29** | `sys_dup2` | Duplicate to specific fd |
+| **30** | `sys_truncate` | Truncate file |
+| **31** | `sys_write_file` | Write file contents |
+| **32** | `sys_symlink` | Create symbolic link |
+| **33** | `sys_readlink` | Read symbolic link |
+| **34** | `sys_pipe` | Create pipe |
+| **35** | `sys_chdir` | Change directory |
+| **36** | `sys_statfs` | File system statistics |
+| **37** | `sys_fallocate` | Preallocate file space |
+| **38** | `sys_getxattr` | Get extended attribute |
+| **39** | `sys_setxattr` | Set extended attribute |
+| **40** | `sys_utimensat` | Set file timestamps |
+| **41** | `sys_fsync` | Flush file to disk |
+| **42** | `sys_punch_hole` | Punch hole in file |
+| **43** | `sys_fork` | Fork current process |
+| **44** | `sys_wait4` | Wait for child process |
+| **45** | `sys_kill` | Send signal to process |
+| **46** | `sys_exec` | Execute ELF binary |
 
 FD table is managed per-process (BTreeMap<pid, ProcessFds>).
 
@@ -542,23 +694,36 @@ FD table is managed per-process (BTreeMap<pid, ProcessFds>).
 
 | Layer | Protocols |
 |:--|:--|
-| **L2** | Ethernet, ARP (with cache table) |
+| **L2** | Ethernet, ARP (with cache table, header validation) |
 | **L3** | IPv4, ICMP |
-| **L4** | UDP, TCP (with connection state management) |
-| **Application** | DHCP, DNS, NTP, HTTP, HTTP/2, Traceroute |
-| **Security** | TLS 1.3 (ECDHE + RSA + AES-GCM) |
+| **L4** | UDP, TCP (listener + client, state machine, retransmits) |
+| **Application** | DHCP, DNS, NTP, HTTP/1.1, HTTP/2 (HPACK), Ping, Traceroute |
+| **Security** | TLS 1.2 / 1.3 (ECDHE + RSA + AES-GCM, constant-time) |
 
 </details>
 
 <details>
-<summary><b>TLS 1.3: Complete Implementation from Scratch</b></summary>
+<summary><b>TLS 1.2 / 1.3: Complete Implementation from Scratch</b></summary>
 
-- ECDH: X25519 key exchange (`tls_ecdh.rs`)
-- RSA: ASN.1/DER certificate parsing, PKCS#1 signature verification (`tls_rsa.rs`)
+- ECDH: P-256 ECDHE key exchange (`tls_ecdh.rs`), constant-time Montgomery-style scalar multiplication (always-double-always-add + `cmov`)
+- RSA: ASN.1/DER certificate parsing, PKCS#1 v1.5 padding (`tls_rsa.rs`), RDRAND-sourced padding bytes
 - BigNum: custom big number implementation for RSA 2048-bit (`tls_bignum.rs`)
 - AES-GCM: authenticated symmetric encryption (`tls_gcm.rs`)
 - SHA-256, HMAC, HKDF: hashing, key derivation (`tls_crypto.rs`)
-- Handshake: ClientHello -> ServerHello -> Certificate -> Finished
+- Handshake: ClientHello -> ServerHello -> Certificate -> [ECDHE] -> Finished (client + server Finished verify_data checked)
+- HTTP/2: RFC 7540 framing and RFC 7541 HPACK with correct Appendix B Huffman table (`http2.rs`)
+
+#### Security Hardening
+
+| Concern | Mitigation |
+|:--|:--|
+| **RNG** | RDRAND-based CSPRNG for ClientHello random, CBC IV, ECDH private key, RSA padding (`random::random_u64`) |
+| **Timing (Lucky13)** | Constant-time MAC compare via OR-accumulator byte diff |
+| **Padding oracle** | Full RFC 5246 padding check — all pad bytes verified, not just the last |
+| **ECDH timing leak** | `fe_cmov` / `jac_cmov` XOR-mask constant-time field/point select |
+| **Server impersonation** | TLS 1.2 server Finished `verify_data = PRF(master, "server finished", hs_hash)` checked constant-time |
+| **PKCS#1 padding** | RDRAND-sourced non-zero padding bytes (rejection loop) |
+| **ARP spoofing** | hw_type / proto_type / hlen / plen checks before accepting ARP-IPv4 entries |
 
 </details>
 
@@ -677,6 +842,24 @@ The immutable flag prevents unlink / write / rename.
 
 ### Shell Commands
 
+#### Service Management (sv)
+
+| Command | Description |
+|:--|:--|
+| `sv list` | List all services |
+| `sv status <name>` | Detailed service status |
+| `sv start/stop/restart <name>` | Service lifecycle |
+| `sv reload <name>` | Send SIGHUP |
+| `sv enable/disable <name>` | Enable/disable |
+| `sv mask/unmask <name>` | Mask/unmask |
+| `sv force-stop <name>` | Force kill |
+| `sv journal [name]` | Event log |
+| `sv target [name]` | Target management |
+| `sv analyze` | Boot analysis |
+| `sv tree/rdeps <name>` | Dependency info |
+| `sv load/scan` | Unit file management |
+| `sv timer list/start/stop` | Timer management |
+
 #### Unified ext Commands (auto-detects mounted FS version)
 
 | Command | Syntax | Description |
@@ -731,17 +914,78 @@ The immutable flag prevents unlink / write / rename.
 
 | Command | Description |
 |:--|:--|
-| `exec <path>` | Run ELF binary (with dynamic linking) |
+| `exec <path> [args]` | Run ELF binary (with dynamic linking) |
 | `ldconfig` | Update shared library cache |
 | `ldd` | List cached libraries |
 
-#### mkfs Commands
+#### Process Management
+
+| Command | Description |
+|:--|:--|
+| `ps` | List all processes |
+| `top` | Live process monitor |
+| `kill <pid>` | Kill process by PID |
+| `nice <pid> <prio>` | Change process priority (1-20) |
+| `affinity <pid> <mask>` | Set CPU affinity mask |
+| `swaptest` | Stress-test the swap subsystem |
+
+#### System Commands
+
+| Command | Description |
+|:--|:--|
+| `poweroff` / `shutdown` / `halt` | Graceful shutdown via mikuD |
+| `reboot` / `restart` | Graceful reboot via mikuD |
+| `info` | System information |
+| `memmap` | Physical memory map |
+| `heap` | Heap statistics |
+| `clear` | Clear screen |
+| `echo <text>` | Print text |
+| `history` | Command history |
+| `help` | Command list |
+
+#### mkfs / Disk / Swap Commands
 
 | Command | Description |
 |:--|:--|
 | `mkfs.ext2 <drive>` | Format ext2 |
 | `mkfs.ext3 <drive>` | Format ext3 (with journal) |
 | `mkfs.ext4 <drive>` | Format ext4 (extents + journal) |
+| `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run format (layout only) |
+| `gpt <drive>` | Show GPT partition table |
+| `gpt.init <drive>` | Initialize empty GPT |
+| `gpt.add <drive> <partition spec>` | Add partition |
+| `gpt.del <drive> <partition>` | Delete partition |
+| `mkswap <drive> <partition>` | Create swap area on partition |
+| `swapon <drive> <partition>` | Activate swap |
+| `swapon.raw <drive> <start> <size>` | Activate raw-range swap |
+| `swapon.auto` | Auto-discover and activate swap partitions |
+| `swapoff` | Deactivate swap |
+| `swapinfo` | Show swap usage |
+| `mkswap.raw <drive> <start> <size>` | Create raw swap without GPT |
+
+#### Extended Attributes / Flags
+
+| Command | Description |
+|:--|:--|
+| `getxattr <path> <name>` | Read user xattr |
+| `setxattr <path> <name> <value>` | Write user xattr |
+| `listxattr <path>` | List all xattrs |
+| `chattr <+/-flags> <path>` | Set file flags (i=immutable, a=append, d=nodump, A=noatime) |
+| `lsattr <path>` | List file flags |
+| `fiemap <path>` | Show file extent map (ext4) |
+
+#### Networking
+
+| Command | Description |
+|:--|:--|
+| `net <subcmd>` | Network status / config |
+| `dhcp` | Request lease via DHCP |
+| `ping <ip\|host> [count]` | ICMP echo (resolves via DNS) |
+| `ntp [server]` | Sync clock via NTP |
+| `traceroute` / `tr <host>` | UDP/ICMP route tracing |
+| `fetch <url\|host> [port]` | Minimal HTTP/HTTPS client |
+| `wget <url> [-O <file>]` | Download over HTTP(S) |
+| `curl <url> [-X GET\|POST] [-d <data>] [-o <file>] [-I]` | HTTP(S) client |
 
 ---
 
@@ -811,15 +1055,15 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
 ## Author
 
 <div align="center">
-  <a href="https://github.com/altushkaso2">
-    <img src="https://github.com/altushkaso2.png" width="100" style="border-radius:50%;" alt="altushkaso2">
+  <a href="https://github.com/alunwrd">
+    <img src="https://github.com/alunwrd.png" width="100" style="border-radius:50%;" alt="alunwrd">
   </a>
   <br><br>
-  <a href="https://github.com/altushkaso2"><b>@altushkaso2</b></a>
+  <a href="https://github.com/alunwrd"><b>@alunwrd</b></a>
   <br>
   <sub>Author and sole developer of Miku OS</sub>
   <br>
-  <sub>Kernel - VFS - MikuFS - ELF - ld-miku - libmiku - Shell - Network - TLS - Scheduler - PMM - VMM - Swap</sub>
+  <sub>Kernel - VFS - MikuFS - ELF - ld-miku - libmiku - Shell - Network - TLS - Scheduler - PMM - VMM - Swap - mikuD - Signals - fork/exec</sub>
 </div>
 
 ---
@@ -834,7 +1078,7 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
 >
 > The moment the ELF loader and dynamic linking worked, when "hello from dynamic linking!"
 > appeared on screen, I will never forget.
-> And when libmiku passed all 71 tests, it became clear that real programs can run on this OS.
+> When libmiku passed all 1617 tests, it became clear that real programs can run on this OS.
 
 <div align="center">
 
@@ -842,4 +1086,4 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
 
 *With love*
 
-<img src="https://raw.githubusercontent.com/altushkaso2/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
+<img src="https://raw.githubusercontent.com/altushkaso2/alunwrd/main/docs/miku.png" width="220" alt="Miku Logo">

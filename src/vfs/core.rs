@@ -129,16 +129,12 @@ impl MikuVFS {
         let mut files_created = 0u8;
 
         for lib in syslibs::LIBS {
-            let dir_h = crate::vfs::hash::name_hash(lib.dir);
             let dir_id = {
-                let mut found = None;
-                for cid in self.nodes[0].children.find_by_hash(dir_h) {
-                    let c = cid as usize;
-                    if c < MAX_VNODES && self.nodes[c].active && self.nodes[c].name_eq(lib.dir) {
-                        found = Some(c);
-                        break;
-                    }
-                }
+                let found = self.nodes[0].children.find_by_name(lib.dir)
+                    .and_then(|id| {
+                        let c = id as usize;
+                        if c < MAX_VNODES && self.nodes[c].active { Some(c) } else { None }
+                    });
                 match found {
                     Some(id) => id,
                     None => {
@@ -384,7 +380,7 @@ impl MikuVFS {
     }
 
     #[inline]
-    fn valid_vnode(&self, id: usize) -> bool {
+    pub fn valid_vnode(&self, id: usize) -> bool {
         id < MAX_VNODES && self.nodes[id].active
     }
 
@@ -422,6 +418,50 @@ impl MikuVFS {
             current = self.lookup_child_or_load(eff, component)?;
 
             if self.nodes[current].is_symlink() {
+                current = self.follow_symlink(current, 0)?;
+            }
+        }
+        Ok(current)
+    }
+
+    pub fn resolve_path_lstat(&mut self, cwd: usize, path: &str) -> VfsResult<usize> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Ok(cwd);
+        }
+
+        let total = path.split('/').filter(|c| !c.is_empty() && *c != "." && *c != "..").count();
+        let mut idx = 0usize;
+        let mut current = if path.starts_with('/') { 0 } else { cwd };
+        let mut depth = 0u8;
+
+        for component in path.split('/') {
+            if component.is_empty() || component == "." {
+                continue;
+            }
+            if component == ".." {
+                let p = self.nodes[current].parent;
+                if p != INVALID_ID {
+                    current = p as usize;
+                }
+                continue;
+            }
+
+            idx += 1;
+            depth += 1;
+            if depth as usize > MAX_PATH_DEPTH {
+                return Err(VfsError::InvalidPath);
+            }
+
+            if !self.nodes[current].is_dir() {
+                return Err(VfsError::NotDirectory);
+            }
+
+            let eff = self.xm(current);
+            current = self.lookup_child_or_load(eff, component)?;
+
+            // follow symlinks for intermediate components, not the last one
+            if idx < total && self.nodes[current].is_symlink() {
                 current = self.follow_symlink(current, 0)?;
             }
         }
@@ -478,15 +518,14 @@ impl MikuVFS {
     }
 
     fn lookup_child_or_load(&mut self, parent: usize, name: &str) -> VfsResult<usize> {
-        let h = name_hash(name);
-        for candidate_id in self.nodes[parent].children.find_by_hash(h) {
-            let cid = candidate_id as usize;
-            if cid < MAX_VNODES && self.nodes[cid].active && self.nodes[cid].name_eq(name) {
+        if let Some(id) = self.nodes[parent].children.find_by_name(name) {
+            let cid = id as usize;
+            if cid < MAX_VNODES && self.nodes[cid].active {
                 return Ok(cid);
             }
         }
 
-        if self.nodes[parent].fs_type == FsType::Ext2 && self.nodes[parent].ext2_ino != 0 {
+        if self.nodes[parent].fs_type.is_ext_family() && self.nodes[parent].ext2_ino != 0 {
             return self.ext2_lazy_lookup(parent, name);
         }
 
@@ -606,7 +645,7 @@ impl MikuVFS {
 
         let ext2_ino = self.nodes[dir_vnode].ext2_ino;
 
-        const BATCH: usize = 128;
+        const BATCH: usize = 256;
         struct ChildInfo {
             name: [u8; 255],
             name_len: u8,
@@ -693,15 +732,12 @@ impl MikuVFS {
                 Err(_) => continue,
             };
 
-            let h = name_hash(name_str);
-            let mut already = false;
-            for cid in self.nodes[dir_vnode].children.find_by_hash(h) {
-                let c = cid as usize;
-                if c < MAX_VNODES && self.nodes[c].active && self.nodes[c].name_eq(name_str) {
-                    already = true;
-                    break;
-                }
-            }
+            let already = self.nodes[dir_vnode].children.find_by_name(name_str)
+                .map(|id| {
+                    let c = id as usize;
+                    c < MAX_VNODES && self.nodes[c].active
+                })
+                .unwrap_or(false);
             if already {
                 continue;
             }
@@ -868,7 +904,7 @@ impl MikuVFS {
         self.nodes[id].touch_mtime(self.now());
     }
 
-    fn truncate_to(&mut self, id: usize, new_size: u64) {
+    pub fn truncate_to(&mut self, id: usize, new_size: u64) {
         let old_size = self.nodes[id].size;
         if new_size >= old_size {
             self.nodes[id].size = new_size;
@@ -919,7 +955,9 @@ impl MikuVFS {
         }
 
         self.nodes[id].size = new_size;
-        self.nodes[id].touch_mtime(self.now());
+        let ts = self.now();
+        self.nodes[id].touch_mtime(ts);
+        self.nodes[id].touch_ctime(ts);
     }
 
     #[inline]
@@ -937,11 +975,10 @@ impl MikuVFS {
     }
 
     fn ensure_no_duplicate(&self, parent: usize, name: &str) -> VfsResult<()> {
-        let h = name_hash(name);
         let eff = self.effective_node(parent);
-        for cid in self.nodes[eff].children.find_by_hash(h) {
-            let c = cid as usize;
-            if c < MAX_VNODES && self.nodes[c].active && self.nodes[c].name_eq(name) {
+        if let Some(id) = self.nodes[eff].children.find_by_name(name) {
+            let c = id as usize;
+            if c < MAX_VNODES && self.nodes[c].active {
                 return Err(VfsError::AlreadyExists);
             }
         }
@@ -981,6 +1018,36 @@ impl MikuVFS {
                 if self.nodes[cid].is_dir() {
                     self.evict_ext2_children(cid);
                 }
+                let h = name_hash(self.nodes[cid].get_name());
+                self.nodes[dir_id].children.remove(h, cid as InodeId);
+                self.nodes[cid].active = false;
+            }
+        }
+
+        self.nodes[dir_id].children_loaded = false;
+    }
+
+    pub(crate) fn evict_children_recursive(&mut self, dir_id: usize) {
+        let mut to_evict: alloc::vec::Vec<InodeId> = alloc::vec::Vec::new();
+
+        for (_, child_id) in self.nodes[dir_id].children.iter() {
+            let cid = child_id as usize;
+            if cid >= MAX_VNODES || !self.nodes[cid].active {
+                continue;
+            }
+            if self.nodes[cid].refcount > 0 {
+                continue;
+            }
+            to_evict.push(child_id);
+        }
+
+        for child_id in to_evict {
+            let cid = child_id as usize;
+            if cid < MAX_VNODES && self.nodes[cid].active {
+                if self.nodes[cid].is_dir() {
+                    self.evict_children_recursive(cid);
+                }
+                self.free_file_pages(cid);
                 let h = name_hash(self.nodes[cid].get_name());
                 self.nodes[dir_id].children.remove(h, cid as InodeId);
                 self.nodes[cid].active = false;
@@ -1113,7 +1180,11 @@ impl MikuVFS {
 
         let ts = self.now();
         self.nodes[pid].touch_mtime(ts);
+        self.nodes[id].nlinks = 0;
         self.nodes[id].active = false;
+        if id < self.vnode_free_hint {
+            self.vnode_free_hint = id;
+        }
 
         crate::serial_println!("[vfs] rmdir '{}' id={}", path, id);
         Ok(())
@@ -1313,7 +1384,7 @@ impl MikuVFS {
     }
 
     pub fn readlink(&mut self, cwd: usize, path: &str) -> VfsResult<NameBuf> {
-        let id = self.resolve_path(cwd, path)?;
+        let id = self.resolve_path_lstat(cwd, path)?;
         if !self.nodes[id].is_symlink() {
             return Err(VfsError::NotSymlink);
         }
@@ -1513,6 +1584,26 @@ impl MikuVFS {
         Ok(new_fd)
     }
 
+    pub fn dup_to(&mut self, old_fd: usize, new_fd: usize) -> VfsResult<usize> {
+        let file = *self.fd_table.get(old_fd)?;
+
+        // close new_fd if open, decrement refcount
+        if self.fd_table.get(new_fd).is_ok() {
+            let _ = self.close(new_fd);
+        }
+
+        self.fd_table.alloc_at(new_fd, file.vnode_id, file.flags)?;
+
+        let vid = file.vnode_id as usize;
+        if self.valid_vnode(vid) {
+            self.nodes[vid].inc_ref();
+        }
+
+        self.fd_table.get_mut(new_fd)?.offset = file.offset;
+
+        Ok(new_fd)
+    }
+
     pub fn read(&mut self, fd: usize, buf: &mut [u8]) -> VfsResult<usize> {
         let file = self.fd_table.get(fd)?;
         if !file.flags.readable() {
@@ -1607,6 +1698,8 @@ impl MikuVFS {
             let n = fs
                 .read_file(&inode, offset, &mut buf[..to_read])
                 .map_err(|_| VfsError::IoError)?;
+            // update atime on read (relatime: only if atime < mtime or atime > 1 day old :)
+            let _ = fs.touch_atime(ext2_ino);
             Ok((n, size))
         });
 
@@ -1715,17 +1808,20 @@ impl MikuVFS {
             return self.write_ext2_file(fd, vid, offset as u64, data);
         }
 
-        let end_offset = offset + data.len();
-        if end_offset as u64 > AddressSpace::max_size() {
+        // partial write if data exceeds max file size (POSIX semantics)
+        let max = AddressSpace::max_size() as usize;
+        if offset >= max {
             return Err(VfsError::FileTooLarge);
         }
+        let available = max - offset;
+        let to_write = data.len().min(available);
 
         let mut done = 0;
-        while done < data.len() {
+        while done < to_write {
             let file_off = offset + done;
             let page_num = file_off / PAGE_SIZE;
             let page_off = file_off % PAGE_SIZE;
-            let chunk = (PAGE_SIZE - page_off).min(data.len() - done);
+            let chunk = (PAGE_SIZE - page_off).min(to_write - done);
 
             let pid = match self.nodes[vid].addr_space.get_page(page_num) {
                 Some(pid) => pid,
@@ -1852,7 +1948,7 @@ impl MikuVFS {
     }
 
     pub fn unlink(&mut self, cwd: usize, path: &str) -> VfsResult<()> {
-        let id = self.resolve_path(cwd, path)?;
+        let id = self.resolve_path_lstat(cwd, path)?;
 
         if self.nodes[id].is_dir() {
             return Err(VfsError::IsDirectory);
@@ -1864,6 +1960,12 @@ impl MikuVFS {
             return Err(VfsError::PermissionDenied);
         }
 
+        // extract the basename from path for correct hardlink removal
+        let entry_name = match path.rfind('/') {
+            Some(pos) => &path[pos + 1..],
+            None => path,
+        };
+
         let pid = self.nodes[id].parent as usize;
         self.check_dir_write(pid)?;
 
@@ -1872,13 +1974,8 @@ impl MikuVFS {
             && self.nodes[id].refcount == 0
         {
             let parent_ino = self.nodes[pid].ext2_ino;
-            let file_name = self.nodes[id].get_name();
-            let mut name_buf = [0u8; NAME_LEN];
-            let nlen = file_name.len().min(NAME_LEN);
-            name_buf[..nlen].copy_from_slice(file_name.as_bytes());
-            let name_str = unsafe { core::str::from_utf8_unchecked(&name_buf[..nlen]) };
             let result = crate::commands::ext2_cmds::with_ext2_pub(|fs| {
-                fs.ext3_delete_file(parent_ino, name_str)
+                fs.ext3_delete_file(parent_ino, entry_name)
             });
             match result {
                 Some(Ok(())) => {}
@@ -1887,8 +1984,7 @@ impl MikuVFS {
             }
         }
 
-        let h = name_hash(self.nodes[id].get_name());
-        self.nodes[pid].children.remove(h, id as InodeId);
+        self.nodes[pid].children.remove_by_name(entry_name);
 
         let ts = self.now();
         self.nodes[pid].touch_mtime(ts);
@@ -1956,10 +2052,9 @@ impl MikuVFS {
             }
         }
 
-        let new_h = name_hash(new_base);
-        for cid in self.nodes[new_pid].children.find_by_hash(new_h) {
-            let c = cid as usize;
-            if c < MAX_VNODES && self.nodes[c].active && self.nodes[c].name_eq(new_base) && c != id {
+        if let Some(existing) = self.nodes[new_pid].children.find_by_name(new_base) {
+            let c = existing as usize;
+            if c < MAX_VNODES && self.nodes[c].active && c != id {
                 return Err(VfsError::AlreadyExists);
             }
         }
@@ -1990,9 +2085,9 @@ impl MikuVFS {
         let mut old_name_buf = [0u8; NAME_LEN];
         let old_name_len = self.nodes[id].name.len as usize;
         old_name_buf[..old_name_len].copy_from_slice(&self.nodes[id].name.data[..old_name_len]);
-        let old_h = name_hash(self.nodes[id].get_name());
+        let old_name_str = unsafe { core::str::from_utf8_unchecked(&old_name_buf[..old_name_len]) };
 
-        self.nodes[old_pid].children.remove(old_h, id as InodeId);
+        self.nodes[old_pid].children.remove_by_name(old_name_str);
         self.nodes[id].name = NameBuf::from_str(new_base);
         self.nodes[id].parent = new_pid as InodeId;
 

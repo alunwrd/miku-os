@@ -436,25 +436,9 @@ pub fn poll() {
                                 }
                             }
                             ipv4::PROTO_TCP => {
-                                if let Some(seg) = tcp::TcpSegment::parse(payload) {
-                                    let mut rst_buf = [0u8; 1500];
-                                    let rst_len = tcp::build(
-                                        seg.dst_port, seg.src_port,
-                                        0, seg.seq.wrapping_add(1),
-                                        tcp::FLAG_RST | tcp::FLAG_ACK,
-                                        0, &[], &ip, &ip_hdr.src, &mut rst_buf,
-                                    );
-                                    if rst_len > 0 && tx_count < 4 {
-                                        let n = EthFrame::build(
-                                            &frame.src, &mac, ETHERTYPE_IP,
-                                            &rst_buf[..rst_len], &mut tx_frames[tx_count],
-                                        );
-                                        if n > 0 {
-                                            tx_lens[tx_count] = n;
-                                            tx_count += 1;
-                                        }
-                                    }
-                                }
+                                // active TCP sockets/listeners handle their own traffic;
+                                // here we do nothing rather than blast RSTs with a broken
+                                // (IP-less) payload that also tears down live connections.
                             }
                             _ => {}
                         }
@@ -496,17 +480,20 @@ pub fn send_udp(dst_ip: &[u8; 4], dst_port: u16, src_port: u16, data: &[u8]) -> 
         }
     };
 
-    let mut buf = [0u8; 1520];
-    let udp_len = udp::build(src_port, dst_port, data, &ip, dst_ip, &mut buf[34..]);
+    let mut udp_buf = [0u8; 1500];
+    let udp_len = udp::build(src_port, dst_port, data, &ip, dst_ip, &mut udp_buf);
     if udp_len == 0 { return false; }
-    let ip_len = ipv4::build(&ip, dst_ip, ipv4::PROTO_UDP,
-        &buf[34..34 + udp_len].to_vec(), &mut buf[14..]);
+
+    let mut ip_buf = [0u8; 1520];
+    let ip_len = ipv4::build(&ip, dst_ip, ipv4::PROTO_UDP, &udp_buf[..udp_len], &mut ip_buf);
     if ip_len == 0 { return false; }
-    let eth_len = EthFrame::build(&dst_mac, &mac, ETHERTYPE_IP,
-        &buf[14..14 + ip_len].to_vec(), &mut buf[..]);
+
+    let mut eth_buf = [0u8; 1540];
+    let eth_len = EthFrame::build(&dst_mac, &mac, ETHERTYPE_IP, &ip_buf[..ip_len], &mut eth_buf);
+    if eth_len == 0 { return false; }
 
     if let Some(drv) = state.driver.as_mut() {
-        if drv.send(&buf[..eth_len]) {
+        if drv.send(&eth_buf[..eth_len]) {
             state.tx_count += 1;
             return true;
         }

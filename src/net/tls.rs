@@ -41,24 +41,13 @@ const ALERT_PROTOCOL_VERSION:      u8 = 70;
 const ALERT_INSUFFICIENT_SECURITY: u8 = 71;
 const ALERT_INTERNAL_ERROR:        u8 = 80;
 
-fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack, nomem));
-    }
-    ((hi as u64) << 32) | lo as u64
-}
-
 fn fill_random(buf: &mut [u8]) {
-    let mut state = rdtsc()
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    for b in buf.iter_mut() {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        *b = (state >> 33) as u8;
+    let mut i = 0;
+    while i < buf.len() {
+        let v = crate::random::random_u64().to_le_bytes();
+        let take = (buf.len() - i).min(8);
+        buf[i..i + take].copy_from_slice(&v[..take]);
+        i += take;
     }
 }
 
@@ -240,7 +229,11 @@ impl TlsStream {
         mac_input[12] = plain_data.len() as u8;
         mac_input[13..13 + plain_data.len()].copy_from_slice(plain_data);
         let mac_exp = compute_mac(ml, &self.server_mac_key, &mac_input[..13 + plain_data.len()]);
-        if mac_got != &mac_exp[..ml] {
+        let mut diff = 0u8;
+        for i in 0..ml {
+            diff |= mac_got[i] ^ mac_exp[i];
+        }
+        if diff != 0 {
             crate::log_err!("tls: bad MAC seq={} cipher=0x{:04X}", self.server_seq, self.selected_cipher);
             return None;
         }
@@ -803,6 +796,9 @@ impl TlsStream {
         let mut fin_body = [0u8; 20];
         let fin_len      = make_handshake(HT_FINISHED, &vd, &mut fin_body);
         self.send_record(RT_HANDSHAKE, &fin_body[..fin_len]);
+        hs_hash.update(&fin_body[..fin_len]);
+        let sf_digest     = hs_hash.clone_finalize();
+        let sf_expected   = Self::finished_verify(&self.master_secret, b"server finished", &sf_digest);
         crate::log!("tls: ClientFinished sent (TLS1.2)");
 
         let mut got_ccs = false;
@@ -834,7 +830,25 @@ impl TlsStream {
             }
             if rtype == RT_CHANGE_CIPHER_SPEC { got_ccs = true; }
             if rtype == RT_HANDSHAKE && got_ccs {
-                if self.decrypt_record(5, rec_len).is_some() { got_fin = true; }
+                if let Some(dec_len) = self.decrypt_record(5, rec_len) {
+                    let off = self.rx_len - dec_len;
+                    if dec_len >= 16 && self.rx_buf[off] == HT_FINISHED {
+                        let mut diff = 0u8;
+                        for i in 0..12 {
+                            diff |= self.rx_buf[off + 4 + i] ^ sf_expected[i];
+                        }
+                        self.rx_len -= dec_len;
+                        if diff == 0 {
+                            got_fin = true;
+                        } else {
+                            crate::log_err!("tls: server Finished verify_data mismatch");
+                            self.consume(5+rec_len);
+                            return None;
+                        }
+                    } else {
+                        self.rx_len -= dec_len;
+                    }
+                }
             }
             self.consume(5+rec_len);
             if got_fin { break 'server_fin; }

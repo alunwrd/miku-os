@@ -2,11 +2,11 @@
 
 # Miku OS
 
-**Rustで開発された実験的なオペレーティングシステムカーネル**
+**An experimental operating system kernel written in Rust**
 
-*Rustと数人の開発者によって動いています :D*
+*Powered by Rust and a few developers :D*
 
-<img src="https://raw.githubusercontent.com/altushkaso2/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
+<img src="https://raw.githubusercontent.com/alunwrd/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
 
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Architecture](https://img.shields.io/badge/arch-x86__64-blue.svg)]()
@@ -17,769 +17,1004 @@
 
 ---
 
-> **ドキュメント:** [Russian](docs/Russian_README.md) | [English](docs/English_README.md) | [Japanese](Japanese_README.md)
+> **Documentation:** [Russian](docs/Russian_README.md) | [English](docs/English_README.md) | [Japanese](docs/Japanese_README.md)
 
 ---
 
-## プロジェクトについて
+## About
 
-**Miku OS** は `no_std` 環境でゼロから開発されたUNIX系オペレーティングシステムです。
-標準ライブラリ (`libc`) を一切使用せず、ハードウェアとメモリアーキテクチャを完全に制御します。
-ELFダイナミックリンク、共有ライブラリ、ユーザースペースプロセスを独自実装で実現しています。
+**Miku OS** is a operating system developed from scratch in a `no_std` environment.
+It does not use any standard library (`libc`), maintaining full control over hardware and memory architecture.
+ELF dynamic linking, shared libraries, userspace processes, an init daemon (mikuD), and process management (fork/exec/wait) are implemented from scratch.
 
-> すべてのコードはRustで書かれています。アセンブラはブートローダー、syscallハンドラー、コンテキストスイッチの部分にのみ使用しています。
-
----
-
-## 技術仕様
-
-### カーネル
-
-| コンポーネント | 説明 |
-|:--|:--|
-| **アーキテクチャ** | x86_64、`#![no_std]`、`#![no_main]` |
-| **ブートローダー** | GRUB2 + Multiboot2、フレームバッファ (BGR/RGB 自動検出) |
-| **保護機能** | GDT + TSS + IST (ダブルフォルト、ページフォルト、GPF用)、ring 0 / ring 3 |
-| **割り込み** | IDT: タイマー、キーボード、ページフォルト、GPF、#UD、#NM、ダブルフォルト |
-| **PIC** | PIC8259 (オフセット 32/40) |
-| **SSE** | CR0.EM=0、CR0.MP=1、CR4.OSFXSR=1、CR4.OSXMMEXCPT=1 |
-| **ヒープ** | 32 MB、リンクリストアロケータ |
-| **Syscall** | MSR経由のSYSCALL/SYSRET、naked asmハンドラー、R8/R9/R10保存 |
+> All code is written in Rust. Assembly is only used for the bootloader, syscall handler, and context switching.
 
 ---
 
-### ELFローダーとダイナミックリンク
+## Technical Specifications
 
-<details>
-<summary><b>ELFローダー</b></summary>
+### Kernel
 
-#### 機能
-
-| 機能 | 説明 |
+| Component | Description |
 |:--|:--|
-| **対応形式** | ET_EXEC (静的)、ET_DYN (PIE) |
-| **セグメント** | PT_LOAD、PT_INTERP、PT_DYNAMIC、PT_TLS、PT_GNU_RELRO、PT_GNU_STACK |
-| **リロケーション** | R_X86_64_RELATIVE、R_X86_64_JUMP_SLOT、R_X86_64_GLOB_DAT、R_X86_64_64 |
-| **セキュリティ** | W^X enforcement (W+Xセグメント拒否)、RELRO |
-| **ASLR** | PIEバイナリに20ビットエントロピー (RDRAND + TSCフォールバック) |
-| **スタック** | SysV ABI準拠: argc、argv、envp、auxv (16バイトアラインメント) |
-| **TLS** | Thread Local Storage (FS.baseレジスタ経由) |
-
-#### モジュール構成
-
-| モジュール | 説明 |
-|:--|:--|
-| **elf_loader.rs** | ELFパース、セグメントマッピング |
-| **exec_elf.rs** | プロセス生成、スタック構築 |
-| **dynlink.rs** | ダイナミックリンク (reloc.rsに委譲) |
-| **reloc.rs** | 統合リロケーションエンジン |
-| **vfs_read.rs** | 統合ファイル読み込み (VFS + ext2) |
-| **random.rs** | RDRAND/TSC乱数、ASLR |
-
-#### auxvエントリ
-
-| キー | 説明 |
-|:--|:--|
-| AT_PHDR | プログラムヘッダーの仮想アドレス |
-| AT_PHENT | プログラムヘッダーのエントリサイズ |
-| AT_PHNUM | プログラムヘッダーの数 |
-| AT_PAGESZ | ページサイズ (4096) |
-| AT_ENTRY | 実行ファイルのエントリポイント |
-| AT_BASE | インタープリターのベースアドレス |
-| AT_RANDOM | 16バイトのランダムデータ |
-
-</details>
-
-<details>
-<summary><b>ld-miku (ダイナミックリンカー)</b></summary>
-
-#### 概要
-
-`ld-miku` はMikuOS用のELFダイナミックリンカーです。Rustで `#![no_std]` 環境で書かれ、
-静的PIEバイナリとしてコンパイルされます。
-
-#### 処理フロー
-
-```
-1. カーネルがELFをロード → PT_INTERPを検出
-2. ld-miku.soをINCLUDE_BYTESからメモリにマッピング
-3. ld-miku起動 → auxvからAT_PHDR/AT_ENTRYを解析
-4. DT_NEEDEDから必要なライブラリを特定
-5. SYS_MAP_LIB syscallで共有ライブラリをマッピング
-6. PLT/GOTリロケーションを適用
-7. シンボルをグローバルテーブルにエクスポート
-8. DT_INIT / DT_INIT_ARRAYを実行
-9. 実行ファイルのエントリポイントにジャンプ
-```
-
-#### 特徴
-
-- グローバルシンボルテーブル (最大1024シンボル)
-- weakシンボルの解決
-- 再帰的な依存ライブラリのロード (最大16ライブラリ)
-- R_X86_64_COPY リロケーション対応
-- DT_HASH / DT_GNU_HASH によるシンボル数の正確な取得
-- envp を正しくスキップするauxv解析
-
-</details>
-
-<details>
-<summary><b>共有ライブラリ (solib)</b></summary>
-
-#### グローバルライブラリキャッシュ
-
-| パラメータ | 値 |
-|:--|:--|
-| **最大キャッシュ数** | 32ライブラリ |
-| **検索パス** | /lib、/usr/lib |
-| **ページマッピング** | 全セグメントをプロセスごとにコピー |
-| **OOM保護** | parse_and_prepare中のOOMで部分キャッシュを防止 |
-
-#### SYS_MAP_LIB syscall (nr=15)
-
-カーネルがELFセグメントを解析し、共有ライブラリを直接プロセスのアドレス空間にマッピングします。
-
-- read-onlyセグメント → キャッシュからプライベートコピー
-- writableセグメント → プロセスごとに新規アロケーション
-- map_page失敗時のロールバック対応
-
-#### システムライブラリ
-
-`libmiku.so` は `include_bytes!` でカーネルに組み込まれ、`solib::preload` で起動時にキャッシュに登録されます。
-
-#### シェルコマンド
-
-| コマンド | 説明 |
-|:--|:--|
-| `ldconfig` | /lib と /usr/lib をスキャンしキャッシュを更新 |
-| `ldd` | キャッシュされたライブラリの一覧表示 |
-
-</details>
+| **Architecture** | x86_64, `#![no_std]`, `#![no_main]` |
+| **Bootloader** | GRUB2 + Multiboot2, framebuffer (BGR/RGB auto-detection) |
+| **Protection** | GDT + TSS + IST (double fault, page fault, GPF), ring 0 / ring 3 |
+| **Interrupts** | IDT: timer, keyboard, page fault, GPF, #UD, #NM, double fault |
+| **PIC** | PIC8259 (offset 32/40) |
+| **SSE** | CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1 |
+| **Heap** | 32 MB, linked list allocator |
+| **Syscall** | SYSCALL/SYSRET via MSR, naked asm handler, R8/R9/R10 preservation |
+| **Signals** | SIGKILL (9), SIGTERM (15), SIGCHLD (17), 32-bit bitmask |
+| **Init** | mikuD (PID 1) - systemd-like service supervisor |
 
 ---
 
-### libmiku.so (標準ライブラリ)
+### mikuD - Init Daemon
 
 <details>
-<summary><b>展開する</b></summary>
+<summary><b>Expand</b></summary>
 
-#### 概要
+#### Overview
 
-libmikuはMikuOS用のC互換標準ライブラリです。Rustで書かれ、12モジュール、79関数をエクスポートします。
-ld-mikuによって動的にロードされ、全てのuserspace プログラムが使用します。
+mikuD is the init daemon (PID 1) for MikuOS - a full systemd-like service supervisor with Unix-style boundaries. It manages service lifecycle, dependency resolution, targets (runlevels), watchdog, notifications, socket activation, timers, ELF binary execution (ExecStart), and graceful shutdown with global timeout.
 
-#### モジュール構成
+#### Targets (Runlevels)
 
+| Target | Value | Description |
+|:--|:--:|:--|
+| **SysInit** | 0 | System initialization |
+| **MultiUser** | 1 | Multi-user mode (default) |
+| **Graphical** | 2 | Graphical mode |
+| **Rescue** | 3 | Rescue / single-user mode |
+
+Services activate when target >= their declared target. Target transitions trigger automatic reconciliation.
+
+#### Service Types
+
+| Type | Description |
+|:--|:--|
+| **Simple** | Long-running service (default) |
+| **Oneshot** | Execute once, then mark completed |
+| **Notify** | Service reports readiness via `notify_ready()` |
+| **Forking** | Service forks child process |
+
+#### Restart Policies
+
+| Policy | Behavior |
+|:--|:--|
+| **Always** | Restart on any exit |
+| **Never** | Never restart |
+| **OnFailure** | Restart only if exit code != 0 |
+| **OnSuccess** | Restart only if exit code == 0 |
+| **OnAbnormal** | Restart on signal or non-zero exit |
+
+#### Dependency Types
+
+| Type | Behavior |
+|:--|:--|
+| **Requires** (deps) | Hard dependency - service fails if dep fails |
+| **Wants** | Soft dependency - service continues if dep fails |
+| **Conflicts** | Stop conflicting service before starting |
+
+#### Features
+
+| Feature | Details |
+|:--|:--|
+| **ExecStart** | Launch ELF binaries from disk as services |
+| **Watchdog** | Service must ping within timeout or gets restarted |
+| **Notify** | sd_notify analog - service signals readiness |
+| **Conditions** | ConditionPathExists, ConditionServiceActive, ConditionTargetActive |
+| **Masking** | Completely prevent a service from starting |
+| **Critical** | Protected services cannot be stopped by user |
+| **Burst protection** | Max 5 restarts per 10 sec window |
+| **Graceful shutdown** | Stop non-critical first, then critical, 30 sec global timeout |
+| **Boot analysis** | Timing data for all services started during boot |
+| **Environment vars** | Up to 8 key=value pairs per service |
+| **Timeout** | Configurable start/stop timeouts (default 10 sec) |
+| **On-restart hooks** | Callback before service re-entry (shell reinit) |
+| **Isolate** | Switch target and stop everything not in it |
+
+#### Journal (Event Log)
+
+128-entry ring buffer logging all mikuD events:
+
+| Event | Symbol | Description |
+|:--|:--:|:--|
+| Started | + | Service started |
+| Stopped | - | Service stopped |
+| Exited | x | Service exited (with exit code) |
+| Failed | ! | Service failed |
+| DepFailed | d | Dependency failure |
+| ExecFailed | E | ELF binary launch failed |
+| Reloaded | R | SIGHUP reload |
+| WatchdogTimeout | W | Watchdog expired |
+| BurstLimit | B | Restart rate limit hit |
+| Shutdown | S | Graceful shutdown initiated |
+| TimerFired | F | Timer unit fired |
+| SocketActivated | A | Socket activation triggered |
+
+Events have severity levels: info (0), notice (1), warning (2), critical (3).
+
+#### Timer Units
+
+| Type | Behavior |
+|:--|:--|
+| **Interval** | Fire every N ticks repeatedly |
+| **Oneshot** | Fire once after N ticks, then disable |
+| **Realtime** | Fire every N ticks aligned to boot time |
+
+Max 16 timers. Timers trigger service start on fire.
+
+#### Socket Activation
+
+Services can be started on-demand when a connection arrives on a registered port.
+Supports Stream (TCP) and Dgram (UDP) socket types. Max 16 sockets.
+
+#### Unit Files (.service)
+
+INI-like format loaded from `/etc/mikud/`:
+
+```ini
+[Unit]
+Description=My service
+After=kbd network
+Wants=logging
+Conflicts=rescue-shell
+ConditionPathExists=/etc/config
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/myservice
+Restart=always
+RestartSec=50
+Priority=5
+WatchdogSec=100
+TimeoutStartSec=2500
+RemainAfterExit=false
+Critical=false
+Environment=LANG=en
+
+[Install]
+WantedBy=multi-user
 ```
-src/lib/libmiku/
-├── lib.rs       mod宣言、エントリ、panicハンドラー
-├── sys.rs       syscallプリミティブ (sc0..sc4)、定数
-├── proc.rs      exit、getpid、brk、mmap、munmap、tls
-├── io.rs        write、read、print、println、readline
-├── mem.rs       memset、memcpy、memmove、memcmp
-├── num.rs       itoa、utoa、atoi、print_int、print_hex
-├── string.rs    strlen、strcmp、strcpy、strtok、strtol...
-├── heap.rs      malloc、free、realloc、calloc
-├── file.rs      open、close、seek、fsize、read_file
-├── time.rs      sleep、uptime
-├── util.rs      abs、min、max、rand、assert、panic
-└── fmt.rs       printf、snprintf (asmトランポリン)
-```
 
-#### モジュール: io (入出力)
+#### Shell Commands (sv)
 
-| 関数 | 説明 |
+| Command | Description |
 |:--|:--|
-| `miku_write(fd, buf, len)` | fdへの書き込み |
-| `miku_read(fd, buf, len)` | fdからの読み込み |
-| `miku_print(str)` | 文字列出力 |
-| `miku_println(str)` | 文字列出力 + 改行 |
-| `miku_puts(str)` | println互換 |
-| `miku_putchar(c)` | 1バイト出力 |
-| `miku_getchar()` | 1バイト入力 |
-| `miku_readline(buf, max)` | 行入力 (固定バッファ) |
-| `miku_getline()` | 行入力 (malloc、free必要) |
-
-#### モジュール: string (文字列)
-
-| 関数 | 説明 |
-|:--|:--|
-| `miku_strlen` | 文字列長 |
-| `miku_strcmp` / `miku_strncmp` | 文字列比較 |
-| `miku_strcpy` / `miku_strncpy` | 文字列コピー |
-| `miku_strcat` / `miku_strncat` | 文字列連結 |
-| `miku_strchr` / `miku_strrchr` | 文字検索 |
-| `miku_strstr` | 部分文字列検索 |
-| `miku_strdup` | 文字列複製 (malloc) |
-| `miku_toupper` / `miku_tolower` | 大文字/小文字変換 |
-| `miku_isdigit` / `miku_isalpha` / `miku_isalnum` / `miku_isspace` | 文字分類 |
-| `miku_strtok` | トークン分割 (stateful) |
-| `miku_strpbrk` | 文字セット検索 |
-| `miku_strspn` / `miku_strcspn` | プレフィックス長 |
-| `miku_strtol` / `miku_strtoul` | 文字列→数値 (base 0/8/10/16) |
-| `miku_strlcpy` / `miku_strlcat` | BSD安全コピー/連結 |
-
-#### モジュール: num (数値)
-
-| 関数 | 説明 |
-|:--|:--|
-| `miku_itoa(val, buf)` | 整数→文字列 |
-| `miku_utoa(val, buf)` | 符号なし整数→文字列 |
-| `miku_atoi(str)` | 文字列→整数 |
-| `miku_print_int(val)` | 10進数出力 |
-| `miku_print_hex(val)` | 16進数出力 (0x...) |
-
-#### モジュール: mem (メモリ)
-
-| 関数 | 説明 |
-|:--|:--|
-| `miku_memset` | メモリ塗りつぶし (8バイトアライン最適化) |
-| `miku_memcpy` | メモリコピー (8バイトアライン最適化) |
-| `miku_memmove` | メモリコピー (オーバーラップ対応) |
-| `miku_memcmp` | メモリ比較 |
-| `miku_bzero` | ゼロクリア |
-
-#### モジュール: heap (動的メモリ)
-
-| 関数 | 説明 |
-|:--|:--|
-| `miku_malloc(size)` | メモリ確保 |
-| `miku_free(ptr)` | メモリ解放 |
-| `miku_realloc(ptr, size)` | サイズ変更 |
-| `miku_calloc(count, size)` | ゼロ初期化確保 |
-
-実装: mmapベースのslabアロケータ。32KB未満は128KBのslabから切り出し、32KB以上はmmap/munmapで個別管理。
-
-#### モジュール: fmt (フォーマット出力)
-
-| 関数 | 説明 |
-|:--|:--|
-| `miku_printf(fmt, ...)` | フォーマット出力 |
-| `miku_snprintf(buf, max, fmt, ...)` | バッファへのフォーマット出力 |
-
-対応フォーマット: `%s` `%d` `%u` `%x` `%c` `%p` `%%`
-
-実装: `global_asm!` トランポリンでrsi/rdx/rcx/r8/r9をスタックに保存。XMMレジスタ不使用によりSSEアラインメント問題を回避。`%d/%x/%u` は32ビット (i32/u32として読み取り)。
-
-#### モジュール: file (ファイルI/O)
-
-| 関数 | 説明 |
-|:--|:--|
-| `miku_open(path, len)` | ファイルを開く |
-| `miku_open_cstr(path)` | ファイルを開く (C文字列) |
-| `miku_close(fd)` | 閉じる |
-| `miku_seek(fd, offset)` | オフセット設定 |
-| `miku_fsize(fd)` | ファイルサイズ取得 |
-| `miku_read_file(path, &size)` | ファイル全体を読み込み (malloc) |
-
-#### モジュール: time (時間)
-
-| 関数 | 説明 |
-|:--|:--|
-| `miku_sleep(ticks)` | スリープ (~10ms/ティック) |
-| `miku_sleep_ms(ms)` | ミリ秒スリープ |
-| `miku_uptime()` | 起動からのティック数 |
-| `miku_uptime_ms()` | 起動からのミリ秒 |
-
-#### モジュール: proc (プロセス)
-
-| 関数 | 説明 |
-|:--|:--|
-| `miku_exit(code)` | プロセス終了 |
-| `miku_getpid()` | PID取得 |
-| `miku_getcwd(buf, size)` | カレントディレクトリ取得 |
-| `miku_brk(addr)` | ヒープ拡張 (0=クエリ) |
-| `miku_mmap` / `miku_munmap` / `miku_mprotect` | メモリマッピング |
-| `miku_set_tls` / `miku_get_tls` | TLSレジスタ |
-| `miku_map_lib(name, len)` | 共有ライブラリのマッピング |
-
-#### モジュール: util (ユーティリティ)
-
-| 関数 | 説明 |
-|:--|:--|
-| `miku_abs` / `miku_min` / `miku_max` / `miku_clamp` | 数値ユーティリティ |
-| `miku_swap(a, b)` | 値の交換 |
-| `miku_srand(seed)` / `miku_rand()` / `miku_rand_range(lo, hi)` | 疑似乱数 (xorshift64) |
-| `miku_assert_fail(expr, file, line)` | アサーション失敗 |
-| `miku_panic(msg)` | パニック (exit 134) |
+| `sv list` | List all services with state, PID, restarts |
+| `sv status <name>` | Detailed status + journal entries |
+| `sv start <name>` | Start a service |
+| `sv stop <name>` | Stop a service (graceful) |
+| `sv restart <name>` | Restart a service |
+| `sv reload <name>` | Send SIGHUP for config reload |
+| `sv enable <name>` | Enable service |
+| `sv disable <name>` | Disable service (stop + deactivate) |
+| `sv mask <name>` | Prevent service from starting |
+| `sv unmask <name>` | Allow masked service to start |
+| `sv force-stop <name>` | Force kill (even critical services) |
+| `sv journal [name]` | Show event log (last 20 or per service) |
+| `sv target [name]` | Show/set active target |
+| `sv analyze` | Boot timing analysis |
+| `sv tree <name>` | Dependency tree visualization |
+| `sv rdeps <name>` | Reverse dependencies |
+| `sv cat <name>` | Show service unit config |
+| `sv load <path>` | Load .service unit file |
+| `sv scan` | Scan /etc/mikud/ for unit files |
+| `sv timer list` | List timer units |
+| `sv timer start/stop <name>` | Control timers |
 
 </details>
 
 ---
 
-### ユーザースペースSDK
+### ELF Loader and Dynamic Linking
 
 <details>
-<summary><b>展開する</b></summary>
+<summary><b>ELF Loader</b></summary>
 
-#### 概要
+#### Features
 
-MikuOSはRust SDKを提供し、`no_std` 環境でuserspace プログラムを開発できます。
-C言語も引き続きサポートされています。
-
-#### SDK構成
-
-```
-src/lib/userspace/
-├── Cargo.toml              crate設定
-├── build.rs                stub libmiku.soの自動生成
-├── build.sh                ビルド + デプロイスクリプト
-├── x86_64-miku-app.json    ターゲット仕様
-└── src/
-    ├── miku.rs             SDK: externバインディング + 安全ラッパー
-    ├── hello.rs            Hello Worldサンプル
-    └── test_full.rs        71テスト
-```
-
-#### Rustプログラムの例
-
-```rust
-#![no_std]
-#![no_main]
-
-#[path = "miku.rs"]
-mod miku;
-
-#[no_mangle]
-pub extern "C" fn _start_main() -> ! {
-    miku::println("Hello MikuOS!");
-    miku::exit(0);
-}
-
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! { miku::exit(1); }
-```
-
-#### ビルドとデプロイ
-
-```bash
-cd ~/miku-os/src/lib/userspace
-./build.sh hello        # ビルド + data.imgにコピー
-```
-
-#### MikuOSでの実行
-
-```
-miku@os:/ $ ext4mount 3
-miku@os:/ $ exec hello
-Hello MikuOS!
-```
-
-#### 安全ラッパー (miku.rs)
-
-SDKはC ABI上に安全なRustラッパーを提供します:
-
-| ラッパー | 説明 |
+| Feature | Description |
 |:--|:--|
-| `miku::print(s: &str)` | 文字列出力 |
-| `miku::println(s: &str)` | 文字列出力 + 改行 |
-| `miku::exit(code)` | プロセス終了 |
-| `miku::open(path) -> Result` | ファイルオープン |
-| `miku::read_file(path) -> Option` | ファイル全体読み込み |
-| `miku::sleep_ms(ms)` | ミリ秒スリープ |
-| `miku::rand_range(lo, hi)` | 範囲指定乱数 |
-| `cstr!("text")` | C文字列マクロ |
+| **Formats** | ET_EXEC (static), ET_DYN (PIE) |
+| **Segments** | PT_LOAD, PT_INTERP, PT_DYNAMIC, PT_TLS, PT_GNU_RELRO, PT_GNU_STACK |
+| **Relocations** | R_X86_64_RELATIVE, R_X86_64_JUMP_SLOT, R_X86_64_GLOB_DAT, R_X86_64_64 |
+| **Security** | W^X enforcement (W+X segments rejected), RELRO |
+| **ASLR** | 20-bit entropy for PIE binaries (RDRAND + TSC fallback) |
+| **Stack** | SysV ABI compliant: argc, argv, envp, auxv (16-byte aligned) |
+| **TLS** | Thread Local Storage (via FS.base register) |
 
-#### エントリポイント
+#### Modular Structure
 
-`_start_main` を使用します (`_start` ではない)。`miku.rs` 内の `global_asm!` トランポリンが `_start` で `and rsp, -16` によるスタックアラインメントを行い、`_start_main` を呼び出します。
-
-#### テストスイート
-
-71テストが以下のカテゴリで実行されます:
-
-| カテゴリ | テスト数 |
+| Module | Description |
 |:--|:--|
-| strings (基本) | 10 |
-| strings (拡張) | 14 |
+| **elf_loader.rs** | ELF parsing, segment mapping |
+| **exec_elf.rs** | Process creation, stack construction |
+| **dynlink.rs** | Dynamic linking (delegates to reloc.rs) |
+| **reloc.rs** | Unified relocation engine |
+| **vfs_read.rs** | Unified file reading (VFS + ext2) |
+| **random.rs** | RDRAND/TSC random numbers, ASLR |
+
+#### auxv Entries
+
+| Key | Description |
+|:--|:--|
+| AT_PHDR | Virtual address of program headers |
+| AT_PHENT | Size of program header entry |
+| AT_PHNUM | Number of program headers |
+| AT_PAGESZ | Page size (4096) |
+| AT_ENTRY | Executable entry point |
+| AT_BASE | Interpreter base address |
+| AT_RANDOM | 16 bytes of random data |
+
+</details>
+
+<details>
+<summary><b>ld-miku (Dynamic Linker)</b></summary>
+
+#### Overview
+
+`ld-miku` is the ELF dynamic linker for MikuOS. Written in Rust in a `#![no_std]` environment,
+compiled as a static PIE binary.
+
+#### Loading Process
+
+```
+1. Kernel loads ELF -> detects PT_INTERP
+2. ld-miku.so mapped from INCLUDE_BYTES into memory
+3. ld-miku starts -> parses auxv (AT_PHDR/AT_ENTRY)
+4. Identifies required libraries from DT_NEEDED
+5. Maps shared libraries via SYS_MAP_LIB syscall
+6. Applies PLT/GOT relocations
+7. Exports symbols to global table
+8. Executes DT_INIT / DT_INIT_ARRAY
+9. Jumps to executable entry point
+```
+
+#### Features
+
+- Global symbol table (up to 1024 symbols)
+- Weak symbol resolution
+- Recursive dependency loading (up to 16 libraries)
+- R_X86_64_COPY relocation support
+- DT_HASH / DT_GNU_HASH for accurate symbol counting
+- Correct envp skipping during auxv parsing
+
+</details>
+
+<details>
+<summary><b>Shared Libraries (solib)</b></summary>
+
+#### Global Library Cache
+
+| Parameter | Value |
+|:--|:--|
+| **Max cached** | 32 libraries |
+| **Search paths** | /lib, /usr/lib |
+| **Page mapping** | All segments copied per-process |
+| **OOM protection** | parse_and_prepare aborts on OOM without caching broken data |
+
+#### SYS_MAP_LIB Syscall (nr=15)
+
+The kernel parses ELF segments and maps the shared library directly into the process address space.
+
+- Read-only segments -> private copy from cache
+- Writable segments -> fresh allocation per process
+- Rollback on map_page failure
+
+#### System Libraries
+
+`libmiku.so` is embedded in the kernel via `include_bytes!` and registered in the cache at boot via `solib::preload`.
+
+#### Shell Commands
+
+| Command | Description |
+|:--|:--|
+| `ldconfig` | Scan /lib and /usr/lib, update cache |
+| `ldd` | List cached libraries |
+
+</details>
+
+---
+
+### libmiku.so (Standard Library)
+
+<details>
+<summary><b>Expand</b></summary>
+
+#### Overview
+
+libmiku is a C-compatible standard library for MikuOS. Written in Rust, it provides 63 modules and 962 exported functions covering everything from basic I/O to data structures, cryptography, parsing, and a full POSIX libc compatibility layer (stdio, stdlib, string.h, etc.).
+Dynamically loaded by ld-miku, used by all userspace programs.
+
+#### Module Categories
+
+| Category | Modules |
+|:--|:--|
+| **Data Structures** | vec, list, hashmap, treemap, trie, queue, ringbuf, ringbuf2, heap_queue, bitset, channel |
+| **Strings** | string, strbuf, ctype, utf8, format, regex, glob |
+| **I/O** | io, bufio, stdio, file, dir, path |
+| **Numbers / Math** | num, math, random, convert, endian, bitops |
+| **Encoding** | base64, hex, json, csv, ini, lz |
+| **Crypto / Hash** | sha256, checksum, hash, uuid |
+| **System** | sys, proc, signal, env, errno, args, getopt |
+| **Concurrency** | sync, channel, event, timer |
+| **Time** | time, datetime |
+| **Memory** | mem, heap, arena, pool, slab |
+| **Logging / Testing** | log, test, panic |
+| **Sorting** | sort |
+| **libc compat** | libc (fopen/fclose/fread/fwrite/fprintf/fgets/fputs etc., 151 functions) |
+
+> The previous `util` module was split into `math` (abs/min/max/clamp/isqrt/div_ceil/is_prime), `random` (srand/rand/rand_range/rand_bytes) and `panic` (assert_fail/panic/assert_eq/assert_not_null). Calls like `miku_abs` / `miku_rand_range` remain ABI-compatible.
+
+#### Module: io (Input/Output)
+
+| Function | Description |
+|:--|:--|
+| `miku_write(fd, buf, len)` | Write to fd |
+| `miku_read(fd, buf, len)` | Read from fd |
+| `miku_print(str)` | Print string |
+| `miku_println(str)` | Print string + newline |
+| `miku_puts(str)` | puts-compatible |
+| `miku_putchar(c)` | Output 1 byte |
+| `miku_getchar()` | Input 1 byte |
+| `miku_readline(buf, max)` | Line input (fixed buffer) |
+| `miku_getline()` | Line input (malloc, needs free) |
+
+#### Module: string (Strings)
+
+| Function | Description |
+|:--|:--|
+| `miku_strlen` | String length |
+| `miku_strcmp` / `miku_strncmp` | String comparison |
+| `miku_strcpy` / `miku_strncpy` | String copy |
+| `miku_strcat` / `miku_strncat` | String concatenation |
+| `miku_strchr` / `miku_strrchr` | Character search |
+| `miku_strstr` | Substring search |
+| `miku_strdup` | String duplicate (malloc) |
+| `miku_toupper` / `miku_tolower` | Case conversion |
+| `miku_isdigit` / `miku_isalpha` / `miku_isalnum` / `miku_isspace` | Character classification |
+| `miku_strtok` | Tokenization (stateful) |
+| `miku_strpbrk` | Character set search |
+| `miku_strspn` / `miku_strcspn` | Prefix length |
+| `miku_strtol` / `miku_strtoul` | String to number (base 0/8/10/16) |
+| `miku_strlcpy` / `miku_strlcat` | BSD-safe copy/concatenation |
+
+#### Module: num (Numbers)
+
+| Function | Description |
+|:--|:--|
+| `miku_itoa(val, buf)` | Integer to string |
+| `miku_utoa(val, buf)` | Unsigned integer to string |
+| `miku_atoi(str)` | String to integer |
+| `miku_print_int(val)` | Print decimal |
+| `miku_print_hex(val)` | Print 0x... |
+
+#### Module: mem (Memory)
+
+| Function | Description |
+|:--|:--|
+| `miku_memset` | Memory fill |
+| `miku_memcpy` | Memory copy |
+| `miku_memmove` | Memory copy (overlap-safe) |
+| `miku_memcmp` | Memory comparison |
+| `miku_bzero` | Zero fill |
+| `miku_memchr` | Byte search |
+| `miku_memrchr` | Reverse byte search |
+| `miku_memmem` | Byte sequence search |
+
+#### Module: heap (Dynamic Memory)
+
+| Function | Description |
+|:--|:--|
+| `miku_malloc(size)` | Allocate memory |
+| `miku_free(ptr)` | Free memory |
+| `miku_realloc(ptr, size)` | Resize allocation |
+| `miku_calloc(count, size)` | Zero-initialized allocation |
+
+Implementation: mmap-based slab allocator. < 32KB from 128KB slab, >= 32KB via individual mmap/munmap.
+
+#### Module: fmt (Formatted Output)
+
+| Function | Description |
+|:--|:--|
+| `miku_printf(fmt, ...)` | Formatted output |
+| `miku_snprintf(buf, max, fmt, ...)` | Formatted output to buffer |
+
+Supported formats: `%s` `%d` `%u` `%x` `%c` `%p` `%%`
+
+Implementation: `global_asm!` trampoline saves rsi/rdx/rcx/r8/r9 to stack. No XMM registers used, avoiding SSE alignment issues. `%d/%x/%u` are 32-bit (read as i32/u32).
+
+#### Module: file (File I/O)
+
+| Function | Description |
+|:--|:--|
+| `miku_open(path, len)` | Open file |
+| `miku_open_cstr(path)` | Open file (C string) |
+| `miku_close(fd)` | Close |
+| `miku_seek(fd, offset)` | Set offset |
+| `miku_fsize(fd)` | Get file size |
+| `miku_read_file(path, &size)` | Read entire file (malloc) |
+
+#### Module: time (Time)
+
+| Function | Description |
+|:--|:--|
+| `miku_sleep(ticks)` | Sleep (~4 ms/tick at 250 Hz) |
+| `miku_sleep_ms(ms)` | Sleep in milliseconds |
+| `miku_uptime()` | Ticks since boot |
+| `miku_uptime_ms()` | Milliseconds since boot |
+
+#### Module: proc (Process)
+
+| Function | Description |
+|:--|:--|
+| `miku_exit(code)` | Terminate process |
+| `miku_getpid()` | Get PID |
+| `miku_getcwd(buf, size)` | Get current directory |
+| `miku_brk(addr)` | Expand heap (0=query) |
+| `miku_mmap` / `miku_munmap` / `miku_mprotect` | Memory mapping |
+| `miku_set_tls` / `miku_get_tls` | TLS register |
+| `miku_map_lib(name, len)` | Map shared library |
+
+</details>
+
+---
+
+### Userspace SDK
+
+<details>
+<summary><b>Expand</b></summary>
+
+#### Overview
+
+MikuOS provides a Rust SDK for developing userspace programs in a `no_std` environment.
+C is also supported.
+
+#### Safe Wrappers (miku.rs)
+
+| Wrapper | Description |
+|:--|:--|
+| `miku::print(s: &str)` | Print string |
+| `miku::println(s: &str)` | Print string + newline |
+| `miku::exit(code)` | Terminate process |
+| `miku::open(path) -> Result` | Open file |
+| `miku::read_file(path) -> Option` | Read entire file |
+| `miku::sleep_ms(ms)` | Sleep in milliseconds |
+| `miku::rand_range(lo, hi)` | Random number in range |
+| `cstr!("text")` | C string macro |
+
+#### Entry Point
+
+Use `_start_main`, not `_start`. `miku.rs` contains a `global_asm!` trampoline that defines `_start` with `and rsp, -16` for SSE alignment before calling `_start_main`.
+
+#### Test Suite
+
+1617 tests across the following categories:
+
+| Category | Count |
+|:--|:--|
+| strings (basic/extended) | 24 |
 | numbers | 7 |
 | memory | 4 |
 | utilities | 7 |
 | heap | 7 |
 | process | 2 |
-| printf | 6 |
-| snprintf | 5 |
+| printf / snprintf | 11 |
 | time | 5 |
 | file I/O | 3+ |
+| libc compat (stdio) | 1500+ |
 
 </details>
 
 ---
 
-### メモリ管理
+### Memory Management
 
 <details>
-<summary><b>物理メモリ (PMM)</b></summary>
+<summary><b>Physical Memory (PMM)</b></summary>
 
-#### フレームアロケータ
+#### Frame Allocator
 
-- ビットマップアロケータ: 最大4Mフレーム (16 GB RAM)、1ビット = 1フレーム 4KB
-- `free_hint` と `contiguous_hint` で空きフレームの検索を高速化
-- 連続alloc: 1回のリクエストでNフレームをまとめて確保
-- リージョン: Multiboot2メモリマップからRAM範囲を動的に登録
+- Bitmap allocator: up to 4M frames (16 GB RAM), 1 bit = 1 frame of 4KB
+- `free_hint` and `contiguous_hint` for fast free frame lookup
+- Contiguous alloc: N frames in a single request
+- Regions: dynamic RAM range registration from Multiboot2 memory map
 
-#### エマージェンシープール
+#### Emergency Pool
 
-| パラメータ | 値 |
+| Parameter | Value |
 |:--|:--|
-| **プールサイズ** | 64フレーム (256 KB) |
-| **用途** | ページフォルトハンドラー内のswap-inのみ |
-| **補充** | `refill_emergency_pool_tick()` 経由でTimer ISRが250Hzごとに実行 |
-
-```
-alloc_frame()           - PMMからの通常alloc
-alloc_frame_emergency() - エマージェンシープールのみ (フォルトハンドラー用)
-alloc_or_evict()        - RAMが不足した場合にalloc + evict
-alloc_for_swapin()      - エマージェンシープールのみ (faultコンテキスト)
-```
+| **Pool size** | 64 frames (256 KB) |
+| **Purpose** | Swap-in within page fault handler only |
+| **Refill** | Timer ISR at 250Hz via `refill_emergency_pool_tick()` |
 
 </details>
 
 <details>
-<summary><b>仮想メモリ (VMM)</b></summary>
+<summary><b>Virtual Memory (VMM)</b></summary>
 
-- 4レベルページテーブル (PML4 → PDP → PD → PT)
+- 4-level page tables (PML4 -> PDP -> PD -> PT)
 - HHDM: Higher Half Direct Map (`0xFFFF800000000000`)
-- `mark_swapped()`: ページをスワップアウトした際のswap PTE書き込み
-- ring 0 / ring 3 マッピングのサポート
-- ユーザープロセス用アドレス空間の作成と破棄
+- `mark_swapped()`: write swap PTE when evicting a page
+- Ring 0 / ring 3 mapping support
+- Address space creation and destruction for user processes
+- Per-process address space for fork/exec
 
 </details>
 
 <details>
-<summary><b>mmap サブシステム</b></summary>
+<summary><b>mmap Subsystem</b></summary>
 
-| パラメータ | 値 |
+| Parameter | Value |
 |:--|:--|
-| **MMAP範囲** | 0x100000000 ~ 0x7F0000000000 |
-| **BRK範囲** | 0x6000000000 ~ |
-| **最大VMA** | 256エントリ |
-| **機能** | mmap、munmap、mprotect、brk |
-| **MAP_FIXED** | 既存マッピングのunmap + VMA重複除去 |
-| **VMA検証** | insert失敗時のロールバック |
+| **MMAP range** | 0x100000000 ~ 0x7F0000000000 |
+| **BRK range** | 0x6000000000 ~ |
+| **Max VMAs** | 256 entries |
+| **Features** | mmap, munmap, mprotect, brk |
+| **MAP_FIXED** | Unmaps existing mappings + removes overlapping VMAs |
+| **VMA validation** | Rollback on insert failure |
 
 </details>
 
 <details>
-<summary><b>スワップ (Swap)</b></summary>
+<summary><b>Swap</b></summary>
 
-#### リバースマッピング (swap_map)
+#### Reverse Mapping (swap_map)
 
-- 各物理フレームに `(cr3, virt_addr, age, pinned)` を記録
-- 最大512Kフレーム (2 GB RAM) を追跡
+- Each physical frame records `(cr3, virt_addr, age, pinned)`
+- Tracks up to 512K frames (2 GB RAM)
 
-#### 追い出しアルゴリズム: クロックスイープ
+#### Eviction Algorithm: Clock Sweep
 
 ```
-Pass 1: age >= 3 のフレームを検索 (最も古いもの)
-Pass 2: 緊急時、unpinnedフレームを任意に取得
+Pass 1: search for frames with age >= 3 (oldest)
+Pass 2: emergency mode, any unpinned frame
 ```
 
-- `touch(phys)`: ページアクセス時にageを1にリセット
-- `age_all()`: タイマーで全フレームのageを増加
+- `touch(phys)`: reset age to 1 on page access
+- `age_all()`: increment age of all frames on timer
 
-#### Swap PTEエンコーディング
+#### Swap PTE Encoding
 
 ```
 bit 0     = 0  (PRESENT=0)
 bit 1     = 1  (SWAP_MARKER)
-bits 12.. = スワップスロット番号
-判定条件: slot番号が0でないことを追加検証 (false positive防止)
+bits 12.. = swap slot number
+Additional check: slot number != 0 (false positive prevention)
 ```
 
 </details>
 
 ---
 
-### スケジューラ
+### Process Management
 
-| パラメータ | 値 |
+| Feature | Description |
 |:--|:--|
-| **方式** | CFS、プリエンプティブ |
-| **最大プロセス数** | 4096 |
-| **タイマー周波数** | 250 Hz (PIT) |
-| **CPU窓** | 250ティック (1秒) |
-| **スタック** | プロセスあたり 512 KB |
-| **状態** | Ready / Running / Sleeping / Blocked / Dead |
-| **実装** | ロックフリー: ISRはアトミックのみ使用 |
+| **fork()** | Full COW-style process cloning via deep page table copy |
+| **exec()** | Replace process image with ELF binary |
+| **wait4()** | Wait for child process (blocking) |
+| **kill()** | Send signal to process (SIGTERM, SIGKILL, SIGCHLD) |
+| **Zombie reaping** | Automatic via mikuD and wait4 |
+| **Process hierarchy** | Parent-child tracking via ppid |
 
 ---
 
-### システムコール
+### Scheduler
 
-| Nr | 名前 | 説明 |
+| Parameter | Value |
+|:--|:--|
+| **Algorithm** | CFS, preemptive |
+| **Max processes** | 4096 |
+| **Timer frequency** | 250 Hz (PIT) |
+| **CPU window** | 250 ticks (1 second) |
+| **Stack** | 512 KB per process |
+| **States** | Ready / Running / Sleeping / Blocked / Dead |
+| **Implementation** | Lock-free: ISR uses atomics only |
+| **Priority** | 1-20 scale with weighted vruntime |
+| **Affinity** | Per-process CPU mask |
+
+---
+
+### System Calls
+
+| Nr | Name | Description |
 |:--:|:--|:--|
-| **0** | `sys_exit` | プロセス終了 + yield |
-| **1** | `sys_write` | stdout/stderrへの書き込み (fd 1/2) |
-| **2** | `sys_read` | stdin (fd 0) またはファイルディスクリプタからの読み込み |
-| **3** | `sys_mmap` | メモリマッピングの作成 |
-| **4** | `sys_munmap` | メモリマッピングの解除 |
-| **5** | `sys_mprotect` | メモリ保護属性の変更 |
-| **6** | `sys_brk` | ヒープの拡張 |
-| **7** | `sys_getpid` | 現在のプロセスのPIDを取得 |
-| **8** | `sys_getcwd` | カレントディレクトリの取得 |
-| **9** | `sys_set_tls` | FS.baseレジスタの設定 (TLS) |
-| **10** | `sys_get_tls` | FS.baseレジスタの取得 |
-| **11** | `sys_open` | ファイルを開く (VFS + ext2) |
-| **12** | `sys_close` | ファイルディスクリプタを閉じる |
-| **13** | `sys_seek` | ファイルオフセットの設定 |
-| **14** | `sys_fsize` | ファイルサイズの取得 |
-| **15** | `sys_map_lib` | 共有ライブラリの直接マッピング |
-| **16** | `sys_sleep` | プロセスをスリープ (~10ms/ティック) |
-| **17** | `sys_uptime` | 起動からのティック数を取得 |
+| **0** | `sys_exit` | Terminate process + yield |
+| **1** | `sys_write` | Write to stdout/stderr (fd 1/2) |
+| **2** | `sys_read` | Read from stdin (fd 0) or file descriptor |
+| **3** | `sys_mmap` | Create memory mapping |
+| **4** | `sys_munmap` | Remove memory mapping |
+| **5** | `sys_mprotect` | Change memory protection attributes |
+| **6** | `sys_brk` | Expand heap |
+| **7** | `sys_getpid` | Get current process PID |
+| **8** | `sys_getcwd` | Get current directory |
+| **9** | `sys_set_tls` | Set FS.base register (TLS) |
+| **10** | `sys_get_tls` | Get FS.base register |
+| **11** | `sys_open` | Open file (VFS + ext2) |
+| **12** | `sys_close` | Close file descriptor |
+| **13** | `sys_seek` | Set file offset |
+| **14** | `sys_fsize` | Get file size |
+| **15** | `sys_map_lib` | Direct shared library mapping |
+| **16** | `sys_sleep` | Sleep process (~4ms/tick) |
+| **17** | `sys_uptime` | Get ticks since boot |
+| **18** | `sys_stat` | File stat |
+| **19** | `sys_fstat` | File descriptor stat |
+| **20** | `sys_mkdir` | Create directory |
+| **21** | `sys_rmdir` | Remove directory |
+| **22** | `sys_unlink` | Remove file |
+| **23** | `sys_readdir` | Read directory entries |
+| **24** | `sys_rename` | Rename file/directory |
+| **25** | `sys_link` | Create hard link |
+| **26** | `sys_chmod` | Change permissions |
+| **27** | `sys_chown` | Change ownership |
+| **28** | `sys_dup` | Duplicate file descriptor |
+| **29** | `sys_dup2` | Duplicate to specific fd |
+| **30** | `sys_truncate` | Truncate file |
+| **31** | `sys_write_file` | Write file contents |
+| **32** | `sys_symlink` | Create symbolic link |
+| **33** | `sys_readlink` | Read symbolic link |
+| **34** | `sys_pipe` | Create pipe |
+| **35** | `sys_chdir` | Change directory |
+| **36** | `sys_statfs` | File system statistics |
+| **37** | `sys_fallocate` | Preallocate file space |
+| **38** | `sys_getxattr` | Get extended attribute |
+| **39** | `sys_setxattr` | Set extended attribute |
+| **40** | `sys_utimensat` | Set file timestamps |
+| **41** | `sys_fsync` | Flush file to disk |
+| **42** | `sys_punch_hole` | Punch hole in file |
+| **43** | `sys_fork` | Fork current process |
+| **44** | `sys_wait4` | Wait for child process |
+| **45** | `sys_kill` | Send signal to process |
+| **46** | `sys_exec` | Execute ELF binary |
 
-FDテーブルはプロセスごとに管理 (BTreeMap<pid, ProcessFds>)。
+FD table is managed per-process (BTreeMap<pid, ProcessFds>).
 
 ---
 
-### ネットワークスタック
+### Network Stack
 
 <details>
-<summary><b>ネットワークカードドライバ</b></summary>
+<summary><b>Network Card Drivers</b></summary>
 
-| ドライバ | チップ |
+| Driver | Chip |
 |:--|:--|
-| **Intel E1000** | 82540EM、82545EM、82574L、82579LM、I217 |
+| **Intel E1000** | 82540EM, 82545EM, 82574L, 82579LM, I217 |
 | **Realtek RTL8139** | RTL8139 |
-| **Realtek RTL8168** | RTL8168、RTL8169 |
-| **VirtIO Net** | QEMU/KVM仮想ネットワークカード |
+| **Realtek RTL8168** | RTL8168, RTL8169 |
+| **VirtIO Net** | QEMU/KVM virtual network card |
 
 </details>
 
 <details>
-<summary><b>プロトコル</b></summary>
+<summary><b>Protocols</b></summary>
 
-| レイヤー | プロトコル |
+| Layer | Protocols |
 |:--|:--|
-| **L2** | Ethernet、ARP (キャッシュテーブル付き) |
-| **L3** | IPv4、ICMP |
-| **L4** | UDP、TCP (コネクション状態管理付き) |
-| **アプリケーション** | DHCP、DNS、NTP、HTTP、HTTP/2、Traceroute |
-| **セキュリティ** | TLS 1.3 (ECDHE + RSA + AES-GCM) |
+| **L2** | Ethernet, ARP (with cache table, header validation) |
+| **L3** | IPv4, ICMP |
+| **L4** | UDP, TCP (listener + client, state machine, retransmits) |
+| **Application** | DHCP, DNS, NTP, HTTP/1.1, HTTP/2 (HPACK), Ping, Traceroute |
+| **Security** | TLS 1.2 / 1.3 (ECDHE + RSA + AES-GCM, constant-time) |
 
 </details>
 
 <details>
-<summary><b>TLS 1.3: ゼロからの完全実装</b></summary>
+<summary><b>TLS 1.2 / 1.3: Complete Implementation from Scratch</b></summary>
 
-- ECDH: X25519鍵交換 (`tls_ecdh.rs`)
-- RSA: ASN.1/DER証明書のパース、PKCS#1署名検証 (`tls_rsa.rs`)
-- BigNum: RSA 2048-bit用の独自大数演算実装 (`tls_bignum.rs`)
-- AES-GCM: 認証付き対称暗号化 (`tls_gcm.rs`)
-- SHA-256、HMAC、HKDF: ハッシュ化、鍵導出 (`tls_crypto.rs`)
-- ハンドシェイク: ClientHello → ServerHello → Certificate → Finished
+- ECDH: P-256 ECDHE key exchange (`tls_ecdh.rs`), constant-time Montgomery-style scalar multiplication (always-double-always-add + `cmov`)
+- RSA: ASN.1/DER certificate parsing, PKCS#1 v1.5 padding (`tls_rsa.rs`), RDRAND-sourced padding bytes
+- BigNum: custom big number implementation for RSA 2048-bit (`tls_bignum.rs`)
+- AES-GCM: authenticated symmetric encryption (`tls_gcm.rs`)
+- SHA-256, HMAC, HKDF: hashing, key derivation (`tls_crypto.rs`)
+- Handshake: ClientHello -> ServerHello -> Certificate -> [ECDHE] -> Finished (client + server Finished verify_data checked)
+- HTTP/2: RFC 7540 framing and RFC 7541 HPACK with correct Appendix B Huffman table (`http2.rs`)
+
+#### Security Hardening
+
+| Concern | Mitigation |
+|:--|:--|
+| **RNG** | RDRAND-based CSPRNG for ClientHello random, CBC IV, ECDH private key, RSA padding (`random::random_u64`) |
+| **Timing (Lucky13)** | Constant-time MAC compare via OR-accumulator byte diff |
+| **Padding oracle** | Full RFC 5246 padding check — all pad bytes verified, not just the last |
+| **ECDH timing leak** | `fe_cmov` / `jac_cmov` XOR-mask constant-time field/point select |
+| **Server impersonation** | TLS 1.2 server Finished `verify_data = PRF(master, "server finished", hs_hash)` checked constant-time |
+| **PKCS#1 padding** | RDRAND-sourced non-zero padding bytes (rejection loop) |
+| **ARP spoofing** | hw_type / proto_type / hlen / plen checks before accepting ARP-IPv4 entries |
 
 </details>
 
 ---
 
-### VFS (仮想ファイルシステム)
+### VFS (Virtual File System)
 
 <details>
-<summary><b>展開する</b></summary>
+<summary><b>Expand</b></summary>
 
-#### 基本機能
+#### Core Features
 
-| パラメータ | 値 |
+| Parameter | Value |
 |:--|:--|
-| **VNode数** | 256 |
-| **同時オープンファイル数** | 32 |
-| **マウントポイント** | 8 |
-| **子ノード数** | 動的 (上限なし) |
+| **VNodes** | 256 |
+| **Open files** | 32 |
+| **Mount points** | 8 |
+| **Child nodes** | Dynamic (unlimited) |
 
-子ノードは動的 `Vec` ベースのハッシュマップで管理されます。初期スロット数は16で、使用率75%に達すると自動的に2倍に拡張されます。
+Child nodes are managed via a dynamic `Vec`-based hash map. Initial slot count is 16, automatically doubling at 75% utilization.
 
-- ノードタイプ: `Regular`、`Directory`、`Symlink`、`CharDevice`、`BlockDevice`、`Pipe`、`Fifo`、`Socket`
-- 権限、uid/gid、タイムスタンプ、サイズ、nlinksの完全なメタデータ付き
+- Node types: `Regular`, `Directory`, `Symlink`, `CharDevice`, `BlockDevice`, `Pipe`, `Fifo`, `Socket`
+- Full metadata: permissions, uid/gid, timestamps, size, nlinks
 
-#### システムライブラリ
+#### System Libraries
 
-ブート時に `/lib` ディレクトリをtmpfsに作成し、`libmiku.so` をimmutableファイルとして書き込みます。
-immutableフラグにより unlink / write / rename は拒否されます。
+At boot, `/lib` directory is created in tmpfs and `libmiku.so` is written as an immutable file.
+The immutable flag prevents unlink / write / rename.
 
-#### キャッシュ
+#### Cache
 
-| キャッシュ | サイズ |
+| Cache | Size |
 |:--|:--|
-| **ページキャッシュ** | 128ページ x 512バイト、LRU追い出し |
-| **Dentryキャッシュ** | 128エントリ、FNV32ハッシュ |
+| **Page cache** | 128 pages x 512 bytes, LRU eviction |
+| **Dentry cache** | 128 entries, FNV32 hash |
 
-#### ナビゲーション
+#### Navigation
 
-- パスウォーキング: 深さ最大32コンポーネント
-- シンボリックリンク解決: ループ保護 (8レベル)
-- FNV32ハッシュ: O(1)ルックアップのための名前ハッシュ化
+- Path walking: depth up to 32 components
+- Symlink resolution: loop protection (8 levels)
+- FNV32 hash: O(1) lookup by name
 
-#### セキュリティ
+#### Security
 
-- UNIXパーミッションモデル: `owner/group/other`、`setuid/setgid/sticky`
-- セキュリティラベル (MAC)、バイトとinode単位のクォータ
-- ファイルロック: デッドロック検出付きshared/exclusive (最大16ロック)
-- immutableフラグ: システムライブラリの保護
+- UNIX permission model: `owner/group/other`, `setuid/setgid/sticky`
+- Security labels (MAC), byte and inode quotas
+- File locking: shared/exclusive with deadlock detection (up to 16 locks)
+- Immutable flag: system library protection
 
-#### 高度な機能
+#### Advanced Features
 
-| 機能 | 詳細 |
+| Feature | Details |
 |:--|:--|
-| **VFSジャーナル** | 16件の操作ログ |
-| **Xattr** | ノードあたり8つの拡張属性 |
-| **Notifyイベント** | inotify的サブシステム (最大16イベント) |
-| **バージョンストア** | ファイルの16スナップショット |
-| **CASストア** | コンテンツアドレス指定の重複排除 (最大16オブジェクト) |
-| **ブロックI/Oキュー** | 8件の非同期リクエスト |
+| **VFS journal** | 16 operation log entries |
+| **Xattr** | 8 extended attributes per node |
+| **Notify events** | inotify-like subsystem (up to 16 events) |
+| **Version store** | 16 file snapshots |
+| **CAS store** | Content-addressed deduplication (up to 16 objects) |
+| **Block I/O queue** | 8 async requests |
 
 </details>
 
 ---
 
-### ファイルシステム
+### File Systems
 
-| FS | マウントポイント | 説明 |
+| FS | Mount Point | Description |
 |:--:|:--:|:--|
-| **tmpfs** | `/` | RAMベースのルートFS |
-| **devfs** | `/dev` | デバイス: `null`、`zero`、`random`、`urandom`、`console` |
-| **procfs** | `/proc` | `version`、`uptime`、`meminfo`、`mounts`、`cpuinfo`、`stat` |
-| **ext2** | `/mnt` | 実ディスクへの完全な読み書き |
-| **ext3** | `/mnt` | ext2上のジャーナリング (JBD2)、遅延書き込み |
-| **ext4** | `/mnt` | エクステントベースファイル + crc32cチェックサム |
+| **tmpfs** | `/` | RAM-based root FS |
+| **devfs** | `/dev` | Devices: `null`, `zero`, `random`, `urandom`, `console` |
+| **procfs** | `/proc` | `version`, `uptime`, `meminfo`, `mounts`, `cpuinfo`, `stat` |
+| **ext2** | `/mnt` | Full read-write to real disk |
+| **ext3** | `/mnt` | Journaling (JBD2) on top of ext2, delayed writes |
+| **ext4** | `/mnt` | Extent-based files + crc32c checksums |
 
 ---
 
-### MikuFS: Ext2/3/4ドライバ
+### MikuFS: Ext2/3/4 Driver
 
 <details>
-<summary><b>展開する</b></summary>
+<summary><b>Expand</b></summary>
 
-#### 読み込み
+#### Reading
 
-- スーパーブロック、グループディスクリプタ、inode、ディレクトリエントリ
-- 間接ブロック (シングル / ダブル / トリプル)
-- Ext4エクステントツリー
+- Superblock, group descriptors, inodes, directory entries
+- Indirect blocks (single / double / triple)
+- Ext4 extent trees
 
-#### 書き込み
+#### Writing
 
-- ファイル、ディレクトリ、シンボリックリンクの作成と削除
-- ブロックとinode用ビットマップアロケータ (優先グループ対応)
-- 再帰的な削除
-- 遅延書き込み (dirty cache + pdflush)
+- Create and delete files, directories, symbolic links
+- Bitmap allocator for blocks and inodes (with group priority)
+- Recursive deletion
+- Delayed writes (dirty cache + pdflush)
 
-#### Ext3ジャーナル (JBD2)
+#### Ext3 Journal (JBD2)
 
-- ジャーナルの作成 (`ext2 → ext3` 変換)
-- トランザクションの書き込み: ディスクリプタブロック、コミットブロック、revokeブロック
-- リカバリ: マウント時に未完了トランザクションをリプレイ
-- 遅延コミット: journal書き込みをdirty cacheで高速化
+- Journal creation (`ext2 -> ext3` conversion)
+- Transaction writing: descriptor blocks, commit blocks, revoke blocks
+- Recovery: replay incomplete transactions on mount
+- Delayed commit: accelerate journal writes via dirty cache
 
 #### mkfs
 
-- ext2/ext3/ext4のフォーマット対応
-- lazy init: group 0のメタデータのみ即時初期化、残りは遅延
-- ジャーナルスーパーブロックのみ初期化 (全ブロックの零化を省略)
+- ext2/ext3/ext4 formatting
+- Lazy init: only group 0 metadata initialized immediately, rest deferred
+- Journal superblock only initialization (skip full block zeroing)
 
-#### ユーティリティ
+#### Utilities
 
-- `fsck`、`tree`、`du`、`cp`、`mv`、`chmod`、`chown`、ハードリンク
+- `fsck`, `tree`, `du`, `cp`, `mv`, `chmod`, `chown`, hard links
 
 </details>
 
 ---
 
-### シェルコマンド
+### Shell Commands
 
-#### 統合extコマンド (マウントされたFSバージョンを自動検出)
+#### Service Management (sv)
 
-| コマンド | 構文 | 説明 |
+| Command | Description |
+|:--|:--|
+| `sv list` | List all services |
+| `sv status <name>` | Detailed service status |
+| `sv start/stop/restart <name>` | Service lifecycle |
+| `sv reload <name>` | Send SIGHUP |
+| `sv enable/disable <name>` | Enable/disable |
+| `sv mask/unmask <name>` | Mask/unmask |
+| `sv force-stop <name>` | Force kill |
+| `sv journal [name]` | Event log |
+| `sv target [name]` | Target management |
+| `sv analyze` | Boot analysis |
+| `sv tree/rdeps <name>` | Dependency info |
+| `sv load/scan` | Unit file management |
+| `sv timer list/start/stop` | Timer management |
+
+#### Unified ext Commands (auto-detects mounted FS version)
+
+| Command | Syntax | Description |
 |:--|:--|:--|
-| `ext2mount` | `ext2mount [drive]` | ext2マウント |
-| `ext3mount` | `ext3mount [drive]` | ext3マウント |
-| `ext4mount` | `ext4mount [drive]` | ext4マウント |
-| `extls` | `extls [path]` | ディレクトリ一覧 |
-| `extcat` | `extcat <path>` | ファイル内容表示 |
-| `extstat` | `extstat <path>` | inodeの詳細 |
-| `extinfo` | `extinfo` | スーパーブロック情報 |
-| `extwrite` | `extwrite <path> <text>` | ファイルへの書き込み |
-| `extappend` | `extappend <path> <text>` | ファイルへの追記 |
-| `exttouch` | `exttouch <path>` | 空ファイルの作成 |
-| `extmkdir` | `extmkdir <path>` | ディレクトリの作成 |
-| `extrm` | `extrm [-rf] <path>` | ファイルの削除 |
-| `extrmdir` | `extrmdir <path>` | 空ディレクトリの削除 |
-| `extmv` | `extmv <path> <newname>` | ファイルの改名 |
-| `extcp` | `extcp <src> <dst>` | ファイルのコピー |
-| `extln -s` | `extln -s <target> <link>` | シンボリックリンクの作成 |
-| `extlink` | `extlink <existing> <link>` | ハードリンクの作成 |
-| `extchmod` | `extchmod <mode> <path>` | パーミッションの変更 |
-| `extchown` | `extchown <uid> <gid> <path>` | 所有者の変更 |
-| `extdu` | `extdu [path]` | ディスク使用量 |
-| `exttree` | `exttree [path]` | ディレクトリツリー |
-| `extfsck` | `extfsck` | FSの整合性チェック |
-| `extcache` | `extcache` | ブロックキャッシュ統計 |
-| `extcacheflush` | `extcacheflush` | キャッシュのフラッシュ |
-| `extsync` / `sync` | `sync` | ディスクへの書き込み |
+| `ext2mount` | `ext2mount [drive]` | Mount ext2 |
+| `ext3mount` | `ext3mount [drive]` | Mount ext3 |
+| `ext4mount` | `ext4mount [drive]` | Mount ext4 |
+| `extls` | `extls [path]` | Directory listing |
+| `extcat` | `extcat <path>` | File contents |
+| `extstat` | `extstat <path>` | Inode details |
+| `extinfo` | `extinfo` | Superblock info |
+| `extwrite` | `extwrite <path> <text>` | Write to file |
+| `extappend` | `extappend <path> <text>` | Append to file |
+| `exttouch` | `exttouch <path>` | Create empty file |
+| `extmkdir` | `extmkdir <path>` | Create directory |
+| `extrm` | `extrm [-rf] <path>` | Delete file |
+| `extrmdir` | `extrmdir <path>` | Delete empty directory |
+| `extmv` | `extmv <path> <newname>` | Rename file |
+| `extcp` | `extcp <src> <dst>` | Copy file |
+| `extln -s` | `extln -s <target> <link>` | Create symbolic link |
+| `extlink` | `extlink <existing> <link>` | Create hard link |
+| `extchmod` | `extchmod <mode> <path>` | Change permissions |
+| `extchown` | `extchown <uid> <gid> <path>` | Change owner |
+| `extdu` | `extdu [path]` | Disk usage |
+| `exttree` | `exttree [path]` | Directory tree |
+| `extfsck` | `extfsck` | FS integrity check |
+| `extcache` | `extcache` | Block cache statistics |
+| `extcacheflush` | `extcacheflush` | Flush cache |
+| `extsync` / `sync` | `sync` | Write to disk |
 
-> 旧コマンド (`ext2ls`、`ext3cat`、`ext4write` 等) は後方互換性のために残っています。
+> Legacy commands (`ext2ls`, `ext3cat`, `ext4write`, etc.) are kept for backward compatibility.
 
-#### VFSコマンド
+#### VFS Commands
 
-| コマンド | 説明 |
+| Command | Description |
 |:--|:--|
-| `ls [path]` | ディレクトリ一覧 (ext + VFS統合表示) |
-| `cd <path>` | ディレクトリ移動 |
-| `pwd` | 現在のパス表示 |
-| `mkdir <path>` | ディレクトリ作成 |
-| `touch <path>` | ファイル作成 (RAM) |
-| `cat <path>` | ファイル内容表示 |
-| `write <path> <text>` | ファイルへの書き込み (RAM) |
-| `rm [-rf] <path>` | ファイル/ディレクトリ削除 |
-| `rmdir <path>` | ディレクトリ削除 (ext対応) |
-| `mv <old> <new>` | 改名 |
-| `stat <path>` | ファイル情報 |
-| `chmod <mode> <path>` | パーミッション変更 |
-| `df` | ファイルシステム情報 |
+| `ls [path]` | Directory listing (ext + VFS combined view) |
+| `cd <path>` | Change directory |
+| `pwd` | Print current path |
+| `mkdir <path>` | Create directory |
+| `touch <path>` | Create file (RAM) |
+| `cat <path>` | File contents |
+| `write <path> <text>` | Write to file (RAM) |
+| `rm [-rf] <path>` | Delete file/directory |
+| `rmdir <path>` | Delete directory (ext compatible) |
+| `mv <old> <new>` | Rename |
+| `stat <path>` | File info |
+| `chmod <mode> <path>` | Change permissions |
+| `df` | File system info |
 
-#### ダイナミックリンクコマンド
+#### Dynamic Linking Commands
 
-| コマンド | 説明 |
+| Command | Description |
 |:--|:--|
-| `exec <path>` | ELFバイナリの実行 (ダイナミックリンク対応) |
-| `ldconfig` | 共有ライブラリキャッシュの更新 |
-| `ldd` | キャッシュされたライブラリの一覧表示 |
+| `exec <path> [args]` | Run ELF binary (with dynamic linking) |
+| `ldconfig` | Update shared library cache |
+| `ldd` | List cached libraries |
 
-#### mkfsコマンド
+#### Process Management
 
-| コマンド | 説明 |
+| Command | Description |
 |:--|:--|
-| `mkfs.ext2 <drive>` | ext2フォーマット |
-| `mkfs.ext3 <drive>` | ext3フォーマット (ジャーナル付き) |
-| `mkfs.ext4 <drive>` | ext4フォーマット (エクステント + ジャーナル) |
+| `ps` | List all processes |
+| `top` | Live process monitor |
+| `kill <pid>` | Kill process by PID |
+| `nice <pid> <prio>` | Change process priority (1-20) |
+| `affinity <pid> <mask>` | Set CPU affinity mask |
+| `swaptest` | Stress-test the swap subsystem |
+
+#### System Commands
+
+| Command | Description |
+|:--|:--|
+| `poweroff` / `shutdown` / `halt` | Graceful shutdown via mikuD |
+| `reboot` / `restart` | Graceful reboot via mikuD |
+| `info` | System information |
+| `memmap` | Physical memory map |
+| `heap` | Heap statistics |
+| `clear` | Clear screen |
+| `echo <text>` | Print text |
+| `history` | Command history |
+| `help` | Command list |
+
+#### mkfs / Disk / Swap Commands
+
+| Command | Description |
+|:--|:--|
+| `mkfs.ext2 <drive>` | Format ext2 |
+| `mkfs.ext3 <drive>` | Format ext3 (with journal) |
+| `mkfs.ext4 <drive>` | Format ext4 (extents + journal) |
+| `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run format (layout only) |
+| `gpt <drive>` | Show GPT partition table |
+| `gpt.init <drive>` | Initialize empty GPT |
+| `gpt.add <drive> <partition spec>` | Add partition |
+| `gpt.del <drive> <partition>` | Delete partition |
+| `mkswap <drive> <partition>` | Create swap area on partition |
+| `swapon <drive> <partition>` | Activate swap |
+| `swapon.raw <drive> <start> <size>` | Activate raw-range swap |
+| `swapon.auto` | Auto-discover and activate swap partitions |
+| `swapoff` | Deactivate swap |
+| `swapinfo` | Show swap usage |
+| `mkswap.raw <drive> <start> <size>` | Create raw swap without GPT |
+
+#### Extended Attributes / Flags
+
+| Command | Description |
+|:--|:--|
+| `getxattr <path> <name>` | Read user xattr |
+| `setxattr <path> <name> <value>` | Write user xattr |
+| `listxattr <path>` | List all xattrs |
+| `chattr <+/-flags> <path>` | Set file flags (i=immutable, a=append, d=nodump, A=noatime) |
+| `lsattr <path>` | List file flags |
+| `fiemap <path>` | Show file extent map (ext4) |
+
+#### Networking
+
+| Command | Description |
+|:--|:--|
+| `net <subcmd>` | Network status / config |
+| `dhcp` | Request lease via DHCP |
+| `ping <ip\|host> [count]` | ICMP echo (resolves via DNS) |
+| `ntp [server]` | Sync clock via NTP |
+| `traceroute` / `tr <host>` | UDP/ICMP route tracing |
+| `fetch <url\|host> [port]` | Minimal HTTP/HTTPS client |
+| `wget <url> [-O <file>]` | Download over HTTP(S) |
+| `curl <url> [-X GET\|POST] [-d <data>] [-o <file>] [-I]` | HTTP(S) client |
 
 ---
 
-### ATAドライバ
+### ATA Driver
 
-| パラメータ | 値 |
+| Parameter | Value |
 |:--|:--|
-| **モード** | PIO (プログラムI/O) |
-| **操作** | セクターの読み書き (512バイト)、最大255セクター/コマンド |
-| **ディスク数** | 4台: Primary/Secondary x Master/Slave |
-| **保護** | 書き込み後のキャッシュフラッシュ、タイムアウト 50Kイテレーション |
-| **アドレス指定** | LBA28 (最大128GB) |
+| **Mode** | PIO (Programmed I/O) |
+| **Operations** | Sector read/write (512 bytes), up to 255 sectors/command |
+| **Disks** | 4: Primary/Secondary x Master/Slave |
+| **Protection** | Cache flush after write, 50K iteration timeout |
+| **Addressing** | LBA28 (up to 128GB) |
 
 ---
 
-## ビルドと実行
+## Build and Run
 
-### 必要なツール
+### Required Tools
 
-| ツール | 用途 |
+| Tool | Purpose |
 |:--|:--|
-| **Rust nightly** | `no_std` + コンパイラの不安定な機能 |
-| **QEMU** | x86_64マシンのエミュレーション |
-| **grub-mkrescue** | ブータブルISOの作成 |
-| **GCC** | libmiku stub生成 + Cプログラムのコンパイル |
-| **e2tools** | ext4イメージへのファイルコピー |
-| **Cargo** | カーネルのビルド |
+| **Rust nightly** | `no_std` + unstable compiler features |
+| **QEMU** | x86_64 machine emulation |
+| **grub-mkrescue** | Create bootable ISO |
+| **GCC** | libmiku stub generation + C program compilation |
+| **e2tools** | File copy to ext4 image |
+| **Cargo** | Kernel build |
 
-### 実行手順
+### Running
 
 ```bash
 git clone https://github.com/altushkaso2/miku-os
@@ -787,68 +1022,68 @@ cd miku-os/builder
 cargo run
 ```
 
-Builderがすべて自動で行います:
+The builder handles everything automatically:
 
 ```
-RAMの節約モード? (y/N)
-[1/7] ld-miku.soのコンパイル
-[2/7] libmiku.soのコンパイル
-[3/7] miku-osカーネルのコンパイル
-[4/7] ファイル構造の作成
-[5/7] システムイメージの生成 (miku-os.iso)
-[6/7] ディスクの準備
-[7/7] QEMUの起動 (任意 (y/N))
+RAM saving mode? (y/N)
+[1/7] Compile ld-miku.so
+[2/7] Compile libmiku.so
+[3/7] Compile miku-os kernel
+[4/7] Create file structure
+[5/7] Generate system image (miku-os.iso)
+[6/7] Prepare disk
+[7/7] Launch QEMU (optional (y/N))
 ```
 
-### userspace プログラムのビルド
+### Building Userspace Programs
 
 ```bash
 cd src/lib/userspace
-./build.sh hello         # ビルド + ディスクにコピー
-./build.sh test_full     # テストスイート
-./build.sh               # 全バイナリ
+./build.sh hello         # build + copy to disk
+./build.sh test_full     # test suite
+./build.sh               # all binaries
 ```
 
 ---
 
 ## MikuOS ABI
 
-userspace プログラムの開発に関する完全なドキュメントは [MikuOS_ABI.md](docs/MikuOS_ABI.md) を参照してください。
+Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/MikuOS_ABI.md)
 
 ---
 
-## 作者
+## Author
 
 <div align="center">
-  <a href="https://github.com/altushkaso2">
-    <img src="https://github.com/altushkaso2.png" width="100" style="border-radius:50%;" alt="altushkaso2">
+  <a href="https://github.com/alunwrd">
+    <img src="https://github.com/alunwrd.png" width="100" style="border-radius:50%;" alt="alunwrd">
   </a>
   <br><br>
-  <a href="https://github.com/altushkaso2"><b>@altushkaso2</b></a>
+  <a href="https://github.com/alunwrd"><b>@alunwrd</b></a>
   <br>
-  <sub>Miku OSの作者および唯一の開発者</sub>
+  <sub>Author and sole developer of Miku OS</sub>
   <br>
-  <sub>カーネル - VFS - MikuFS - ELF - ld-miku - libmiku - シェル - ネットワーク - TLS - スケジューラ - PMM - VMM - Swap</sub>
+  <sub>Kernel - VFS - MikuFS - ELF - ld-miku - libmiku - Shell - Network - TLS - Scheduler - PMM - VMM - Swap - mikuD - Signals - fork/exec</sub>
 </div>
 
 ---
 
-## 作者より
+## From the Author
 
-> すべては「自分でOSを書いてみたらどうなるだろう?」というシンプルな思いから始まりました。
-> 毎晩、新しい機能を追加し、新しいバグを直し、新しい発見をしています。
-> 画面への最初の文字表示から、本格的なTLS 1.3スタック、ロックフリースケジューラ、
-> そしてダイナミックリンカーまで、すべて手作業で書きました。
-> 既製のライブラリやラッパーは一切なし。Rustとドキュメントと根気だけです :D
+> It all started with a simple thought: "What if I wrote an OS myself?"
+> Every night I add a new feature, fix a new bug, make a new discovery.
+> From the first character on screen to a full TLS 1.3 stack, a lock-free scheduler,
+> and a dynamic linker, everything was written by hand.
+> No pre-made libraries or wrappers. Just Rust, documentation, and persistence :D
 >
-> ELFローダーとダイナミックリンクが動いた瞬間、「hello from dynamic linking!」が
-> 画面に表示された時の感動は忘れられません。
-> そしてlibmikuが71テスト全て通った瞬間、このOSで本当のプログラムが動くことを実感しました。
+> The moment the ELF loader and dynamic linking worked, when "hello from dynamic linking!"
+> appeared on screen, I will never forget.
+> When libmiku passed all 1617 tests, it became clear that real programs can run on this OS.
 
 <div align="center">
 
-**Miku OS** - Rustでゼロから書かれた純粋なOS
+**Miku OS** - A pure OS written from scratch in Rust
 
-*愛を込めて*
+*With love*
 
-<img src="https://raw.githubusercontent.com/altushkaso2/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
+<img src="https://raw.githubusercontent.com/altushkaso2/alunwrd/main/docs/miku.png" width="220" alt="Miku Logo">

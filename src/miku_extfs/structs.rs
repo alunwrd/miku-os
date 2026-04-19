@@ -606,6 +606,9 @@ impl Inode {
     pub fn flags(&self) -> u32 {
         self.read_u32(32)
     }
+    pub fn has_flag(&self, flag: u32) -> bool {
+        self.flags() & flag != 0
+    }
     pub fn osd1(&self) -> u32 {
         self.read_u32(36)
     }

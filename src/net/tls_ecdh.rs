@@ -223,14 +223,27 @@ fn jac_add_affine(p: &JacPoint, ax: &Fe, ay: &Fe) -> JacPoint {
     JacPoint { x: x3, y: y3, z: z3 }
 }
 
+fn fe_cmov(dst: &mut Fe, src: &Fe, cond: u32) {
+    let mask = 0u32.wrapping_sub(cond & 1);
+    for i in 0..8 {
+        dst[i] ^= mask & (dst[i] ^ src[i]);
+    }
+}
+
+fn jac_cmov(dst: &mut JacPoint, src: &JacPoint, cond: u32) {
+    fe_cmov(&mut dst.x, &src.x, cond);
+    fe_cmov(&mut dst.y, &src.y, cond);
+    fe_cmov(&mut dst.z, &src.z, cond);
+}
+
 fn scalar_mul(k: &[u8; 32], px: &Fe, py: &Fe) -> Option<(Fe, Fe)> {
     let mut r = jac_inf();
     for byte in k.iter() {
         for bit in (0..8).rev() {
             r = jac_double(&r);
-            if (byte >> bit) & 1 == 1 {
-                r = jac_add_affine(&r, px, py);
-            }
+            let added = jac_add_affine(&r, px, py);
+            let cond  = ((byte >> bit) & 1) as u32;
+            jac_cmov(&mut r, &added, cond);
         }
     }
     jac_to_affine(&r)
@@ -238,8 +251,7 @@ fn scalar_mul(k: &[u8; 32], px: &Fe, py: &Fe) -> Option<(Fe, Fe)> {
 
 pub fn ecdh_keypair(rand_bytes: &[u8; 32]) -> ([u8; 32], [u8; 65]) {
     let mut priv_key = *rand_bytes;
-    priv_key[0] &= 0x7F;
-    if priv_key[0] == 0 { priv_key[0] = 1; }
+    if priv_key.iter().all(|&b| b == 0) { priv_key[31] = 1; }
 
     let (pub_x, pub_y) = scalar_mul(&priv_key, &GX, &GY)
         .unwrap_or((fe_zero(), fe_zero()));

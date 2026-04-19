@@ -23,38 +23,40 @@ jobs:
 
       - name: Build ld-miku.so
         run: |
-          if [ ! -d "ld-miku" ]; then
-            echo "[!] ld-miku/ not found, skipping"
-            exit 0
+          if [ -d "ld-miku" ]; then
+            cd ld-miku
+            LD_SCRIPT="$(pwd)/ld_link.ld"
+            export RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-z -C link-arg=noexecstack -C link-arg=-z -C link-arg=now -C link-arg=--no-dynamic-linker -C link-arg=-T${LD_SCRIPT} -C no-redzone=y"
+            cargo +nightly build --release --target x86_64-miku-ldso.json -Z json-target-spec -Z build-std=core -Z build-std-features=compiler-builtins-mem
+            mkdir -p ../src/lib/ld_miku
+            cp ../target/x86_64-miku-ldso/release/ld-miku ../src/lib/ld_miku/ld-miku.bin
           fi
-          cd ld-miku
-          LD_SCRIPT="$(pwd)/ld_link.ld"
-          export RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-z -C link-arg=noexecstack -C link-arg=-z -C link-arg=now -C link-arg=--no-dynamic-linker -C link-arg=-T${LD_SCRIPT} -C no-redzone=y"
-          cargo +nightly build --release --target x86_64-miku-ldso.json -Z json-target-spec -Z build-std=core -Z build-std-features=compiler-builtins-mem
-          mkdir -p ../src/lib/ld_miku
-          cp ../target/x86_64-miku-ldso/release/ld-miku ../src/lib/ld_miku/ld-miku.bin
-          echo "[ok] ld-miku.bin: $(du -sh ../src/lib/ld_miku/ld-miku.bin)"
+
+      - name: Build libmiku.so
+        run: |
+          if [ -d "libmiku" ]; then
+            cd libmiku
+            export RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-z -C link-arg=noexecstack -C link-arg=-z -C link-arg=now -C link-arg=--no-dynamic-linker -C link-arg=--export-dynamic -C link-arg=--hash-style=both -C no-redzone=y"
+            cargo +nightly build --release --target x86_64-miku-lib.json -Z json-target-spec -Z build-std=core -Z build-std-features=compiler-builtins-mem
+            mkdir -p ../src/lib/libmiku
+            cp target/x86_64-miku-lib/release/libmiku ../src/lib/libmiku/libmiku.so
+          fi
 
       - name: Build Kernel
         run: |
           export RUSTFLAGS="-C relocation-model=static -C link-arg=-Tlinker.ld -C link-arg=--no-dynamic-linker"
           cargo build --target x86_64-unknown-none -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem
 
-      - name: Create ISO with GRUB
+      - name: Create ISO
         run: |
           mkdir -p iso_root/boot/grub
           cp target/x86_64-unknown-none/debug/miku-os-release iso_root/boot/kernel.elf
           printf 'set timeout=-1\nset default=0\nmenuentry "Miku OS" {\n    multiboot2 /boot/kernel.elf\n    boot\n}\n' > iso_root/boot/grub/grub.cfg
           grub-mkrescue -o miku-os.iso iso_root
 
-      - name: Check Artifacts
-        run: |
-          ls -lh miku-os.iso
-          file miku-os.iso
-
-      - name: Publish Release
+      - name: Publish
         uses: softprops/action-gh-release@v1
         with:
           files: miku-os.iso
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
           generate_release_notes: true

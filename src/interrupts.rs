@@ -233,13 +233,63 @@ extern "x86-interrupt" fn page_fault_handler(
     let (cr3_frame, _) = Cr3::read();
     let cr3 = cr3_frame.start_address().as_u64();
 
-    if page_addr != 0 {
+    // guard: only walk page tables for canonical user-range addresses
+    let safe_to_walk = page_addr != 0 && page_addr < 0x0000_8000_0000_0000;
+
+    if safe_to_walk {
         if let Some(pte_raw) = crate::vmm::read_pte_raw(cr3, page_addr) {
             if crate::swap_map::is_swap_pte(pte_raw) {
                 let slot = crate::swap_map::slot_from_pte(pte_raw);
-                if crate::swap_map::try_swapin(cr3, page_addr, slot) {
+                if crate::swap_map::try_swapin(cr3, page_addr, slot, pte_raw) {
                     return;
                 }
+            }
+
+            // COW: write fault on present page with COW bit
+            let is_write = error_code.contains(
+                x86_64::structures::idt::PageFaultErrorCode::CAUSED_BY_WRITE
+            );
+            let is_present = pte_raw & crate::vmm::PTE_PRESENT != 0;
+            let is_cow = pte_raw & crate::vmm::PTE_COW != 0;
+
+            if is_write && is_present && is_cow {
+                let old_phys = pte_raw & crate::vmm::PTE_ADDR_MASK;
+                let hhdm = crate::grub::hhdm();
+                let rc = crate::pmm::ref_get(old_phys);
+
+                let aspace = crate::vmm::AddressSpace { cr3 };
+                if rc > 1 {
+                    if let Some(new_phys) = crate::pmm::alloc_frame() {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                (old_phys + hhdm) as *const u8,
+                                (new_phys + hhdm) as *mut u8,
+                                4096,
+                            );
+                        }
+                        let remaining = crate::pmm::ref_dec(old_phys);
+                        if remaining <= 1 {
+                            crate::swap_map::set_pinned(old_phys, false);
+                        }
+                        let new_pte = (new_phys & crate::vmm::PTE_ADDR_MASK)
+                            | (pte_raw & !crate::vmm::PTE_ADDR_MASK & !crate::vmm::PTE_COW)
+                            | crate::vmm::PTE_WRITABLE;
+                        unsafe { aspace.write_pte_raw(page_addr, new_pte); }
+                        crate::swap_map::track(new_phys, cr3, page_addr, false);
+                        x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page_addr));
+                        core::mem::forget(aspace);
+                        return;
+                    }
+                } else {
+                    // Last COW reference - just make writable and unpin
+                    let new_pte = (pte_raw & !crate::vmm::PTE_COW) | crate::vmm::PTE_WRITABLE;
+                    unsafe { aspace.write_pte_raw(page_addr, new_pte); }
+                    crate::swap_map::set_pinned(old_phys, false);
+                    x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page_addr));
+                    core::mem::forget(aspace);
+                    return;
+                }
+                core::mem::forget(aspace);
             }
         }
     }
@@ -252,6 +302,26 @@ extern "x86-interrupt" fn page_fault_handler(
         "[page fault] addr={:#x} code={:?} user={}",
         fault_addr, error_code, from_user
     );
+
+    // dump PTE info for debugging
+    if safe_to_walk {
+        if let Some(pte_raw) = crate::vmm::read_pte_raw(cr3, page_addr) {
+            let present  = pte_raw & 1 != 0;
+            let writable = pte_raw & 2 != 0;
+            let user     = pte_raw & 4 != 0;
+            let nx       = pte_raw & (1 << 63) != 0;
+            let cow      = pte_raw & crate::vmm::PTE_COW != 0;
+            let phys     = pte_raw & crate::vmm::PTE_ADDR_MASK;
+            crate::serial_println!(
+                "[page fault] pte={:#x} phys={:#x} P={} W={} U={} NX={} COW={}",
+                pte_raw, phys, present, writable, user, nx, cow
+            );
+        } else {
+            crate::serial_println!("[page fault] pte=NOT_MAPPED for page {:#x}", page_addr);
+        }
+    }
+
+    crate::serial_println!("[page fault] rip={:#x}", stack_frame.instruction_pointer.as_u64());
 
     if from_user {
         let pid = crate::scheduler::current_pid();
@@ -283,3 +353,4 @@ extern "x86-interrupt" fn gpf_handler(stack_frame: InterruptStackFrame, error_co
 
     loop { x86_64::instructions::hlt(); }
 }
+
