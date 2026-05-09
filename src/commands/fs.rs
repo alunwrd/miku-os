@@ -832,11 +832,59 @@ pub fn cmd_mount_list() {
     cprintln!(230, 240, 240, "  devfs         /dev          devfs");
     cprintln!(230, 240, 240, "  procfs        /proc         procfs");
 
-    let is_mounted = with_vfs_ro(|vfs| vfs.ext2_mount_active);
+    let mounts = crate::commands::ext2_cmds::mounted_slots_snapshot();
 
-    if is_mounted {
-        let fs_name = crate::commands::ext2_cmds::active_fs_type().as_str();
-        cprintln!(230, 240, 240, "  {:<14}/mnt          {}", fs_name, fs_name);
+    with_vfs_ro(|vfs| {
+        for entry in mounts.iter().flatten() {
+            let (_slot, vnode, fs_name) = *entry;
+            let path = vnode_path(vfs, vnode as usize);
+            let path_str = path.as_str();
+            cprintln!(230, 240, 240, "  {:<14}{:<14}{}", fs_name, path_str, fs_name);
+        }
+    });
+}
+
+/// Build the absolute path of a vnode by walking parent links
+/// Returns "/" for the root and a [u8; 256]-backed buffer otherwise
+fn vnode_path(vfs: &vfs::core::MikuVFS, mut id: usize) -> PathBuf {
+    let mut buf = PathBuf::new();
+    if id == 0 || !vfs.nodes[id].active {
+        buf.push_byte(b'/');
+        return buf;
+    }
+    // Collect names from leaf upward, then write them out in reverse
+    let mut names: [&str; 32] = [""; 32];
+    let mut depth = 0usize;
+    while id != 0 && depth < names.len() {
+        names[depth] = vfs.nodes[id].name.as_str();
+        depth += 1;
+        let p = vfs.nodes[id].parent as usize;
+        if p == id { break; }
+        id = p;
+    }
+    for i in (0..depth).rev() {
+        buf.push_byte(b'/');
+        buf.push_str(names[i]);
+    }
+    if depth == 0 { buf.push_byte(b'/'); }
+    buf
+}
+
+struct PathBuf {
+    data: [u8; 256],
+    len:  usize,
+}
+
+impl PathBuf {
+    fn new() -> Self { Self { data: [0; 256], len: 0 } }
+    fn push_byte(&mut self, b: u8) {
+        if self.len < self.data.len() { self.data[self.len] = b; self.len += 1; }
+    }
+    fn push_str(&mut self, s: &str) {
+        for &b in s.as_bytes() { self.push_byte(b); }
+    }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.data[..self.len]).unwrap_or("/")
     }
 }
 
@@ -859,26 +907,39 @@ pub fn cmd_umount(path: &str) {
     });
 
     let cwd = SESSION.lock().cwd;
-    let result = with_vfs(|vfs| {
+    // Resolve path to a vnode and verify it's actually a registered ext
+    // mount root. Returns the slot index alongside the vnode id so the
+    // caller can tear down the matching slot  not just whichever slot
+    // happens to be active
+    let result = with_vfs(|vfs| -> VfsResult<(usize, usize)> {
         let id = vfs.resolve_path(cwd, path)?;
 
         if !vfs.nodes[id].fs_type.is_ext_family() {
             return Err(VfsError::InvalidArgument);
         }
 
+        let slot = crate::commands::ext2_cmds::slot_for_vnode(id as u16)
+            .ok_or(VfsError::InvalidArgument)?;
+
         vfs.evict_children_recursive(id);
         vfs.nodes[id].fs_type = FsType::TmpFS;
         vfs.nodes[id].ext2_ino = 0;
         vfs.nodes[id].children_loaded = false;
-        vfs.ext2_mount_active = false;
-
-        Ok(())
+        Ok((id, slot))
     });
 
-    crate::commands::ext2_cmds::force_unmount();
-
     match result {
-        Ok(()) => print_success!("  unmounted {}", path),
+        Ok((_id, slot)) => {
+            crate::commands::ext2_cmds::unmount_slot(slot);
+            // Keep the legacy "any ext mounted?" flag in sync. Set it from
+            // a fresh snapshot rather than blanket-clearing - other slots
+            // may still be mounted on different paths
+            let any_left = crate::commands::ext2_cmds::mounted_slots_snapshot()
+                .iter()
+                .any(|e| e.is_some());
+            with_vfs(|vfs| { vfs.ext2_mount_active = any_left; });
+            print_success!("  unmounted {}", path);
+        }
         Err(e) => print_error!("umount: {:?}", e),
     }
 }
@@ -924,7 +985,11 @@ fn mount_ext2_to_vfs(mountpoint: &str) {
     });
 
     match result {
-        Ok(_id) => {
+        Ok(id) => {
+            // Track which VFS vnode now belongs to the active ext slot so
+            // a later umount <path> can find the right slot to drop
+            let active = crate::commands::ext2_cmds::active_slot_index();
+            crate::commands::ext2_cmds::register_mount_vnode(active, id as u16);
             print_success!("  ext2 mounted at {} (on-demand)", mountpoint);
         }
         Err(e) => print_error!("mount: {:?}", e),

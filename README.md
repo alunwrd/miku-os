@@ -44,9 +44,15 @@ ELF dynamic linking, shared libraries, userspace processes, an init daemon (miku
 | **PIC** | PIC8259 (offset 32/40) |
 | **SSE** | CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1 |
 | **Heap** | 32 MB, linked list allocator |
-| **Syscall** | SYSCALL/SYSRET via MSR, naked asm handler, R8/R9/R10 preservation |
+| **Syscall** | SYSCALL/SYSRET via MSR, naked asm handler, R8/R9/R10 preservation (модульный: syscall/) |
 | **Signals** | SIGKILL (9), SIGTERM (15), SIGCHLD (17), 32-bit bitmask |
 | **Init** | mikuD (PID 1) - systemd-like service supervisor |
+| **ACPI** | RSDP/RSDT/XSDT parser, MADT enumeration (LAPIC + IOAPIC discovery) |
+| **APIC** | Local APIC + I/O APIC driver (replaces PIC8259) |
+| **SMP** | Multi-core bring-up: AP trampoline, per-CPU state (percpu), SIPI sequence |
+| **PS/2** | Keyboard controller initialization |
+| **USB** | USB legacy handoff (EHCI/xHCI BIOS release) |
+| **Splash** | Boot splash screen via framebuffer |
 
 ---
 
@@ -719,7 +725,7 @@ FD table is managed per-process (BTreeMap<pid, ProcessFds>).
 |:--|:--|
 | **RNG** | RDRAND-based CSPRNG for ClientHello random, CBC IV, ECDH private key, RSA padding (`random::random_u64`) |
 | **Timing (Lucky13)** | Constant-time MAC compare via OR-accumulator byte diff |
-| **Padding oracle** | Full RFC 5246 padding check — all pad bytes verified, not just the last |
+| **Padding oracle** | Full RFC 5246 padding check - all pad bytes verified, not just the last |
 | **ECDH timing leak** | `fe_cmov` / `jac_cmov` XOR-mask constant-time field/point select |
 | **Server impersonation** | TLS 1.2 server Finished `verify_data = PRF(master, "server finished", hs_hash)` checked constant-time |
 | **PKCS#1 padding** | RDRAND-sourced non-zero padding bytes (rejection loop) |
@@ -929,6 +935,26 @@ The immutable flag prevents unlink / write / rename.
 | `affinity <pid> <mask>` | Set CPU affinity mask |
 | `swaptest` | Stress-test the swap subsystem |
 
+#### NVIDIA GPU Commands
+
+| Command | Description |
+|:--|:--|
+| `nvidia` / `nvidia info` | GPU summary: PCI, chip, BAR0/1/3, PTIMER, MSI, scanout |
+| `nvidia debug` | Full BAR0 register dump (PMC, PBUS, PFIFO, PTOP, PTIMER) |
+| `nvidia firmware` | List embedded TU116 blobs с NVFW headers |
+| `nvidia falcon` | Per-engine liveness: SEC2, GSP, NVDEC, FECS, GPCCS0/1 |
+| `nvidia ungate` | Set PMC_ENABLE.GR + CE0 (bring up FECS / GPCCS / CE0) |
+| `nvidia pmc-scan` | Read-only sweep PMC area (0x000..0x1000) |
+| `nvidia dma-state` | Per-engine DMATRF register snapshot + IDLE/ERROR status |
+| `nvidia fbif-scan` | Sweep FBIF window (+0x500..+0xa00) per live engine |
+| `nvidia fbif-decode` | Decode all 8 TRANSCFG slots per live engine |
+| `nvidia dma-test` | End-to-end DMA loopback: sysmem -> SEC2 DMEM (256 B, CAFE pattern) |
+| `nvidia imem-test` | IMEM variant DMA loopback: sysmem -> SEC2 IMEM |
+| `nvidia acr-info` | Structural dump каждого SEC2 ACR blob (NVFW container + HS headers) |
+| `nvidia gsp` | GSP first-contact boot via `gsp::attempt_boot` |
+| `nvidia next` | Inspect live state, prescribe next driver bring-up step |
+| `nvidia splash` | Redraw boot splash via framebuffer |
+
 #### System Commands
 
 | Command | Description |
@@ -1001,6 +1027,123 @@ The immutable flag prevents unlink / write / rename.
 
 ---
 
+### NVIDIA GPU Driver
+
+<details>
+<summary><b>Expand</b></summary>
+
+#### Overview
+
+MikuOS includes a native driver for NVIDIA Turing-series GPUs (GTX 1650 / 1660).
+Written from scratch in Rust without `std`, uses MMIO over HHDM.
+
+> Turing is the first NVIDIA generation with a GSP (GPU System Processor) on an embedded RISC-V core
+> Without signed GSP firmware, most engines are unavailable.
+> The current driver covers host-side probe + Falcon engine management + DMA loopback
+
+#### Supported GPUs
+
+| Silicon | SKU | Device ID |
+|:--|:--|:--|
+| **TU117** | GTX 1650 GDDR5 / GDDR6, Mobile/Max-Q | 0x1F82..0x1FBA |
+| **TU116** | GTX 1650 SUPER, GTX 1660 / 1660 Ti / 1660 SUPER | 0x2182..0x21C4 |
+
+#### Module Structure (nvidia/)
+
+| Module | Description |
+|:--|:--|
+| **mod.rs** | Root: probe entry, driver registry, `ACTIVE_GTX1650` global handle |
+| **pci.rs** | PCI scan (class 0x03 + vendor 0x10DE), BAR sizing |
+| **mmio.rs** | MMIO primitives: volatile r/w over HHDM |
+| **chip.rs** | Chip identification via `PMC_BOOT_0` (arch / implementation / rev / stepping) |
+| **msi.rs** | PCI MSI / MSI-X capability walker |
+| **vbios.rs** | VBIOS image extraction from PCI expansion ROM |
+| **fb.rs** | Framebuffer: boot scanout detection, BAR index and offset |
+| **gtx1650/** | Main GTX 1650 / 1660 driver (TU117 + TU116) |
+
+#### GTX 1650 Driver (nvidia/gtx1650/)
+
+| Module | Description |
+|:--|:--|
+| **device.rs** | `Gtx1650` struct: BAR0/1/3, chip ID, caps, boot_fb, PTIMER |
+| **init.rs** | Initialization: BAR mapping, chip probe, MSI discovery, VBIOS extract, boot_fb detect |
+| **pmc.rs** | PMC register helpers: `PMC_ENABLE`, straps, PTIMER freq, `ungate_default_engines` |
+| **regs.rs** | Constants for all BAR0 registers (PMC, PBUS, PFIFO, PTOP, PTIMER) |
+| **falcon.rs** | Falcon engine abstraction: IMEM/DMEM r/w, liveness probe, DMA transfer (`Engine::dma_load`) |
+| **fbif.rs** | FBIF TRANSCFG / REGIONCFG: encode, decode, program aperture for DMA |
+| **dma_buf.rs** | `DmaBuffer`: physically contiguous buffer from PMM, write barrier |
+| **gsp.rs** | GSP first-contact boot (`attempt_boot`) |
+| **nvfw_hs.rs** | NVFW HS header / HS load header parser (ACR blob analysis) |
+| **tu116_fw.rs** | Embedded TU116 firmware bundle (compile-time `include_bytes!`) |
+| **tu116.rs** | TU116 SKU/device-id table and `model_name` |
+| **tu117.rs** | TU117 SKU/device-id table and `model_name` |
+
+#### Chip Architectures
+
+| Arch code | Family | Examples |
+|:--:|:--|:--|
+| 0x16 | Turing | TU102, TU104, TU106, TU116 (0x8), TU117 (0x7) |
+| 0x17 | Ampere | GA102, GA104 |
+| 0x19 | Ada Lovelace | AD102, AD104 |
+
+#### Falcon Engines
+
+| Engine | Base offset | Description |
+|:--|:--|:--|
+| **SEC2** | PSEC_BASE | Security engine: ACR boot, HS ucode upload |
+| **GSP** | PGSP_BASE | GPU System Processor (RISC-V) |
+| **NVDEC** | PNVDEC_BASE | Video decoder |
+| **FECS** | PFECS_BASE | Front-end context switch |
+| **GPCCS0/1** | PGPCCS_BASE | GPC context switch |
+
+Liveness states: `Alive`, `GatedPriSentinel`, `NoResponse`, `BadHwcfg`.
+
+#### DMA Path (SEC2 loopback)
+
+```
+1. DmaBuffer::alloc(pages) - physically contiguous pages from PMM
+2. Fill pattern (0xCAFE_xxxx) + write_barrier (sfence)
+3. Program SEC2 TRANSCFG[7]: NoncoherentSysmem + Physical addressing
+4. Set FBIF_CTL.ALLOW_PHYS_NO_CTX
+5. Engine::dma_load: sysmem -> SEC2 DMEM/IMEM (256 B chunk, ctxdma=7)
+6. PIO readback via FALCON_DMEM_C0/D0 (or IMEM_C0/D0)
+7. Pattern verification + TRANSCFG restore
+```
+
+#### Firmware Bundle (TU116)
+
+| Blob | Engine | Container |
+|:--|:--|:--|
+| acr/bl.bin | SEC2 | NVFW v1 |
+| acr/ucode_ahesasc.bin | SEC2 | NVFW v1 |
+| gsp/booter_load.bin | GSP | NVFW v1 |
+| gsp/booter_unload.bin | GSP | NVFW v1 |
+| nvdec/scrubber.bin | NVDEC | NVFW v1 |
+| fecs/ucode.bin | FECS | raw |
+| gpccs/ucode.bin | GPCCS | raw |
+
+All blobs are embedded into the kernel via `include_bytes!` at compile time.
+The GSP-RM image (`gsp_t.bin`) is **not** included - it requires nvidia-open-kernel-modules.
+
+#### Driver Bring-up Roadmap
+
+| Step | Status | Description |
+|:--:|:--:|:--|
+| 1 | done | PCI bind + BAR0 mapped |
+| 2 | done | Chip identification (PMC_BOOT_0) |
+| 3 | done | Firmware bundle embedded |
+| 4 | done | SEC2 / GSP falcon alive probe |
+| 5 | done | FBIF scan + TRANSCFG decode |
+| 6 | done | DMA loopback (DMEM + IMEM) |
+| 7 | - | SEC2 ACR boot (WPR setup) |
+| 8 | - | NVDEC scrubber pass |
+| 9 | - | GSP-RM staging + GSP RPC |
+| 10 | - | FECS/GPCCS contexts, PGRAPH usable |
+
+</details>
+
+---
+
 ## Build and Run
 
 ### Required Tools
@@ -1063,7 +1206,7 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
   <br>
   <sub>Author and sole developer of Miku OS</sub>
   <br>
-  <sub>Kernel - VFS - MikuFS - ELF - ld-miku - libmiku - Shell - Network - TLS - Scheduler - PMM - VMM - Swap - mikuD - Signals - fork/exec</sub>
+  <sub>Kernel - VFS - MikuFS - ELF - ld-miku - libmiku - Shell - Network - TLS - Scheduler - PMM - VMM - Swap - mikuD - Signals - fork/exec - ACPI - APIC - SMP - NVIDIA GPU Driver</sub>
 </div>
 
 ---
@@ -1079,6 +1222,12 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
 > The moment the ELF loader and dynamic linking worked, when "hello from dynamic linking!"
 > appeared on screen, I will never forget.
 > When libmiku passed all 1617 tests, it became clear that real programs can run on this OS.
+>
+> And then - NVIDIA. Writing a GPU driver from scratch, reading PMC_BOOT_0,
+> bringing up Falcon engines, implementing DMA loopback through SEC2 DMEM -
+> it felt like opening a black box with bare hands.
+> ACPI, APIC, SMP - the OS now understands its own hardware at a level
+> most people never see.
 
 <div align="center">
 

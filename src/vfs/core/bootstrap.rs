@@ -1,0 +1,313 @@
+// Root filesystem initialization and standard mounts:
+// devfs, procfs, /lib (system libraries), /mnt
+
+use super::MikuVFS;
+use crate::vfs::devfs;
+use crate::vfs::procfs;
+use crate::vfs::types::*;
+
+mod syslibs {
+    pub struct SysLib {
+        pub dir: &'static str,
+        pub name: &'static str,
+        pub data: &'static [u8],
+    }
+
+    pub static LIBS: &[SysLib] = &[SysLib {
+        dir: "lib",
+        name: "libmiku.so",
+        data: include_bytes!("../../lib/libmiku/libmiku.so"),
+    }];
+}
+
+impl MikuVFS {
+    pub(super) fn bootstrap(&mut self) {
+        self.nodes[0].init(
+            0,
+            INVALID_ID,
+            "/",
+            VNodeKind::Directory,
+            FsType::TmpFS,
+            FileMode::default_dir(),
+            0,
+            0,
+            self.now(),
+        );
+        self.nodes[0].parent = 0;
+        let _ = self.mounts.add(FsType::TmpFS, 0, INVALID_ID);
+
+        self.mount_devfs();
+        self.mount_procfs();
+        self.mount_syslibs();
+        self.create_mnt();
+    }
+
+    fn mount_syslibs(&mut self) {
+        crate::serial_println!("[vfs] mounting syslibs");
+
+        let mut files_created = 0u8;
+
+        for lib in syslibs::LIBS {
+            let dir_id = match self.lookup_or_create_lib_dir(lib.dir) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            if self.install_syslib_file(dir_id, lib).is_some() {
+                files_created += 1;
+            }
+        }
+
+        crate::serial_println!("[vfs] syslibs: {} files", files_created);
+    }
+
+    fn lookup_or_create_lib_dir(&mut self, dir_name: &str) -> Option<usize> {
+        let found = self.nodes[0]
+            .children
+            .find_by_name(dir_name)
+            .and_then(|id| {
+                let c = id as usize;
+                if c < MAX_VNODES && self.nodes[c].active {
+                    Some(c)
+                } else {
+                    None
+                }
+            });
+        if let Some(id) = found {
+            return Some(id);
+        }
+
+        let id = self.alloc_vnode().ok()?;
+        let ts = self.now();
+        self.nodes[id].init(
+            id as InodeId,
+            0,
+            dir_name,
+            VNodeKind::Directory,
+            FsType::TmpFS,
+            FileMode::new(0o755),
+            0,
+            0,
+            ts,
+        );
+        self.nodes[id].flags.immutable = true;
+        if !self.nodes[0].children.insert(dir_name, id as InodeId) {
+            self.nodes[id].active = false;
+            return None;
+        }
+        Some(id)
+    }
+
+    fn install_syslib_file(&mut self, dir_id: usize, lib: &syslibs::SysLib) -> Option<usize> {
+        let file_id = self.alloc_vnode().ok()?;
+        let ts = self.now();
+        self.nodes[file_id].init(
+            file_id as InodeId,
+            dir_id as InodeId,
+            lib.name,
+            VNodeKind::Regular,
+            FsType::TmpFS,
+            FileMode::new(0o555),
+            0,
+            0,
+            ts,
+        );
+
+        if !self.write_pages_from_slice(file_id, lib.data) {
+            crate::serial_println!("[vfs] syslib write failed: {}", lib.name);
+            self.nodes[file_id].active = false;
+            return None;
+        }
+
+        self.nodes[file_id].size = lib.data.len() as u64;
+        self.nodes[file_id].flags.immutable = true;
+
+        if !self.nodes[dir_id]
+            .children
+            .insert(lib.name, file_id as InodeId)
+        {
+            self.nodes[file_id].active = false;
+            return None;
+        }
+
+        crate::serial_println!(
+            "[vfs] syslib: /{}/{} vnode={} {} bytes (immutable)",
+            lib.dir,
+            lib.name,
+            file_id,
+            lib.data.len()
+        );
+        Some(file_id)
+    }
+
+    fn write_pages_from_slice(&mut self, file_id: usize, data: &[u8]) -> bool {
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let page_num = offset / PAGE_SIZE;
+            let page_off = offset % PAGE_SIZE;
+            let chunk = (PAGE_SIZE - page_off).min(data.len() - offset);
+
+            let pid = match self.nodes[file_id].addr_space.get_page(page_num) {
+                Some(pid) => pid,
+                None => {
+                    let pid = match self.page_cache.alloc_page() {
+                        Ok(pid) => pid,
+                        Err(_) => return false,
+                    };
+                    if self.nodes[file_id]
+                        .addr_space
+                        .set_page(page_num, pid)
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    pid
+                }
+            };
+
+            match self.page_cache.get_page_data_mut(pid) {
+                Some(page) => page[page_off..page_off + chunk]
+                    .copy_from_slice(&data[offset..offset + chunk]),
+                None => return false,
+            }
+            offset += chunk;
+        }
+        true
+    }
+
+    fn create_mnt(&mut self) {
+        let mnt_id = match self.alloc_vnode() {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+        self.nodes[mnt_id].init(
+            mnt_id as InodeId,
+            0,
+            "mnt",
+            VNodeKind::Directory,
+            FsType::TmpFS,
+            FileMode::default_dir(),
+            0,
+            0,
+            self.now(),
+        );
+        if self.nodes[0].children.insert("mnt", mnt_id as InodeId) {
+            crate::serial_println!("[vfs] /mnt created");
+        } else {
+            self.nodes[mnt_id].active = false;
+        }
+    }
+
+    fn mount_devfs(&mut self) {
+        crate::serial_println!("[vfs] mounting devfs");
+
+        let dev_id = match self.alloc_vnode() {
+            Ok(id) => id,
+            Err(e) => {
+                crate::serial_println!("[vfs] devfs alloc failed: {:?}", e);
+                return;
+            }
+        };
+
+        self.nodes[dev_id].init(
+            dev_id as InodeId,
+            0,
+            "dev",
+            VNodeKind::Directory,
+            FsType::DevFS,
+            FileMode::default_dir(),
+            0,
+            0,
+            self.now(),
+        );
+
+        if !self.nodes[0].children.insert("dev", dev_id as InodeId) {
+            self.nodes[dev_id].active = false;
+            return;
+        }
+
+        let _ = self.mounts.add(FsType::DevFS, dev_id as InodeId, 0);
+
+        let mut count = 0u8;
+        for &(name, dev_type) in devfs::DEV_ENTRIES {
+            if let Ok(id) = self.alloc_vnode() {
+                self.nodes[id].init(
+                    id as InodeId,
+                    dev_id as InodeId,
+                    name,
+                    VNodeKind::CharDevice,
+                    FsType::DevFS,
+                    FileMode::default_dev(),
+                    0,
+                    0,
+                    self.now(),
+                );
+                self.nodes[id].dev_major = dev_type.major();
+                self.nodes[id].dev_minor = dev_type.minor();
+
+                if self.nodes[dev_id].children.insert(name, id as InodeId) {
+                    count += 1;
+                } else {
+                    self.nodes[id].active = false;
+                }
+            }
+        }
+
+        crate::serial_println!("[vfs] devfs: {} devices mounted at /dev", count);
+    }
+
+    fn mount_procfs(&mut self) {
+        crate::serial_println!("[vfs] mounting procfs");
+
+        let proc_id = match self.alloc_vnode() {
+            Ok(id) => id,
+            Err(e) => {
+                crate::serial_println!("[vfs] procfs alloc failed: {:?}", e);
+                return;
+            }
+        };
+
+        self.nodes[proc_id].init(
+            proc_id as InodeId,
+            0,
+            "proc",
+            VNodeKind::Directory,
+            FsType::ProcFS,
+            FileMode::default_dir(),
+            0,
+            0,
+            self.now(),
+        );
+
+        if !self.nodes[0].children.insert("proc", proc_id as InodeId) {
+            self.nodes[proc_id].active = false;
+            return;
+        }
+
+        let _ = self.mounts.add(FsType::ProcFS, proc_id as InodeId, 0);
+
+        let mut count = 0u8;
+        for &name in procfs::PROC_ENTRIES {
+            if let Ok(id) = self.alloc_vnode() {
+                self.nodes[id].init(
+                    id as InodeId,
+                    proc_id as InodeId,
+                    name,
+                    VNodeKind::Regular,
+                    FsType::ProcFS,
+                    FileMode(0o444),
+                    0,
+                    0,
+                    self.now(),
+                );
+                if self.nodes[proc_id].children.insert(name, id as InodeId) {
+                    count += 1;
+                } else {
+                    self.nodes[id].active = false;
+                }
+            }
+        }
+
+        crate::serial_println!("[vfs] procfs: {} entries mounted at /proc", count);
+    }
+}

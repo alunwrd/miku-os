@@ -9,6 +9,7 @@ const DHCP_ACK: u8 = 5;
 
 const DHCP_MAGIC: [u8; 4] = [99, 130, 83, 99];
 
+const OPT_REQUESTED_IP: u8 = 50; // RFC 2131: MUST be present in REQUEST (SELECTING state)
 const OPT_SUBNET: u8 = 1;
 const OPT_ROUTER: u8 = 3;
 const OPT_DNS: u8 = 6;
@@ -32,6 +33,7 @@ fn build_packet(
     mac: &[u8; 6],
     ciaddr: &[u8; 4],
     server_ip: Option<&[u8; 4]>,
+    requested_ip: Option<&[u8; 4]>,
     out: &mut [u8; 548],
 ) -> usize {
     out[0] = 1;
@@ -42,7 +44,10 @@ fn build_packet(
     out[5] = (xid >> 16) as u8;
     out[6] = (xid >> 8) as u8;
     out[7] = xid as u8;
-    out[8..12].fill(0);
+    // secs=0; flags bit15=1 (broadcast) so server broadcasts all replies -
+    // required when ciaddr=0 and our IP stack cannot yet accept unicast to yiaddr
+    out[8] = 0; out[9] = 0;   // secs
+    out[10] = 0x80; out[11] = 0x00; // flags: broadcast bit set
     out[12..16].copy_from_slice(ciaddr);
     out[16..20].fill(0);
     out[20..24].fill(0);
@@ -58,10 +63,19 @@ fn build_packet(
     out[pos + 2] = msg_type;
     pos += 3;
 
+    // RFC 2131 §4.3.2: DHCP REQUEST in SELECTING state MUST include option 54
+    // (server identifier) and option 50 (requested IP address = yiaddr from OFFER)
     if let Some(srv) = server_ip {
         out[pos] = OPT_SERVER;
         out[pos + 1] = 4;
         out[pos + 2..pos + 6].copy_from_slice(srv);
+        pos += 6;
+    }
+
+    if let Some(req) = requested_ip {
+        out[pos] = OPT_REQUESTED_IP;
+        out[pos + 1] = 4;
+        out[pos + 2..pos + 6].copy_from_slice(req);
         pos += 6;
     }
 
@@ -148,22 +162,58 @@ pub fn do_dhcp() -> Option<DhcpResult> {
     let src_ip = [0u8; 4];
 
     let mut dhcp_buf = [0u8; 548];
-    let dhcp_len = build_packet(DHCP_DISCOVER, xid, &mac, &zero_ip, None, &mut dhcp_buf);
+    let dhcp_len = build_packet(DHCP_DISCOVER, xid, &mac, &zero_ip, None, None, &mut dhcp_buf);
 
-    let offer = send_and_recv(
-        &src_ip, &bcast_ip, &mac, &BROADCAST_MAC,
-        &dhcp_buf[..dhcp_len], xid, 100,
-    )?;
+    // Retry DISCOVER up to 4 times. On real hardware the PHY may have only
+    // just finished auto-negotiation when the user types dhcp, and the
+    // first frame can race the link state and hit the floor. Each attempt
+    // waits +_4s (1000 ticks at 250Hz) which is enough headroom for a typical
+    // home router with ARP+OFFER latency
+    crate::serial_println!(
+        "[dhcp] start xid={:#x} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        xid, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
+
+    let mut offer: Option<DhcpResult> = None;
+    for attempt in 1..=4u32 {
+        crate::serial_println!("[dhcp] DISCOVER {}/4", attempt);
+        if let Some(o) = send_and_recv(
+            &src_ip, &bcast_ip, &mac, &BROADCAST_MAC,
+            &dhcp_buf[..dhcp_len], xid, 1000,
+        ) {
+            offer = Some(o);
+            break;
+        }
+        crate::serial_println!("[dhcp] discover {}/4 timeout", attempt);
+    }
+    let offer = offer?;
 
     let server = offer.server;
-    let _offered_ip = offer.ip;
+    crate::serial_println!(
+        "[dhcp] offer ip={}.{}.{}.{} server={}.{}.{}.{}",
+        offer.ip[0], offer.ip[1], offer.ip[2], offer.ip[3],
+        server[0], server[1], server[2], server[3]
+    );
 
-    let dhcp_len = build_packet(DHCP_REQUEST, xid, &mac, &zero_ip, Some(&server), &mut dhcp_buf);
+    let offered_ip = offer.ip;
+    let dhcp_len = build_packet(DHCP_REQUEST, xid, &mac, &zero_ip, Some(&server), Some(&offered_ip), &mut dhcp_buf);
 
-    let ack = send_and_recv(
-        &src_ip, &bcast_ip, &mac, &BROADCAST_MAC,
-        &dhcp_buf[..dhcp_len], xid, 100,
-    )?;
+    let mut ack: Option<DhcpResult> = None;
+    for attempt in 1..=4u32 {
+        crate::serial_println!("[dhcp] request {}/4", attempt);
+        if let Some(a) = send_and_recv(
+            &src_ip, &bcast_ip, &mac, &BROADCAST_MAC,
+            &dhcp_buf[..dhcp_len], xid, 1000,
+        ) {
+            ack = Some(a);
+            break;
+        }
+    }
+    let ack = ack?;
+    crate::serial_println!(
+        "[dhcp] ACK ip={}.{}.{}.{}",
+        ack.ip[0], ack.ip[1], ack.ip[2], ack.ip[3]
+    );
 
     Some(ack)
 }
@@ -197,8 +247,14 @@ fn send_and_recv(
 
     {
         let mut state = super::NET.lock();
+        let mut sent_ok = false;
         if let Some(drv) = state.driver.as_mut() {
-            drv.send(&eth_buf[..eth_len]);
+            sent_ok = drv.send(&eth_buf[..eth_len]);
+        }
+        if sent_ok {
+            state.tx_count += 1;
+        } else {
+            crate::serial_println!("[dhcp] driver send returned false (TX queue busy?)");
         }
     }
 

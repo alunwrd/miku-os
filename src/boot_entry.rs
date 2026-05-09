@@ -14,7 +14,7 @@ _mb2_hdr_start:
     .long  20
     .long  0
     .long  0
-    .long  32
+    .long  0
     .align 8
     .short 0
     .short 0

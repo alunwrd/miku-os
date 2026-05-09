@@ -3,7 +3,7 @@ use std::path::Path;
 fn main() {
     let font_path = Path::new("assets/JetBrainsMono-Regular.ttf");
     if !font_path.exists() {
-        println!("cargo:warning=JetBrainsMono not found, using fallback");
+        println!("cargo:warning=JetBrainsMono-Regular.ttf not found, using fallback");
         generate_empty_font();
         return;
     }

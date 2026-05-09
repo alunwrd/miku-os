@@ -54,6 +54,16 @@ mod reloc;
 mod vfs_read;
 pub mod signal;
 pub mod mikud;
+pub mod acpi;
+pub mod apic;
+pub mod percpu;
+pub mod smp;
+pub mod nvidia;
+pub mod splash;
+pub mod usb_handoff;
+pub mod firmware;
+pub mod firmware_probe;
+pub mod ps2;
 
 unsafe extern "C" {
     static _kernel_end: u8;
@@ -71,7 +81,7 @@ unsafe extern "C" fn kernel_main_grub(mb2_phys: u64) -> ! {
 }
 
 fn kernel_main() -> ! {
-    serial_println!("[kern] MikuOS starting (Release v0.2.0)");
+    serial_println!("[kern] MikuOS starting (Release v0.2.1-rc)");
     gdt::init();
     unsafe {
         let cr0: u64;
@@ -84,8 +94,6 @@ fn kernel_main() -> ! {
     serial_println!("[sse] enabled (CR0.EM=0 CR0.MP=1 CR4.OSFXSR=1 CR4.OSXMMEXCPT=1)");
     syscall::init();
     interrupts::init_idt();
-    interrupts::init_pics();
-    interrupts::init_pit();
     allocator::init();
     scheduler::reinit_scheduler();
     grub::set_kernel_address(
@@ -112,22 +120,103 @@ fn kernel_main() -> ! {
     serial_println!("[kern] _kernel_end phys={:#x} ({}MB)", kend_aligned, kend_aligned / 1024 / 1024);
 
     pmm::reserve_region(0x0, 0x6000);
+    // Reserve AP trampoline page (used once by smp::start_aps, never returned to pool)
+    pmm::reserve_region(0x8000, 0x9000);
     pmm::reserve_region(grub::KERNEL_PHYS, kend_aligned);
 
     boot_step!("Physical memory manager", Ok(()));
+    boot_step!("ACPI (RSDP/MADT)",         acpi::init());
+    boot_step!("APIC", apic::init_bsp());
+    boot_step!("IO-APIC",                  apic::ioapic_init());
+    apic::init_timer(apic::TIMER_HZ_DEFAULT);
+    boot_step!("LAPIC timer",              Ok(()));
+    let bsp_lapic = apic::lapic_id();
+    let _ = apic::set_irq(1,  apic::VEC_KEYBOARD, bsp_lapic);  // keyboard
+    let _ = apic::set_irq(14, apic::VEC_ATA_PRI,  bsp_lapic);
+    let _ = apic::set_irq(15, apic::VEC_ATA_SEC,  bsp_lapic);
+    boot_step!("IRQ routing", Ok(()));
     boot_step!("Virtual file system",       vfs::core::init_vfs());
     crate::solib::init();
     crate::solib::preload("libmiku.so", crate::ldso::LIBMIKU_BYTES.to_vec());
     crate::solib::ldconfig();
     boot_step!("Shared library cache",      Ok(()));
     boot_step!("Network subsystem",         net::init());
+    boot_step!("NVIDIA GPU probe",          nvidia::init());
     scheduler::init_main_thread();
     scheduler::init_workers(4);
     boot_step!("Scheduler (4 workers)",   Ok(()));
+    boot_step!("Firmware SMI silence",    { firmware::run(); Ok::<(), &'static str>(()) });
+
+    let _ = firmware_probe::dump;
+
+    apic::mask_all_lvt();
+    unsafe {
+        apic::lapic_write(apic::LAPIC_LVT_TIMER, (1 << 16) | apic::VEC_SPURIOUS as u32);
+        apic::lapic_write(apic::LAPIC_INIT_CNT, 0);
+        apic::lapic_write(apic::LAPIC_TPR, 0);
+        let svr = apic::lapic_read(apic::LAPIC_SVR);
+        if svr & 0x100 == 0 {
+            apic::lapic_write(apic::LAPIC_SVR, 0x100 | apic::VEC_SPURIOUS as u32);
+        }
+        for _ in 0..16 {
+            apic::lapic_write(apic::LAPIC_EOI, 0);
+        }
+    }
+
+    let _ = apic::set_irq(1,  apic::VEC_KEYBOARD, apic::lapic_id());
+    let _ = apic::set_irq(14, apic::VEC_ATA_PRI,  apic::lapic_id());
+    let _ = apic::set_irq(15, apic::VEC_ATA_SEC,  apic::lapic_id());
+
+    boot_step!("PS/2 keyboard", ps2::init());
+
+    let saved_tpr: u32;
+    let saved_svr: u32;
+    unsafe {
+        saved_tpr = apic::lapic_read(apic::LAPIC_TPR);
+        saved_svr = apic::lapic_read(apic::LAPIC_SVR);
+        apic::lapic_write(apic::LAPIC_TPR, 0xFF);
+        apic::lapic_write(apic::LAPIC_SVR, saved_svr & !0x100);
+        for _ in 0..16 {
+            apic::lapic_write(apic::LAPIC_EOI, 0);
+        }
+    }
+    crate::interrupts::pixel_mark(4, 255, 0, 0);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+    unsafe {
+        use x86_64::instructions::port::Port;
+        Port::<u8>::new(0x70).write(0x80);
+        let _ = Port::<u8>::new(0x71).read();
+    }
+    crate::interrupts::pixel_mark(15, 255, 255, 0);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     x86_64::instructions::interrupts::enable();
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    crate::interrupts::pixel_mark(5, 0, 255, 0);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    x86_64::instructions::interrupts::disable();
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    crate::interrupts::pixel_mark(7, 0, 80, 220);
+
+    unsafe {
+        apic::lapic_write(apic::LAPIC_SVR, saved_svr | 0x100);
+        apic::lapic_write(apic::LAPIC_TPR, saved_tpr);
+    }
+    crate::interrupts::pixel_mark(8, 220, 220, 0);
+
+    unsafe {
+        let ticks = apic::bsp_ticks_per_hz().max(10_000);
+        apic::lapic_write(apic::LAPIC_INIT_CNT, ticks);
+        apic::lapic_write(apic::LAPIC_LVT_TIMER, (1 << 17) | apic::VEC_TIMER as u32);
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    x86_64::instructions::interrupts::enable();
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     boot_step!("Interrupts",              Ok(()));
     timing::calibrate();
     boot_step!("Timer calibration",       Ok(()));
+    smp::start_aps();
+    boot_step!("SMP (AP bringup)",         Ok(()));
     // Register services with mikuD
     {
         let mut svc = mikud::Service::empty();
@@ -165,7 +254,13 @@ fn kernel_main() -> ! {
     shell::init();
 
     boot::mark_done();
+    // BSP becomes the idle thread. Timer ISR does not preempt (see
+    // comment in interrupts.rs::timer_interrupt_handler), so we MUST
+    // cooperatively yield each loop iteration - otherwise no other
+    // spawned thread (mikud, workers, kbd_thread, shell_thread) ever
+    // gets the CPU, and the system "boots" to a frozen prompt
     loop {
+        scheduler::yield_now();
         x86_64::instructions::interrupts::enable_and_hlt();
     }
 }
@@ -208,6 +303,7 @@ fn init_framebuffer() {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     x86_64::instructions::interrupts::disable();
+    apic::broadcast_halt();
     serial_println!("[panic] {}", info);
     crate::cprintln!(255, 50, 50, "kernel panic: {}", info);
     loop { x86_64::instructions::hlt(); }

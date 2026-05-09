@@ -110,6 +110,13 @@ impl Process {
         })
     }
 
+    pub fn new_idle_ap(cr3: u64, tick: u64, name: &'static str) -> Box<Self> {
+        let mut idle = Self::new_idle(cr3, tick);
+        idle.pid = NEXT_PID.fetch_add(1, Ordering::SeqCst);
+        idle.name = name;
+        idle
+    }
+
     pub fn new_idle(cr3: u64, tick: u64) -> Box<Self> {
         let stack = vec![0u8; DEFAULT_STACK_SIZE].into_boxed_slice();
         Box::new(Self {

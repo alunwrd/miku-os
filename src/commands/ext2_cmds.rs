@@ -47,7 +47,14 @@ struct ExtFsState {
     drive_idx:   [usize; MAX_MOUNTS],
     start_lba:   [u32; MAX_MOUNTS],
     active_slot: usize,
+    /// VFS vnode id of each slot's mountpoint, or INVALID_VNODE when the
+    /// slot is mounted at the disk layer but not yet attached to the VFS via
+    /// mount. Lets us umount a specific path instead of always tearing
+    /// down active_slot.
+    mount_vnode: [u16; MAX_MOUNTS],
 }
+
+const INVALID_VNODE: u16 = u16::MAX;
 
 impl ExtFsState {
     const fn new() -> Self {
@@ -57,6 +64,7 @@ impl ExtFsState {
             drive_idx:   [0; MAX_MOUNTS],
             start_lba:   [0; MAX_MOUNTS],
             active_slot: 0,
+            mount_vnode: [INVALID_VNODE; MAX_MOUNTS],
         }
     }
 
@@ -91,6 +99,10 @@ where
 pub fn is_ext2_ready() -> bool {
     let state = STATE.lock();
     state.ready[state.active_slot]
+}
+
+pub fn active_slot_index() -> usize {
+    STATE.lock().active_slot
 }
 
 pub fn active_fs_type() -> crate::vfs::types::FsType {
@@ -161,8 +173,79 @@ pub fn force_unmount() {
     state.ready[slot] = false;
     state.slots[slot].block_cache = None;
     state.slots[slot].journal_inode_cached = None;
+    state.mount_vnode[slot] = INVALID_VNODE;
     drop(state);
     invalidate_vfs_ext_mounts();
+}
+
+/// Record which VFS vnode is the root of slot's mount. Called by the
+/// mount shell command after it grafts an ext-family slot onto a VFS
+/// directory.
+pub fn register_mount_vnode(slot: usize, vnode: u16) {
+    if slot >= MAX_MOUNTS { return; }
+    let mut state = STATE.lock();
+    state.mount_vnode[slot] = vnode;
+}
+
+/// Reverse lookup: given a VFS vnode id, return the ext slot whose mount
+/// root is that vnode, or None if the vnode is not a known mountpoint
+pub fn slot_for_vnode(vnode: u16) -> Option<usize> {
+    let state = STATE.lock();
+    for s in 0..MAX_MOUNTS {
+        if state.ready[s] && state.mount_vnode[s] == vnode {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Tear down a specific ext slot. Unlike force_unmount (which always
+/// targets active_slot), this lets umount <path> drop only the slot
+/// owning that path, leaving any sibling mounts intact
+///
+/// Caller must already have evicted the corresponding VFS subtree
+pub fn unmount_slot(slot: usize) {
+    if slot >= MAX_MOUNTS { return; }
+    let mut state = STATE.lock();
+    if !state.ready[slot] { return; }
+
+    let _ = state.slots[slot].sync();
+    state.slots[slot].mark_clean_unmount();
+    let _ = state.slots[slot].flush_all_dirty_metadata();
+    state.ready[slot] = false;
+    state.slots[slot].block_cache = None;
+    state.slots[slot].journal_inode_cached = None;
+    state.mount_vnode[slot] = INVALID_VNODE;
+
+    // If we just dropped the active slot, fail over to any other ready slot
+    // so subsequent ext commands keep working without an explicit fs.select
+    if state.active_slot == slot {
+        for s in 0..MAX_MOUNTS {
+            if state.ready[s] {
+                state.active_slot = s;
+                break;
+            }
+        }
+    }
+}
+
+/// Snapshot every ext slot that currently has a VFS mount attached
+/// Returns up to MAX_MOUNTS (slot, vnode_id, fs_version_tag) tuples;
+/// slots that are mounted at the disk layer but not yet grafted onto the
+/// VFS are skipped
+pub fn mounted_slots_snapshot() -> [Option<(usize, u16, &'static str)>; MAX_MOUNTS] {
+    let mut out: [Option<(usize, u16, &'static str)>; MAX_MOUNTS] = [None; MAX_MOUNTS];
+    let state = STATE.lock();
+    for s in 0..MAX_MOUNTS {
+        if state.ready[s] && state.mount_vnode[s] != INVALID_VNODE {
+            out[s] = Some((
+                s,
+                state.mount_vnode[s],
+                state.slots[s].superblock.fs_version_str(),
+            ));
+        }
+    }
+    out
 }
 
 pub fn cmd_fs_list() {
@@ -235,6 +318,7 @@ pub fn cmd_fs_umount(args: &str) {
     state.ready[slot] = false;
     state.slots[slot].block_cache = None;
     state.slots[slot].journal_inode_cached = None;
+    state.mount_vnode[slot] = INVALID_VNODE;
     print_success!("  slot {} unmounted", slot);
     if state.active_slot == slot {
         let other = 1 - slot;
@@ -293,6 +377,7 @@ pub fn invalidate_drive_mounts(drive_idx: usize, start_lba: u32) {
             state.ready[i] = false;
             state.slots[i].block_cache = None;
             state.slots[i].journal_inode_cached = None;
+            state.mount_vnode[i] = INVALID_VNODE;
             invalidated_any = true;
             serial_println!(
                 "[miku_extfs] slot {} invalidated (drive {} lba {} reformatted)",
@@ -307,6 +392,44 @@ pub fn invalidate_drive_mounts(drive_idx: usize, start_lba: u32) {
     }
 }
 
+struct ExtProbe {
+    drive: usize,
+    block_size: u32,
+    fs_version: &'static str,
+}
+
+fn probe_drive(drive_index: usize, start_lba: u32) -> Option<ExtProbe> {
+    let drive = make_ata_drive(drive_index);
+    let mut reader = DiskReader::new_partitioned(drive, start_lba);
+    let mut sector = [0u8; 512];
+    if reader.read_sector(2, &mut sector).is_err() {
+        return None;
+    }
+    let magic_lo = u16::from_le_bytes([sector[56], sector[57]]);
+    if magic_lo != EXT2_MAGIC {
+        return None;
+    }
+    let log_bs = u32::from_le_bytes([sector[24], sector[25], sector[26], sector[27]]);
+    if log_bs > 6 {
+        return None;
+    }
+    let block_size = 1024u32 << log_bs;
+
+    let mut sector2 = [0u8; 512];
+    if reader.read_sector(3, &mut sector2).is_err() {
+        return None;
+    }
+    let mut sb = Superblock { data: [0u8; 1024] };
+    sb.data[0..512].copy_from_slice(&sector);
+    sb.data[512..1024].copy_from_slice(&sector2);
+
+    Some(ExtProbe {
+        drive: drive_index,
+        block_size,
+        fs_version: sb.fs_version_str(),
+    })
+}
+
 pub fn cmd_ext2_mount(args: &str) {
     let mut parts = args.split_whitespace();
     let drive_str = parts.next().unwrap_or("");
@@ -314,15 +437,49 @@ pub fn cmd_ext2_mount(args: &str) {
 
     if drive_str.is_empty() {
         serial_println!("[miku_extfs] scanning all drives...");
-        for &i in &[2usize, 1, 3, 0] {
+
+        let mut candidates: alloc::vec::Vec<ExtProbe> = alloc::vec::Vec::new();
+        let mut already_mounted: Option<usize> = None;
+
+        for i in 0..4usize {
             if STATE.lock().is_already_mounted(i, 0) {
-                serial_println!("[miku_extfs] drive {} lba 0 - already mounted, skip", i);
+                already_mounted = Some(i);
                 continue;
             }
-            serial_println!("[miku_extfs] trying drive {} ...", i);
-            if try_mount(i, 0) { return; }
+            if let Some(probe) = probe_drive(i, 0) {
+                serial_println!(
+                    "[miku_extfs] drive {} - {} candidate (block={})",
+                    probe.drive, probe.fs_version, probe.block_size
+                );
+                candidates.push(probe);
+            }
         }
-        print_error!("  no extfs found on any drive");
+
+        match candidates.len() {
+            0 => {
+                if let Some(d) = already_mounted {
+                    print_success!("  drive {} already mounted (use fs.list)", d);
+                } else {
+                    print_error!("  no extfs found on any drive");
+                }
+            }
+            1 => {
+                let d = candidates[0].drive;
+                if !try_mount(d, 0) {
+                    print_error!("  failed to mount ext on drive {}", d);
+                }
+            }
+            _ => {
+                print_error!("  multiple ext filesystems found:");
+                for c in &candidates {
+                    println!(
+                        "    drive {}: {} ({} byte blocks)",
+                        c.drive, c.fs_version, c.block_size
+                    );
+                }
+                println!("  specify explicitly: ext4mount <drive>");
+            }
+        }
         return;
     }
 
@@ -857,83 +1014,6 @@ pub fn cmd_ext2_hardlink(existing: &str, linkname: &str) {
     }
 }
 
-pub fn cmd_ext3_info() {
-    let result = with_ext2(|fs| fs.scan_journal());
-    match result {
-        Some(Ok(info)) => {
-            if !info.valid { print_error!("  no journal found"); return; }
-            cprintln!(57, 197, 187, "  ext3 Journal Info");
-            println!("  Version:    {}", if info.version == 2 { "JBD2" } else { "JBD1" });
-            println!("  Block size: {} bytes", info.block_size);
-            println!("  Total:      {} blocks", info.total_blocks);
-            println!("  Size:       {} KB", info.journal_size / 1024);
-            println!("  First:      block {}", info.first_block);
-            println!("  Sequence:   {}", info.sequence);
-            println!("  Start:      {}", info.start);
-            if info.clean { print_success!("  Status:     clean"); }
-            else { print_error!("  Status:     dirty ({} transactions)", info.transaction_count); }
-            if info.errno != 0 { print_error!("  Errno:      {}", info.errno); }
-        }
-        Some(Err(FsError::NoJournal)) => print_error!("  no journal"),
-        Some(Err(e)) => print_error!("  ext3info: {:?}", e),
-        None => print_error!("  ext2 not mounted"),
-    }
-}
-
-pub fn cmd_ext3_journal() {
-    let result = with_ext2(|fs| fs.scan_journal());
-    match result {
-        Some(Ok(info)) => {
-            if !info.valid { print_error!("  no journal found"); return; }
-            if info.clean { print_success!("  journal is clean"); return; }
-            cprintln!(57, 197, 187, "  Journal Transactions ({}):", info.transaction_count);
-            for i in 0..info.transaction_count {
-                let tx = &info.transactions[i];
-                if !tx.active { continue; }
-                if tx.committed {
-                    cprintln!(100, 220, 150, "  {:>6}  {:>8}  {:>6}  committed", tx.sequence, tx.start_block, tx.data_blocks);
-                } else {
-                    cprintln!(255, 50, 50, "  {:>6}  {:>8}  {:>6}  incomplete", tx.sequence, tx.start_block, tx.data_blocks);
-                }
-            }
-        }
-        Some(Err(FsError::NoJournal)) => print_error!("  no journal"),
-        Some(Err(e)) => print_error!("  ext3journal: {:?}", e),
-        None => print_error!("  ext2 not mounted"),
-    }
-}
-
-pub fn cmd_ext3_mkjournal() {
-    let result = with_ext2(|fs| -> Result<(), FsError> { fs.ext3_create_journal(DEFAULT_JOURNAL_BLOCKS) });
-    match result {
-        Some(Ok(())) => print_success!("  ext3 journal created ({} blocks)", DEFAULT_JOURNAL_BLOCKS),
-        Some(Err(FsError::AlreadyExists)) => print_error!("  journal already exists"),
-        Some(Err(e)) => print_error!("  ext3mkjournal: {:?}", e),
-        None => print_error!("  ext2 not mounted"),
-    }
-}
-
-pub fn cmd_ext3_clean() {
-    let result = with_ext2(|fs| fs.ext3_clean_journal());
-    match result {
-        Some(Ok(())) => print_success!("  journal marked clean"),
-        Some(Err(FsError::NoJournal)) => print_error!("  no journal found"),
-        Some(Err(e)) => print_error!("  ext3clean: {:?}", e),
-        None => print_error!("  ext2 not mounted"),
-    }
-}
-
-pub fn cmd_ext3_recover() {
-    let result = with_ext2(|fs| fs.ext3_recover());
-    match result {
-        Some(Ok(0)) => print_success!("  no recovery needed"),
-        Some(Ok(n)) => print_success!("  recovered {} blocks", n),
-        Some(Err(FsError::NoJournal)) => print_error!("  no journal found"),
-        Some(Err(e)) => print_error!("  ext3recover: {:?}", e),
-        None => print_error!("  ext2 not mounted"),
-    }
-}
-
 pub fn cmd_ext2_cache() {
     let result = with_ext2(|fs| match &fs.block_cache {
         Some(c) => {
@@ -960,265 +1040,4 @@ pub fn cmd_ext2_cache_flush() {
         }
     });
     if result.is_none() { print_error!("  ext2 not mounted"); }
-}
-
-pub fn cmd_ext4_info() {
-    let result = with_ext2(|fs| {
-        let info = fs.fs_info();
-        cprintln!(57, 197, 187, "  ext4 Filesystem Info");
-        println!("  Version:   {}", info.version);
-        println!("  Extents:   {}", if info.has_extents { "enabled" } else { "disabled" });
-        println!("  Journal:   {}", if info.has_journal { "enabled" } else { "disabled" });
-        println!("  64bit:     {}", if fs.superblock.has_64bit() { "yes" } else { "no" });
-        println!("  Checksums: {}", if fs.superblock.has_metadata_csum() { "crc32c" } else { "none" });
-        println!("  Flex BG:   {}", if fs.superblock.has_flex_bg() { "yes" } else { "no" });
-        if fs.superblock.has_metadata_csum() {
-            let sb_ok = fs.verify_superblock_csum();
-            if sb_ok { print_success!("  SB csum:   valid"); }
-            else { print_error!("  SB csum:   invalid"); }
-        }
-    });
-    if result.is_none() { print_error!("  ext2 not mounted"); }
-}
-
-pub fn cmd_ext4_enable_extents() {
-    let result = with_ext2(|fs| -> Result<(), FsError> { fs.enable_extents_feature() });
-    match result {
-        Some(Ok(())) => print_success!("  extents enabled"),
-        Some(Err(e)) => print_error!("  ext4extents: {:?}", e),
-        None         => print_error!("  ext2 not mounted"),
-    }
-}
-
-pub fn cmd_ext4_checksums() {
-    let result = with_ext2(|fs| {
-        cprintln!(57, 197, 187, "  Checksum Verification");
-        let sb_ok = fs.verify_superblock_csum();
-        println!("  Superblock: {}", if sb_ok { "ok" } else { "fail" });
-        let gc = fs.group_count as usize;
-        let (mut gd_ok, mut gd_fail) = (0u32, 0u32);
-        let (mut bb_ok, mut bb_fail) = (0u32, 0u32);
-        let (mut ib_ok, mut ib_fail) = (0u32, 0u32);
-        for g in 0..gc.min(32) {
-            if fs.verify_group_desc_csum(g) { gd_ok += 1; } else { gd_fail += 1; }
-            if fs.verify_block_bitmap_csum(g) { bb_ok += 1; } else { bb_fail += 1; }
-            if fs.verify_inode_bitmap_csum(g) { ib_ok += 1; } else { ib_fail += 1; }
-        }
-        println!("  Group descs:   {} ok, {} fail", gd_ok, gd_fail);
-        println!("  Block bitmaps: {} ok, {} fail", bb_ok, bb_fail);
-        println!("  Inode bitmaps: {} ok, {} fail", ib_ok, ib_fail);
-        let (mut ino_ok, mut ino_fail) = (0u32, 0u32);
-        let max_check = fs.superblock.inodes_count().min(64);
-        for ino in 1..=max_check {
-            if let Ok(inode) = fs.read_inode(ino) {
-                if inode.mode() != 0 {
-                    if fs.verify_inode_csum(ino, &inode) { ino_ok += 1; } else { ino_fail += 1; }
-                }
-            }
-        }
-        println!("  Inodes (first {}): {} ok, {} fail", max_check, ino_ok, ino_fail);
-    });
-    if result.is_none() { print_error!("  ext2 not mounted"); }
-}
-
-pub fn cmd_ext4_extent_info(path: &str) {
-    if path.is_empty() { println!("Usage: ext4extinfo <path>"); return; }
-    let result = with_ext2(|fs| -> Result<(), FsError> {
-        let ino = fs.resolve_path(path)?;
-        let inode = fs.read_inode(ino)?;
-        if !inode.uses_extents() {
-            println!("  inode {} does not use extents (indirect blocks)", ino);
-            return Ok(());
-        }
-        let header = inode.extent_header();
-        println!("  Inode: {}", ino);
-        println!("  Extent tree depth: {}", header.depth);
-        println!("  Entries: {} / {}", header.entries, header.max);
-        let count = fs.ext4_extent_count(&inode)?;
-        println!("  Total extents: {}", count);
-        if header.depth == 0 {
-            for i in 0..header.entries as usize {
-                let ext = inode.extent_at(i);
-                println!("    [{}] logical={} len={} phys={}", i, ext.block, ext.actual_len(), ext.start());
-            }
-        }
-        Ok(())
-    });
-    match result {
-        Some(Ok(())) => {}
-        Some(Err(e)) => print_error!("  ext4extinfo: {:?}", e),
-        None         => print_error!("  ext2 not mounted"),
-    }
-}
-
-pub fn cmd_ext4_write(path: &str, text: &str) {
-    if path.is_empty() || text.is_empty() { println!("Usage: ext4write <path> <text>"); return; }
-    let disk_sw = crate::timing::Stopwatch::start();
-    let result = with_ext2_pub(|fs| -> Result<u32, FsError> {
-        let (parent_ino, filename) = resolve_parent_and_name(fs, path)?;
-        fs.ext3_write_file_create_or_overwrite(parent_ino, filename, 0o644, text.as_bytes())
-    });
-    let disk_ms = disk_sw.elapsed_ms();
-    let render_sw = crate::timing::Stopwatch::start();
-    match result {
-        Some(Ok(ino)) => print_success!("  [ext4] written to inode {} (extents+journal)  [disk {}ms]", ino, disk_ms),
-        Some(Err(e))  => print_error!("  ext4write: {:?}", e),
-        None          => print_error!("  not mounted"),
-    }
-    let render_us = render_sw.elapsed_us();
-    crate::serial_println!("[timing] ext4write disk={}ms render={}us", disk_ms, render_us);
-}
-
-pub fn cmd_fiemap(path: &str) {
-    if path.is_empty() { println!("Usage: fiemap <path>"); return; }
-    let result = with_ext2(|fs| -> Result<(), FsError> {
-        let ino = fs.resolve_path(path)?;
-        let mut extents = [(0u32, 0u32, 0u32); 64];
-        let count = fs.ext4_fiemap(ino, &mut extents)?;
-        println!("  File extent map for inode {}:", ino);
-        if count == 0 {
-            println!("  (no extents / empty file)");
-        }
-        let mut total_blocks = 0u32;
-        for i in 0..count {
-            let (logical, phys, len) = extents[i];
-            println!("    [{:2}] logical={:<6} phys={:<8} len={}", i, logical, phys, len);
-            total_blocks += len;
-        }
-        println!("  {} extents, {} blocks total", count, total_blocks);
-        Ok(())
-    });
-    match result {
-        Some(Ok(())) => {}
-        Some(Err(e)) => print_error!("  fiemap: {:?}", e),
-        None         => print_error!("  ext2 not mounted"),
-    }
-}
-
-pub fn cmd_getxattr(path: &str, name: &str) {
-    if path.is_empty() || name.is_empty() { println!("Usage: getxattr <path> <name>"); return; }
-    let result = with_ext2(|fs| -> Result<(), FsError> {
-        let ino = fs.resolve_path(path)?;
-        let mut buf = [0u8; 256];
-        let len = fs.get_xattr(ino, crate::miku_extfs::xattr::XATTR_INDEX_USER, name, &mut buf)?;
-        if let Ok(s) = core::str::from_utf8(&buf[..len]) {
-            println!("  {}=\"{}\"", name, s);
-        } else {
-            println!("  {} = [{} bytes]", name, len);
-        }
-        Ok(())
-    });
-    match result {
-        Some(Ok(())) => {}
-        Some(Err(FsError::NotFound)) => print_error!("  xattr '{}' not found", name),
-        Some(Err(e)) => print_error!("  getxattr: {:?}", e),
-        None         => print_error!("  ext2 not mounted"),
-    }
-}
-
-pub fn cmd_setxattr(path: &str, name: &str, value: &str) {
-    if path.is_empty() || name.is_empty() { println!("Usage: setxattr <path> <name> <value>"); return; }
-    let result = with_ext2(|fs| -> Result<(), FsError> {
-        let ino = fs.resolve_path(path)?;
-        fs.set_xattr(ino, crate::miku_extfs::xattr::XATTR_INDEX_USER, name, value.as_bytes())
-    });
-    match result {
-        Some(Ok(())) => print_success!("  xattr '{}' set", name),
-        Some(Err(e)) => print_error!("  setxattr: {:?}", e),
-        None         => print_error!("  ext2 not mounted"),
-    }
-}
-
-pub fn cmd_listxattr(path: &str) {
-    if path.is_empty() { println!("Usage: listxattr <path>"); return; }
-    let result = with_ext2(|fs| -> Result<(), FsError> {
-        let ino = fs.resolve_path(path)?;
-        let list = fs.read_xattrs(ino)?;
-        if list.count == 0 {
-            println!("  (no extended attributes)");
-        }
-        for i in 0..list.count {
-            let e = &list.entries[i];
-            let ns = match e.name_index {
-                1 => "user",
-                2 => "system.posix_acl_access",
-                3 => "system.posix_acl_default",
-                4 => "trusted",
-                6 => "security",
-                7 => "system",
-                _ => "unknown",
-            };
-            if let Ok(val) = core::str::from_utf8(&e.value[..e.value_len as usize]) {
-                println!("  {}.{}=\"{}\"", ns, e.name_str(), val);
-            } else {
-                println!("  {}.{} = [{} bytes]", ns, e.name_str(), e.value_len);
-            }
-        }
-        Ok(())
-    });
-    match result {
-        Some(Ok(())) => {}
-        Some(Err(e)) => print_error!("  listxattr: {:?}", e),
-        None         => print_error!("  ext2 not mounted"),
-    }
-}
-
-pub fn cmd_chattr(flags_str: &str, path: &str) {
-    let result = with_ext2(|fs| -> Result<(), FsError> {
-        let ino = fs.resolve_path(path)?;
-        let inode = fs.read_inode(ino)?;
-        let mut flags = inode.flags();
-        let adding = flags_str.starts_with('+');
-        let removing = flags_str.starts_with('-');
-        if !adding && !removing {
-            return Err(FsError::InvalidArg);
-        }
-        let chars = &flags_str[1..];
-        for c in chars.bytes() {
-            let flag = match c {
-                b'i' => EXT4_IMMUTABLE_FL,
-                b'a' => EXT4_APPEND_FL,
-                b'd' => EXT4_NODUMP_FL,
-                b'A' => EXT4_NOATIME_FL,
-                _ => continue,
-            };
-            if adding { flags |= flag; } else { flags &= !flag; }
-        }
-        let mut inode = fs.read_inode(ino)?;
-        inode.set_flags(flags);
-        let now = fs.get_timestamp();
-        inode.set_ctime(now);
-        fs.write_inode(ino, &inode)
-    });
-    match result {
-        Some(Ok(())) => print_success!("  flags updated"),
-        Some(Err(e)) => print_error!("  chattr: {:?}", e),
-        None         => print_error!("  ext2 not mounted"),
-    }
-}
-
-pub fn cmd_lsattr(path: &str) {
-    if path.is_empty() { println!("Usage: lsattr <path>"); return; }
-    let result = with_ext2(|fs| -> Result<(), FsError> {
-        let ino = fs.resolve_path(path)?;
-        let inode = fs.read_inode(ino)?;
-        let f = inode.flags();
-        let mut attrs = [b'-'; 8];
-        if f & EXT4_IMMUTABLE_FL != 0 { attrs[0] = b'i'; }
-        if f & EXT4_APPEND_FL != 0 { attrs[1] = b'a'; }
-        if f & EXT4_NODUMP_FL != 0 { attrs[2] = b'd'; }
-        if f & EXT4_NOATIME_FL != 0 { attrs[3] = b'A'; }
-        if f & EXT4_EXTENTS_FL != 0 { attrs[4] = b'e'; }
-        if f & EXT4_INDEX_FL != 0 { attrs[5] = b'I'; }
-        if f & EXT4_HUGE_FILE_FL != 0 { attrs[6] = b'h'; }
-        if f & EXT4_INLINE_DATA_FL != 0 { attrs[7] = b'N'; }
-        let s = core::str::from_utf8(&attrs).unwrap_or("--------");
-        println!("  {} {}", s, path);
-        Ok(())
-    });
-    match result {
-        Some(Ok(())) => {}
-        Some(Err(e)) => print_error!("  lsattr: {:?}", e),
-        None         => print_error!("  ext2 not mounted"),
-    }
 }

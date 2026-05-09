@@ -147,6 +147,33 @@ pub fn clear_from_x(start_x: usize, count: usize) {
     });
 }
 
+pub fn fb_size() -> Option<(usize, usize)> {
+    interrupts::without_interrupts(|| {
+        WRITER.lock().as_ref().map(|w| (w.fb_width(), w.fb_height()))
+    })
+}
+
+pub fn fill_rect(x: usize, y: usize, w: usize, h: usize, r: u8, g: u8, b: u8) {
+    interrupts::without_interrupts(|| {
+        if let Some(c) = WRITER.lock().as_mut() { c.fill_rect(x, y, w, h, r, g, b); }
+    });
+}
+
+pub fn fill_hgradient(
+    x: usize, y: usize, w: usize, h: usize,
+    left: (u8, u8, u8), right: (u8, u8, u8),
+) {
+    interrupts::without_interrupts(|| {
+        if let Some(c) = WRITER.lock().as_mut() { c.fill_hgradient(x, y, w, h, left, right); }
+    });
+}
+
+pub fn write_pixel_at(x: usize, y: usize, r: u8, g: u8, b: u8) {
+    interrupts::without_interrupts(|| {
+        if let Some(c) = WRITER.lock().as_mut() { c.write_pixel(x, y, r, g, b); }
+    });
+}
+
 pub fn hide_cursor() {}
 pub fn show_cursor() {}
 
@@ -602,6 +629,65 @@ impl Console {
 
     pub fn write_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8) {
         self.write_pixel_direct(x, y, r, g, b);
+    }
+
+    pub fn fb_width(&self) -> usize { self.width }
+    pub fn fb_height(&self) -> usize { self.height }
+    pub fn fb_is_bgr(&self) -> bool { self.is_bgr }
+
+    /// Paint a filled rectangle at (x, y) with the given dimensions. Pixels
+    /// outside the framebuffer are clipped. Uses memset for the common 32bpp
+    /// case when the colour bytes repeat, otherwise a row-by-row fill.
+    pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, r: u8, g: u8, b: u8) {
+        if w == 0 || h == 0 || x >= self.width || y >= self.height { return; }
+        let w = w.min(self.width - x);
+        let h = h.min(self.height - y);
+        let pixel = self.make_pixel(r, g, b);
+        let bpp = self.bpp;
+        let sb = self.stride_bytes;
+        for row in 0..h {
+            let base = sb * (y + row) + x * bpp;
+            if base + w * bpp > self.fb_len { break; }
+            unsafe {
+                let mut p = self.fb_ptr.add(base);
+                if bpp == 4 {
+                    for _ in 0..w {
+                        (p as *mut u32).write_unaligned(pixel);
+                        p = p.add(4);
+                    }
+                } else {
+                    for _ in 0..w {
+                        *p         = pixel as u8;
+                        *p.add(1)  = (pixel >> 8) as u8;
+                        *p.add(2)  = (pixel >> 16) as u8;
+                        p = p.add(bpp);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Paint a horizontal gradient from `left` to `right` across the given
+    /// rectangle. Useful for colour-bar tests.
+    pub fn fill_hgradient(
+        &mut self,
+        x: usize, y: usize, w: usize, h: usize,
+        left: (u8, u8, u8), right: (u8, u8, u8),
+    ) {
+        if w == 0 || h == 0 { return; }
+        for col in 0..w {
+            let t = col as u32;
+            let denom = (w.max(1) - 1).max(1) as u32;
+            let lerp = |a: u8, b: u8| -> u8 {
+                let a = a as i32;
+                let b = b as i32;
+                (a + (b - a) * t as i32 / denom as i32) as u8
+            };
+            let r = lerp(left.0, right.0);
+            let g = lerp(left.1, right.1);
+            let b = lerp(left.2, right.2);
+            self.fill_rect(x + col, y, 1, h, r, g, b);
+        }
     }
 
     #[inline(always)]

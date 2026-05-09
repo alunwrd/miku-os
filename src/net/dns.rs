@@ -31,64 +31,83 @@ pub fn resolve(hostname: &str, dns_server: &[u8; 4]) -> Option<[u8; 4]> {
     let eth_len = EthFrame::build(&dst_mac, &our_mac, ETHERTYPE_IP, &ip_buf[..ip_len], &mut eth_buf);
     if eth_len == 0 { return None; }
 
-    {
-        let mut state = super::NET.lock();
-        if let Some(drv) = state.driver.as_mut() {
-            drv.send(&eth_buf[..eth_len]);
-        }
-    }
+    let mut raw: [[u8; 1520]; 4] = [[0; 1520]; 4];
+    let mut raw_lens = [0usize; 4];
 
-    for _ in 0..3_000_000 {
-        if CTRL_C.load(Ordering::SeqCst) {
-            return None;
-        }
-
-        let mut raw: [[u8; 1520]; 4] = [[0; 1520]; 4];
-        let mut raw_lens = [0usize; 4];
-        let mut raw_n = 0usize;
+    for attempt in 0..4u32 {
         {
             let mut state = super::NET.lock();
             if let Some(drv) = state.driver.as_mut() {
-                drv.recv(&mut |buf| {
-                    if raw_n < 4 {
-                        let l = buf.len().min(1520);
-                        raw[raw_n][..l].copy_from_slice(&buf[..l]);
-                        raw_lens[raw_n] = l;
-                        raw_n += 1;
-                    }
-                });
+                drv.send(&eth_buf[..eth_len]);
             }
+            state.tx_count += 1;
         }
+        crate::serial_println!("[dns] query attempt {}/4 for {}", attempt + 1, hostname);
 
-        for i in 0..raw_n {
-            let buf = &raw[i][..raw_lens[i]];
-            if let Some(frame) = EthFrame::parse(buf) {
-                if frame.ethertype == super::eth::ETHERTYPE_ARP {
-                    let mut state = super::NET.lock();
-                    let mc = state.mac; let ic = state.ip;
-                    let mut rep = [0u8; 64];
-                    let rlen = super::arp::handle(&frame, &mc, &ic, &mut state.arp, &mut rep);
-                    if rlen > 0 {
-                        let rc = rep;
-                        if let Some(drv) = state.driver.as_mut() { drv.send(&rc[..rlen]); }
-                    }
-                    continue;
+        let start = crate::vfs::procfs::uptime_ticks();
+        x86_64::instructions::interrupts::enable();
+
+        loop {
+            if CTRL_C.load(Ordering::SeqCst) {
+                return None;
+            }
+
+            let now = crate::vfs::procfs::uptime_ticks();
+            if now.wrapping_sub(start) > 750 {
+                crate::serial_println!("[dns] attempt {}/4 timeout", attempt + 1);
+                break;
+            }
+
+            x86_64::instructions::hlt();
+
+            let mut raw_n = 0usize;
+            {
+                let mut state = super::NET.lock();
+                if let Some(drv) = state.driver.as_mut() {
+                    drv.recv(&mut |buf| {
+                        if raw_n < 4 {
+                            let l = buf.len().min(1520);
+                            raw[raw_n][..l].copy_from_slice(&buf[..l]);
+                            raw_lens[raw_n] = l;
+                            raw_n += 1;
+                        }
+                    });
                 }
-                if frame.ethertype != ETHERTYPE_IP { continue; }
-                if let Some(ip) = ipv4::Ipv4Header::parse(frame.payload) {
-                    if ip.proto != ipv4::PROTO_UDP { continue; }
-                    let payload = ip.payload(frame.payload);
-                    if payload.len() < 8 { continue; }
-                    let src_port = u16::from_be_bytes([payload[0], payload[1]]);
-                    if src_port != 53 { continue; }
-                    let udp_data = &payload[8..];
-                    if let Some(ip4) = parse_response(udp_data) {
-                        return Some(ip4);
+                state.rx_count += raw_n as u64;
+            }
+
+            for i in 0..raw_n {
+                let buf = &raw[i][..raw_lens[i]];
+                if let Some(frame) = EthFrame::parse(buf) {
+                    if frame.ethertype == super::eth::ETHERTYPE_ARP {
+                        let mut state = super::NET.lock();
+                        let mc = state.mac;
+                        let ic = state.ip;
+                        let mut rep = [0u8; 64];
+                        let rlen = super::arp::handle(&frame, &mc, &ic, &mut state.arp, &mut rep);
+                        if rlen > 0 {
+                            let rc = rep;
+                            if let Some(drv) = state.driver.as_mut() {
+                                drv.send(&rc[..rlen]);
+                            }
+                        }
+                        continue;
+                    }
+                    if frame.ethertype != ETHERTYPE_IP { continue; }
+                    if let Some(ip) = ipv4::Ipv4Header::parse(frame.payload) {
+                        if ip.proto != ipv4::PROTO_UDP { continue; }
+                        let payload = ip.payload(frame.payload);
+                        if payload.len() < 8 { continue; }
+                        let src_port = u16::from_be_bytes([payload[0], payload[1]]);
+                        if src_port != 53 { continue; }
+                        let udp_data = &payload[8..];
+                        if let Some(ip4) = parse_response(udp_data) {
+                            return Some(ip4);
+                        }
                     }
                 }
             }
         }
-        core::hint::spin_loop();
     }
     None
 }

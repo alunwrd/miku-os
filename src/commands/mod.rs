@@ -2,8 +2,10 @@ pub mod ext2_cmds;
 pub mod ext_cmds_common;
 pub mod ext3_cmds;
 pub mod ext4_cmds;
+pub mod xattr_cmds;
 pub mod fs;
 pub mod system;
+pub mod nvidia_cmds;
 pub mod mkfs_cmds;
 pub mod disk_cmds;
 
@@ -136,8 +138,8 @@ pub fn execute(input: &str) {
         "extinfo" => {
             ext_dispatch!(
                 ext2_cmds::cmd_ext2_info(),
-                ext2_cmds::cmd_ext3_info(),
-                ext2_cmds::cmd_ext4_info()
+                ext3_cmds::cmd_ext3_info(),
+                ext4_cmds::cmd_ext4_info()
             );
         }
         "extwrite" => {
@@ -253,16 +255,16 @@ pub fn execute(input: &str) {
         "extcacheflush" => ext2_cmds::cmd_ext2_cache_flush(),
         "extsync" | "sync" => ext4_cmds::cmd_ext4_sync(),
 
-        "ext3mkjournal" => ext2_cmds::cmd_ext3_mkjournal(),
-        "ext3journal"   => ext2_cmds::cmd_ext3_journal(),
-        "ext3recover"   => ext2_cmds::cmd_ext3_recover(),
-        "ext3clean"     => ext2_cmds::cmd_ext3_clean(),
+        "ext3mkjournal" => ext3_cmds::cmd_ext3_mkjournal(),
+        "ext3journal"   => ext3_cmds::cmd_ext3_journal(),
+        "ext3recover"   => ext3_cmds::cmd_ext3_recover(),
+        "ext3clean"     => ext3_cmds::cmd_ext3_clean(),
 
-        "ext4extents"   => ext2_cmds::cmd_ext4_enable_extents(),
-        "ext4checksums" => ext2_cmds::cmd_ext4_checksums(),
+        "ext4extents"   => ext4_cmds::cmd_ext4_enable_extents(),
+        "ext4checksums" => ext4_cmds::cmd_ext4_checksums(),
         "ext4extinfo"   => {
             if a1.is_empty() { println!("Usage: ext4extinfo <path>"); }
-            else { ext2_cmds::cmd_ext4_extent_info(a1); }
+            else { ext4_cmds::cmd_ext4_extent_info(a1); }
         }
 
         "ext2ls"     => ext2_cmds::cmd_ext2_ls(a1),
@@ -324,7 +326,7 @@ pub fn execute(input: &str) {
         "ext3ls"     => ext3_cmds::cmd_ext3_ls(a1),
         "ext3cat"    => ext3_cmds::cmd_ext3_cat(a1),
         "ext3stat"   => ext3_cmds::cmd_ext3_stat(a1),
-        "ext3info"   => ext2_cmds::cmd_ext3_info(),
+        "ext3info"   => ext3_cmds::cmd_ext3_info(),
         "ext3write"  => {
             let text = if rest.len() > a1.len() { rest[a1.len()..].trim_start() } else { "" };
             if a1.is_empty() { println!("Usage: ext3write <path> <text>"); }
@@ -344,7 +346,7 @@ pub fn execute(input: &str) {
         "ext4ls"     => ext4_cmds::cmd_ext4_ls(a1),
         "ext4cat"    => ext4_cmds::cmd_ext4_cat(a1),
         "ext4stat"   => ext4_cmds::cmd_ext4_stat(a1),
-        "ext4info"   => ext2_cmds::cmd_ext4_info(),
+        "ext4info"   => ext4_cmds::cmd_ext4_info(),
         "ext4sync"   => ext4_cmds::cmd_ext4_sync(),
         "ext4write"  => {
             let text = if rest.len() > a1.len() { rest[a1.len()..].trim_start() } else { "" };
@@ -367,21 +369,21 @@ pub fn execute(input: &str) {
         "ext4du"     => ext4_cmds::cmd_ext4_du(a1),
         "ext4fsck"   => ext4_cmds::cmd_ext4_fsck(),
 
-        "fiemap"     => ext2_cmds::cmd_fiemap(a1),
-        "getxattr"   => { if a1.is_empty() || a2.is_empty() { println!("Usage: getxattr <path> <name>"); } else { ext2_cmds::cmd_getxattr(a1, a2); } }
+        "fiemap"     => ext4_cmds::cmd_fiemap(a1),
+        "getxattr"   => { if a1.is_empty() || a2.is_empty() { println!("Usage: getxattr <path> <name>"); } else { xattr_cmds::cmd_getxattr(a1, a2); } }
         "setxattr"   => {
             let val = if rest.len() > a1.len() + a2.len() + 1 {
                 rest[a1.len()..].trim_start()[a2.len()..].trim_start()
             } else { "" };
             if a1.is_empty() || a2.is_empty() { println!("Usage: setxattr <path> <name> <value>"); }
-            else { ext2_cmds::cmd_setxattr(a1, a2, val); }
+            else { xattr_cmds::cmd_setxattr(a1, a2, val); }
         }
-        "listxattr"  => ext2_cmds::cmd_listxattr(a1),
+        "listxattr"  => xattr_cmds::cmd_listxattr(a1),
         "chattr"     => {
             if a1.is_empty() || a2.is_empty() { println!("Usage: chattr <+/-flags> <path>  (i=immutable, a=append, d=nodump, A=noatime)"); }
-            else { ext2_cmds::cmd_chattr(a1, a2); }
+            else { xattr_cmds::cmd_chattr(a1, a2); }
         }
-        "lsattr"     => ext2_cmds::cmd_lsattr(a1),
+        "lsattr"     => xattr_cmds::cmd_lsattr(a1),
 
         "mkfs.ext2" => {
             if a1.is_empty() { println!("Usage: mkfs.ext2 <drive 0-3>"); }
@@ -445,6 +447,7 @@ pub fn execute(input: &str) {
         "ps"       => system::cmd_ps(),
         "ldconfig" => system::cmd_ldconfig(rest),
         "ldd"      => system::cmd_ldd(a1),
+        "nvidia" | "gpu" => nvidia_cmds::cmd_nvidia(rest),
         "top"      => system::cmd_top(),
         "swaptest" => system::cmd_swaptest(),
         "nice"     => system::cmd_nice(a1, a2),
@@ -551,7 +554,7 @@ fn cmd_fetch(host_or_url: &str, port_str: &str) {
     );
     x86_64::instructions::interrupts::enable();
     let req_str  = alloc::format!(
-        "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: MikuOS/0.1\r\nConnection: close\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: MikuOS/0.2-rc\r\nConnection: close\r\n\r\n",
         host
     );
     let req_bytes = req_str.as_bytes();

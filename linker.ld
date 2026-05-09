@@ -37,6 +37,10 @@ SECTIONS {
 
     .text : AT(PHYS_KERNEL) {
         *(.text .text.*)
+        . = ALIGN(0x1000);
+        _ap_trampoline_link_start = .;
+        KEEP(*(.ap_trampoline))
+        _ap_trampoline_link_end = .;
     } :text
 
     .rodata ALIGN(0x1000) : AT(ADDR(.rodata) - KOFFSET) {

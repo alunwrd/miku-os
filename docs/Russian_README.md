@@ -45,9 +45,15 @@ ELF динамическая линковка, разделяемые библи
 | **PIC** | PIC8259 (смещение 32/40) |
 | **SSE** | CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1 |
 | **Куча** | 32 MB, linked list аллокатор |
-| **Syscall** | SYSCALL/SYSRET через MSR, naked asm обработчик, сохранение R8/R9/R10 |
+| **Syscall** | SYSCALL/SYSRET через MSR, naked asm обработчик, сохранение R8/R9/R10 (модульный: syscall/) |
 | **Сигналы** | SIGKILL (9), SIGTERM (15), SIGCHLD (17), 32-бит битовая маска |
 | **Init** | mikuD (PID 1) - systemd-подобный менеджер сервисов |
+| **ACPI** | Парсер RSDP/RSDT/XSDT, перечисление MADT (LAPIC + IOAPIC) |
+| **APIC** | Local APIC + I/O APIC драйвер (заменяет PIC8259) |
+| **SMP** | Запуск нескольких ядер: AP трамплин, per-CPU состояние (percpu), последовательность SIPI |
+| **PS/2** | Инициализация контроллера клавиатуры |
+| **USB** | USB legacy handoff (освобождение EHCI/xHCI от BIOS) |
+| **Splash** | Загрузочный экран через фреймбуфер |
 
 ---
 
@@ -782,7 +788,7 @@ bits 12.. = номер swap слота
 |:--|:--|
 | **RNG** | CSPRNG на RDRAND для ClientHello random, CBC IV, приватного ключа ECDH, паддинга RSA (`random::random_u64`) |
 | **Timing (Lucky13)** | Constant-time сравнение MAC через OR-аккумулятор |
-| **Padding oracle** | Полная проверка паддинга по RFC 5246 — все байты, не только последний |
+| **Padding oracle** | Полная проверка паддинга по RFC 5246 - все байты, не только последний |
 | **ECDH timing leak** | `fe_cmov` / `jac_cmov` XOR-маска для выбора поля/точки |
 | **Подмена сервера** | TLS 1.2 `verify_data = PRF(master, "server finished", hs_hash)` проверяется constant-time |
 | **PKCS#1 паддинг** | Ненулевые байты из RDRAND (rejection loop) |
@@ -992,6 +998,26 @@ bits 12.. = номер swap слота
 | `affinity <pid> <mask>` | Установка CPU-аффинности |
 | `swaptest` | Стресс-тест подсистемы swap |
 
+#### Команды NVIDIA GPU
+
+| Команда | Описание |
+|:--|:--|
+| `nvidia` / `nvidia info` | Сводка GPU: PCI, чип, BAR0/1/3, PTIMER, MSI, scanout |
+| `nvidia debug` | Полный дамп регистров BAR0 (PMC, PBUS, PFIFO, PTOP, PTIMER) |
+| `nvidia firmware` | Список встроенных blob-файлов TU116 с заголовками NVFW |
+| `nvidia falcon` | Живучесть движков: SEC2, GSP, NVDEC, FECS, GPCCS0/1 |
+| `nvidia ungate` | Установка PMC_ENABLE.GR + CE0 (активация FECS / GPCCS / CE0) |
+| `nvidia pmc-scan` | Только чтение: обход области PMC (0x000..0x1000) |
+| `nvidia dma-state` | Снимок регистров DMATRF + статус IDLE/ERROR по движкам |
+| `nvidia fbif-scan` | Обход окна FBIF (+0x500..+0xa00) для каждого активного движка |
+| `nvidia fbif-decode` | Декодирование всех 8 слотов TRANSCFG для каждого активного движка |
+| `nvidia dma-test` | Сквозной DMA loopback: sysmem -> SEC2 DMEM (256 байт, паттерн CAFE) |
+| `nvidia imem-test` | IMEM-вариант DMA loopback: sysmem -> SEC2 IMEM |
+| `nvidia acr-info` | Структурный дамп каждого ACR blob SEC2 (контейнер NVFW + заголовки HS) |
+| `nvidia gsp` | First-contact загрузка GSP через gsp::attempt_boot |
+| `nvidia next` | Анализ состояния и рекомендация следующего шага разработки драйвера |
+| `nvidia splash` | Перерисовка загрузочного экрана через фреймбуфер |
+
 #### Системные команды
 
 | Команда | Описание |
@@ -1049,6 +1075,106 @@ bits 12.. = номер swap слота
 | `fetch <url\|host> [port]` | Минимальный HTTP/HTTPS-клиент |
 | `wget <url> [-O <file>]` | Скачивание по HTTP(S) |
 | `curl <url> [-X GET\|POST] [-d <data>] [-o <file>] [-I]` | HTTP(S)-клиент |
+
+---
+
+### Драйвер NVIDIA GPU
+
+<details>
+<summary><b>Развернуть</b></summary>
+
+#### Обзор
+
+MikuOS включает собственный драйвер для GPU NVIDIA серии Turing (GTX 1650 / 1660).
+Написан с нуля на Rust без std, использует MMIO поверх HHDM.
+
+> Turing - первое поколение NVIDIA с GSP (GPU System Processor) на встроенном ядре RISC-V.
+> Без подписанного firmware GSP большинство движков недоступно.
+> Текущий драйвер охватывает host-side probe + управление Falcon-движками + DMA loopback.
+
+#### Поддерживаемые GPU
+
+| Чип | SKU | Диапазон Device ID |
+|:--|:--|:--|
+| **TU117** | GTX 1650 GDDR5 / GDDR6, Mobile/Max-Q | 0x1F82..0x1FBA |
+| **TU116** | GTX 1650 SUPER, GTX 1660 / 1660 Ti / 1660 SUPER | 0x2182..0x21C4 |
+
+#### Структура модулей (nvidia/)
+
+| Модуль | Описание |
+|:--|:--|
+| **mod.rs** | Корень: точка входа probe, реестр драйверов, глобальный ACTIVE_GTX1650 |
+| **pci.rs** | PCI-сканирование (класс 0x03 + vendor 0x10DE), определение размера BAR |
+| **mmio.rs** | MMIO-примитивы: volatile чтение/запись через HHDM |
+| **chip.rs** | Идентификация чипа по PMC_BOOT_0 (arch / implementation / rev / stepping) |
+| **msi.rs** | Обход возможностей PCI MSI / MSI-X |
+| **vbios.rs** | Извлечение образа VBIOS из PCI expansion ROM |
+| **fb.rs** | Фреймбуфер: определение boot scanout, BAR-индекс и смещение |
+| **gtx1650/** | Основной драйвер GTX 1650 / 1660 (TU117 + TU116) |
+
+#### Архитектуры чипов
+
+| Код arch | Семейство | Примеры |
+|:--:|:--|:--|
+| 0x16 | Turing | TU102, TU104, TU106, TU116 (0x8), TU117 (0x7) |
+| 0x17 | Ampere | GA102, GA104 |
+| 0x19 | Ada Lovelace | AD102, AD104 |
+
+#### Falcon-движки
+
+| Движок | Базовый адрес | Описание |
+|:--|:--|:--|
+| **SEC2** | PSEC_BASE | Движок безопасности: загрузка ACR, загрузка HS ucode |
+| **GSP** | PGSP_BASE | GPU System Processor (RISC-V) |
+| **NVDEC** | PNVDEC_BASE | Видеодекодер |
+| **FECS** | PFECS_BASE | Переключение контекста фронтального движка |
+| **GPCCS0/1** | PGPCCS_BASE | Переключение контекста GPC |
+
+Состояния живучести: Alive, GatedPriSentinel, NoResponse, BadHwcfg.
+
+#### DMA-путь (loopback через SEC2)
+
+```
+1. DmaBuffer::alloc(pages) - физически непрерывные страницы из PMM
+2. Заполнение паттерном (0xCAFE_xxxx) + write_barrier (sfence)
+3. Программирование SEC2 TRANSCFG[7]: NoncoherentSysmem + Physical addressing
+4. Установка FBIF_CTL.ALLOW_PHYS_NO_CTX
+5. Engine::dma_load: sysmem -> SEC2 DMEM/IMEM (256 байт, ctxdma=7)
+6. PIO readback через FALCON_DMEM_C0/D0 (или IMEM_C0/D0)
+7. Проверка паттерна + восстановление TRANSCFG
+```
+
+#### Пакет firmware (TU116)
+
+| Blob | Движок | Контейнер |
+|:--|:--|:--|
+| acr/bl.bin | SEC2 | NVFW v1 |
+| acr/ucode_ahesasc.bin | SEC2 | NVFW v1 |
+| gsp/booter_load.bin | GSP | NVFW v1 |
+| gsp/booter_unload.bin | GSP | NVFW v1 |
+| nvdec/scrubber.bin | NVDEC | NVFW v1 |
+| fecs/ucode.bin | FECS | raw |
+| gpccs/ucode.bin | GPCCS | raw |
+
+Все blob-файлы встроены в ядро через include_bytes! при компиляции.
+Образ GSP-RM (gsp_t.bin) НЕ включен - требует NVIDIA open-kernel-modules.
+
+#### Дорожная карта драйвера
+
+| Шаг | Статус | Описание |
+|:--:|:--:|:--|
+| 1 | готово | PCI bind + BAR0 mapped |
+| 2 | готово | Идентификация чипа (PMC_BOOT_0) |
+| 3 | готово | Пакет firmware встроен |
+| 4 | готово | Alive-проба Falcon-движков SEC2 / GSP |
+| 5 | готово | FBIF scan + декодирование TRANSCFG |
+| 6 | готово | DMA loopback (DMEM + IMEM) |
+| 7 | - | Загрузка ACR через SEC2 (установка WPR) |
+| 8 | - | Проход скруббера NVDEC |
+| 9 | - | Подготовка GSP-RM + GSP RPC |
+| 10 | - | Контексты FECS/GPCCS, доступ к PGRAPH |
+
+</details>
 
 ---
 
@@ -1126,7 +1252,7 @@ cd src/lib/userspace
   <br>
   <sub>Автор и единственный разработчик Miku OS</sub>
   <br>
-  <sub>Ядро - VFS - MikuFS - ELF - ld-miku - libmiku - Оболочка - Сеть - TLS - Планировщик - PMM - VMM - Swap - mikuD - Сигналы - fork/exec</sub>
+  <sub>Ядро - VFS - MikuFS - ELF - ld-miku - libmiku - Оболочка - Сеть - TLS - Планировщик - PMM - VMM - Swap - mikuD - Сигналы - fork/exec - ACPI - APIC - SMP - Драйвер NVIDIA GPU</sub>
 </div>
 
 ---
@@ -1142,6 +1268,12 @@ cd src/lib/userspace
 > Момент, когда ELF загрузчик и динамическая линковка заработали, когда "hello from dynamic linking!"
 > появилось на экране, я не забуду никогда.
 > Когда libmiku прошла все 1617 тестов, стало ясно что на этой ОС можно запускать настоящие программы.
+>
+> А потом - NVIDIA. Писать GPU-драйвер с нуля, читать PMC_BOOT_0,
+> запускать Falcon-движки, реализовывать DMA loopback через SEC2 DMEM -
+> это как открывать черный ящик голыми руками.
+> ACPI, APIC, SMP - теперь ОС понимает своё железо на уровне,
+> который большинство никогда не видит.
 
 <div align="center">
 

@@ -2,7 +2,10 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-const READ_CHUNK: usize = 4096;
+// Big chunks amortize the per-call ext2 lock + path/inode lookup. A typical
+// ELF binary is several hundred KB, so 64 KiB cuts the round-trip count
+// roughly 16× compared with single-page reads.
+const READ_CHUNK: usize = 64 * 1024;
 
 pub fn read_file(path: &str) -> Option<Vec<u8>> {
     let path_clean = path.trim_end_matches('\0');

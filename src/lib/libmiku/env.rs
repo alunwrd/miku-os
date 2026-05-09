@@ -90,7 +90,7 @@ pub extern "C" fn miku_setenv(key: *const u8, val: *const u8) -> bool {
 // get environment variable
 // Returns pointer to an internal static buffer. Matches POSIX getenv semantics:
 // the pointer is valid only until the next miku_getenv call on ANY thread.
-// NOT thread-safe for concurrent readers — use miku_getenv_r for that.
+// NOT thread-safe for concurrent readers - use miku_getenv_r for that
 // The spinlock on the buffer ensures the copy itself is atomic (no torn bytes),
 // but the returned pointer may be overwritten the instant we return.
 #[no_mangle]

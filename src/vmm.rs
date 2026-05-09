@@ -374,3 +374,134 @@ pub fn read_pte_raw(cr3: u64, virt: u64) -> Option<u64> {
     let _ = aspace.into_raw();
     result
 }
+
+// MMIO mapping at the HHDM window with uncacheable attributes. Needed for
+// device registers where writes must hit silicon on the next write, not on
+// an eventual cacheline eviction (LAPIC EOI, IOAPIC RTEs, PCIe BARs). On
+// real hardware without an MTRR covering the MMIO range this is the only
+// way to avoid losing writes into the L1/L2 cache.
+fn alloc_pt_frame() -> u64 {
+    let phys = pmm::alloc_frame()
+        .expect("map_mmio_uc: out of physical memory for page table");
+    let hhdm = grub::hhdm();
+    unsafe {
+        let ptr = (phys + hhdm) as *mut u8;
+        core::ptr::write_bytes(ptr, 0, 4096);
+    }
+    phys
+}
+
+unsafe fn split_huge_p3(p3: &mut PageTable, p3_idx: usize, hhdm: u64) {
+    let huge_phys = p3[p3_idx].addr().as_u64();
+    let huge_flags = p3[p3_idx].flags();
+
+    let new_p2_phys = alloc_pt_frame();
+    let new_p2 = &mut *((new_p2_phys + hhdm) as *mut PageTable);
+
+    for j in 0..512usize {
+        let page_phys = huge_phys + (j as u64) * 0x20_0000;
+        let mut flags = huge_flags;
+        flags.remove(PageTableFlags::HUGE_PAGE);
+        flags.insert(PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
+
+        let new_p1_phys = alloc_pt_frame();
+        let new_p1 = &mut *((new_p1_phys + hhdm) as *mut PageTable);
+        for k in 0..512usize {
+            let phys_4k = page_phys + (k as u64) * 0x1000;
+            new_p1[k].set_addr(
+                x86_64::PhysAddr::new(phys_4k),
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+            );
+        }
+        new_p2[j].set_addr(x86_64::PhysAddr::new(new_p1_phys), flags);
+    }
+
+    p3[p3_idx].set_addr(
+        x86_64::PhysAddr::new(new_p2_phys),
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+    );
+}
+
+unsafe fn split_huge_p2(p2: &mut PageTable, p2_idx: usize, hhdm: u64) {
+    let huge_phys = p2[p2_idx].addr().as_u64();
+    let huge_flags = p2[p2_idx].flags();
+
+    let new_p1_phys = alloc_pt_frame();
+    let new_p1 = &mut *((new_p1_phys + hhdm) as *mut PageTable);
+
+    for k in 0..512usize {
+        let phys_4k = huge_phys + (k as u64) * 0x1000;
+        let mut flags = huge_flags;
+        flags.remove(PageTableFlags::HUGE_PAGE);
+        flags.insert(PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
+        new_p1[k].set_addr(x86_64::PhysAddr::new(phys_4k), flags);
+    }
+
+    p2[p2_idx].set_addr(
+        x86_64::PhysAddr::new(new_p1_phys),
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+    );
+}
+
+pub fn map_mmio_uc(phys_addr: u64, size: u64) {
+    let hhdm = grub::hhdm();
+    let start_page = phys_addr & !0xFFF;
+    let end_page = (phys_addr + size + 0xFFF) & !0xFFF;
+
+    unsafe {
+        let (p4_frame, _) = Cr3::read();
+        let p4 = &mut *((p4_frame.start_address().as_u64() + hhdm) as *mut PageTable);
+
+        for page in (start_page..end_page).step_by(0x1000) {
+            let virt = page + hhdm;
+            let p4_idx = ((virt >> 39) & 0x1FF) as usize;
+            let p3_idx = ((virt >> 30) & 0x1FF) as usize;
+            let p2_idx = ((virt >> 21) & 0x1FF) as usize;
+            let p1_idx = ((virt >> 12) & 0x1FF) as usize;
+
+            if !p4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
+                p4[p4_idx].set_addr(
+                    x86_64::PhysAddr::new(alloc_pt_frame()),
+                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                );
+            }
+            let p3 = &mut *((p4[p4_idx].addr().as_u64() + hhdm) as *mut PageTable);
+
+            if !p3[p3_idx].flags().contains(PageTableFlags::PRESENT) {
+                p3[p3_idx].set_addr(
+                    x86_64::PhysAddr::new(alloc_pt_frame()),
+                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                );
+            } else if p3[p3_idx].flags().contains(PageTableFlags::HUGE_PAGE) {
+                split_huge_p3(p3, p3_idx, hhdm);
+                x86_64::instructions::tlb::flush_all();
+            }
+            let p2 = &mut *((p3[p3_idx].addr().as_u64() + hhdm) as *mut PageTable);
+
+            if !p2[p2_idx].flags().contains(PageTableFlags::PRESENT) {
+                p2[p2_idx].set_addr(
+                    x86_64::PhysAddr::new(alloc_pt_frame()),
+                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                );
+            } else if p2[p2_idx].flags().contains(PageTableFlags::HUGE_PAGE) {
+                split_huge_p2(p2, p2_idx, hhdm);
+                x86_64::instructions::tlb::flush_all();
+            }
+            let p1 = &mut *((p2[p2_idx].addr().as_u64() + hhdm) as *mut PageTable);
+
+            // Strict UC (PCD=1, PWT=1 → default PAT index 3). Using only PCD
+            // (NO_CACHE) yields UC- which MTRR=WB can downgrade back to WB on
+            // real hardware, defeating the whole purpose for MMIO.
+            p1[p1_idx].set_addr(
+                x86_64::PhysAddr::new(page),
+                PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::NO_CACHE
+                    | PageTableFlags::WRITE_THROUGH,
+            );
+        }
+
+        core::arch::asm!("mfence", options(nostack, nomem));
+        x86_64::instructions::tlb::flush_all();
+    }
+}

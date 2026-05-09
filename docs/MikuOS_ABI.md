@@ -1,4 +1,4 @@
-# MikuOS ABI v0.2.0
+# MikuOS ABI v0.3.0
 
 Application Binary Interface for MikuOS userspace.
 
@@ -37,11 +37,25 @@ rustup toolchain install nightly
 rustup component add rust-src --toolchain nightly
 
 # GCC (for stub generation)
-sudo apt install gcc
+You need to install GCC for you OS
 
 # e2tools (copying to ext4)
-sudo apt install e2tools
+You need to install e2tools for you OS
 ```
+
+### 2.4 Kernel Environment
+
+New hardware subsystems initialized before userspace starts:
+
+| Subsystem | Details |
+|:--|:--|
+| **ACPI** | RSDP/RSDT/XSDT parser, MADT enumeration, LAPIC and IOAPIC discovery |
+| **APIC** | Local APIC + I/O APIC driver replaces PIC8259 |
+| **SMP** | AP trampoline, per-CPU state (percpu), SIPI sequence for multi-core bring-up |
+| **PS/2** | Keyboard controller initialization |
+| **USB** | USB legacy handoff (EHCI/xHCI BIOS release) |
+| **Splash** | Boot splash via framebuffer before shell starts |
+| **NVIDIA** | GTX 1650/1660 (TU117/TU116) host-side driver: PCI probe, BAR0 MMIO, Falcon engine management, DMA loopback |
 
 ### 2.2 SDK Structure
 
@@ -795,6 +809,7 @@ readelf --dyn-syms app | grep miku  # should list miku_* symbols
 - No float support in printf
 - Heap slab does not return memory to the kernel when small blocks are freed
 - No networking syscalls from userspace yet
+- NVIDIA GPU driver does not yet expose a userspace API; accessible only via shell commands (nvidia info/debug/falcon/dma-test/gsp etc.)
 
 ---
 

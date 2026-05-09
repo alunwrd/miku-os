@@ -343,14 +343,23 @@ fn map_load_segment(
         let pv = page_start + (i as u64) * PAGE_SIZE;
         let frame = pmm::alloc_frame().ok_or(LoadError::OutOfMemory)?;
 
-        unsafe {
-            core::ptr::write_bytes((frame + hhdm) as *mut u8, 0, PAGE_SIZE as usize);
-        }
-
         let copy_vstart = pv.max(vaddr);
         let copy_vend = (pv + PAGE_SIZE).min(seg_file_end);
+        let copy_len = copy_vend.saturating_sub(copy_vstart);
 
-        if copy_vend > copy_vstart {
+        // Skip the 4 KiB memset when the file copy will overwrite the whole
+        // page anyway - common for .text / .rodata pages that come straight
+        // from the ELF file. Partial pages (BSS tail, page-spanning gaps)
+        // still need the zero fill so we never leak previous frame contents
+        // back to userspace
+        let full_page = copy_vstart == pv && copy_len == PAGE_SIZE;
+        if !full_page {
+            unsafe {
+                core::ptr::write_bytes((frame + hhdm) as *mut u8, 0, PAGE_SIZE as usize);
+            }
+        }
+
+        if copy_len > 0 {
             copy_segment_data(data, hhdm, frame, pv, copy_vstart, copy_vend, offset, vaddr);
         }
 

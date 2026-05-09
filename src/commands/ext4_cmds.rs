@@ -103,7 +103,6 @@ pub fn cmd_ext4_upgrade() {
 pub fn cmd_ext4_ls(path: &str)                  { common::impl_ls(path, "ext4"); }
 pub fn cmd_ext4_cat(path: &str)                 { common::impl_cat(path, "ext4"); }
 pub fn cmd_ext4_stat(path: &str)                { common::impl_stat(path, "ext4"); }
-pub fn cmd_ext4_info()                          { common::impl_info("ext4"); }
 pub fn cmd_ext4_write(path: &str, text: &str)   { common::impl_write(path, text, "ext4"); }
 pub fn cmd_ext4_mkdir(path: &str)               { common::impl_mkdir(path, "ext4"); }
 pub fn cmd_ext4_rm(path: &str)                  { common::impl_rm(path, "ext4"); }
@@ -114,9 +113,122 @@ pub fn cmd_ext4_du(path: &str)                  { common::impl_du(path, "ext4");
 pub fn cmd_ext4_cp(src: &str, dst: &str)        { common::impl_cp(src, dst, "ext4"); }
 pub fn cmd_ext4_sync()                          { common::impl_sync("ext4"); }
 
-pub fn cmd_ext4_extinfo(path: &str)             { crate::commands::ext2_cmds::cmd_ext4_extent_info(path); }
-pub fn cmd_ext4_enable_extents()                { crate::commands::ext2_cmds::cmd_ext4_enable_extents(); }
-pub fn cmd_ext4_checksums()                     { crate::commands::ext2_cmds::cmd_ext4_checksums(); }
+pub fn cmd_ext4_extinfo(path: &str)             { cmd_ext4_extent_info(path); }
+
+pub fn cmd_ext4_info() {
+    let result = with_ext2_pub(|fs| {
+        let info = fs.fs_info();
+        cprintln!(57, 197, 187, "  ext4 Filesystem Info");
+        println!("  Version:   {}", info.version);
+        println!("  Extents:   {}", if info.has_extents { "enabled" } else { "disabled" });
+        println!("  Journal:   {}", if info.has_journal { "enabled" } else { "disabled" });
+        println!("  64bit:     {}", if fs.superblock.has_64bit() { "yes" } else { "no" });
+        println!("  Checksums: {}", if fs.superblock.has_metadata_csum() { "crc32c" } else { "none" });
+        println!("  Flex BG:   {}", if fs.superblock.has_flex_bg() { "yes" } else { "no" });
+        if fs.superblock.has_metadata_csum() {
+            if fs.verify_superblock_csum() { print_success!("  SB csum:   valid"); }
+            else { print_error!("  SB csum:   invalid"); }
+        }
+    });
+    if result.is_none() { print_error!("  ext2 not mounted"); }
+}
+
+pub fn cmd_ext4_enable_extents() {
+    let result = with_ext2_pub(|fs| -> Result<(), FsError> { fs.enable_extents_feature() });
+    match result {
+        Some(Ok(())) => print_success!("  extents enabled"),
+        Some(Err(e)) => print_error!("  ext4extents: {:?}", e),
+        None         => print_error!("  ext2 not mounted"),
+    }
+}
+
+pub fn cmd_ext4_checksums() {
+    let result = with_ext2_pub(|fs| {
+        cprintln!(57, 197, 187, "  Checksum Verification");
+        let sb_ok = fs.verify_superblock_csum();
+        println!("  Superblock: {}", if sb_ok { "ok" } else { "fail" });
+        let gc = fs.group_count as usize;
+        let (mut gd_ok, mut gd_fail) = (0u32, 0u32);
+        let (mut bb_ok, mut bb_fail) = (0u32, 0u32);
+        let (mut ib_ok, mut ib_fail) = (0u32, 0u32);
+        for g in 0..gc.min(32) {
+            if fs.verify_group_desc_csum(g) { gd_ok += 1; } else { gd_fail += 1; }
+            if fs.verify_block_bitmap_csum(g) { bb_ok += 1; } else { bb_fail += 1; }
+            if fs.verify_inode_bitmap_csum(g) { ib_ok += 1; } else { ib_fail += 1; }
+        }
+        println!("  Group descs:   {} ok, {} fail", gd_ok, gd_fail);
+        println!("  Block bitmaps: {} ok, {} fail", bb_ok, bb_fail);
+        println!("  Inode bitmaps: {} ok, {} fail", ib_ok, ib_fail);
+        let (mut ino_ok, mut ino_fail) = (0u32, 0u32);
+        let max_check = fs.superblock.inodes_count().min(64);
+        for ino in 1..=max_check {
+            if let Ok(inode) = fs.read_inode(ino) {
+                if inode.mode() != 0 {
+                    if fs.verify_inode_csum(ino, &inode) { ino_ok += 1; } else { ino_fail += 1; }
+                }
+            }
+        }
+        println!("  Inodes (first {}): {} ok, {} fail", max_check, ino_ok, ino_fail);
+    });
+    if result.is_none() { print_error!("  ext2 not mounted"); }
+}
+
+pub fn cmd_ext4_extent_info(path: &str) {
+    if path.is_empty() { println!("Usage: ext4extinfo <path>"); return; }
+    let result = with_ext2_pub(|fs| -> Result<(), FsError> {
+        let ino = fs.resolve_path(path)?;
+        let inode = fs.read_inode(ino)?;
+        if !inode.uses_extents() {
+            println!("  inode {} does not use extents (indirect blocks)", ino);
+            return Ok(());
+        }
+        let header = inode.extent_header();
+        println!("  Inode: {}", ino);
+        println!("  Extent tree depth: {}", header.depth);
+        println!("  Entries: {} / {}", header.entries, header.max);
+        let count = fs.ext4_extent_count(&inode)?;
+        println!("  Total extents: {}", count);
+        if header.depth == 0 {
+            for i in 0..header.entries as usize {
+                let ext = inode.extent_at(i);
+                println!("    [{}] logical={} len={} phys={}",
+                    i, ext.block, ext.actual_len(), ext.start());
+            }
+        }
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(e)) => print_error!("  ext4extinfo: {:?}", e),
+        None         => print_error!("  ext2 not mounted"),
+    }
+}
+
+pub fn cmd_fiemap(path: &str) {
+    if path.is_empty() { println!("Usage: fiemap <path>"); return; }
+    let result = with_ext2_pub(|fs| -> Result<(), FsError> {
+        let ino = fs.resolve_path(path)?;
+        let mut extents = [(0u32, 0u32, 0u32); 64];
+        let count = fs.ext4_fiemap(ino, &mut extents)?;
+        println!("  File extent map for inode {}:", ino);
+        if count == 0 {
+            println!("  (no extents / empty file)");
+        }
+        let mut total_blocks = 0u32;
+        for i in 0..count {
+            let (logical, phys, len) = extents[i];
+            println!("    [{:2}] logical={:<6} phys={:<8} len={}", i, logical, phys, len);
+            total_blocks += len;
+        }
+        println!("  {} extents, {} blocks total", count, total_blocks);
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(e)) => print_error!("  fiemap: {:?}", e),
+        None         => print_error!("  ext2 not mounted"),
+    }
+}
 
 pub fn cmd_ext4_fsck() {
     let result = with_ext2_pub(|fs| fs.ext2_fsck());
