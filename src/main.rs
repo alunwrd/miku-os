@@ -63,6 +63,7 @@ pub mod splash;
 pub mod usb_handoff;
 pub mod firmware;
 pub mod firmware_probe;
+pub mod fwload;
 pub mod ps2;
 
 unsafe extern "C" {
@@ -81,7 +82,7 @@ unsafe extern "C" fn kernel_main_grub(mb2_phys: u64) -> ! {
 }
 
 fn kernel_main() -> ! {
-    serial_println!("[kern] MikuOS starting (Release v0.2.1-rc)");
+    serial_println!("[kern] MikuOS starting (Release v0.2.2-rc)");
     gdt::init();
     unsafe {
         let cr0: u64;
@@ -141,6 +142,7 @@ fn kernel_main() -> ! {
     crate::solib::ldconfig();
     boot_step!("Shared library cache",      Ok(()));
     boot_step!("Network subsystem",         net::init());
+    boot_step!("Firmware store",            fwload::init());
     boot_step!("NVIDIA GPU probe",          nvidia::init());
     scheduler::init_main_thread();
     scheduler::init_workers(4);
@@ -243,6 +245,19 @@ fn kernel_main() -> ! {
         svc.flags.critical = true;
         svc.deps = &["kbd"];
         svc.on_restart = Some(shell::on_shell_restart);
+        mikud::register_service_ext(svc);
+    }
+    // netd: NetworkManager/systemd-networkd equivalent. Auto-runs DHCP
+    // after the NIC comes up, in its own thread so boot is never blocked
+    {
+        let mut svc = mikud::Service::empty();
+        svc.name = "netd";
+        svc.description = "DHCP auto-configuration";
+        svc.entry = Some(net::netd_thread);
+        svc.restart = mikud::RestartPolicy::OnFailure;
+        svc.target = mikud::Target::MultiUser;
+        svc.priority = 1;
+        svc.restart_delay_ticks = mikud::service::DEFAULT_RESTART_DELAY;
         mikud::register_service_ext(svc);
     }
 

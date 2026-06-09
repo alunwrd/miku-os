@@ -1,4 +1,4 @@
-// NVIDIA GPU command handlers - extracted from src/commands/system.rs.
+// NVIDIA GPU command handlers - extracted from src/commands/system.rs
 // All cmd_nvidia_ helpers have been moved here; the cmd_nvidia dispatcher*
 // remains the sole public entry point
 
@@ -7,6 +7,7 @@ use crate::{cprint, cprintln};
 pub fn cmd_nvidia(arg: &str) {
     match arg.trim() {
         "" | "info" | "status"           => cmd_nvidia_info(),
+        "list" | "ls" | "gpus"           => cmd_nvidia_list(),
         "splash" | "test" | "draw"       => {
             crate::splash::draw();
             cprintln!(100, 220, 150, "  splash drawn - check the screen");
@@ -22,11 +23,23 @@ pub fn cmd_nvidia(arg: &str) {
         "dma-test" | "dmatest" | "loopback" => cmd_nvidia_dma_test(),
         "imem-test" | "imemtest"         => cmd_nvidia_imem_test(),
         "acr-info" | "acrinfo" | "acr"   => cmd_nvidia_acr_info(),
+        "temp" | "thermal" | "temperature" => cmd_nvidia_temp(),
         "gsp"                            => cmd_nvidia_gsp(),
+        "gsp-rm" | "gsprm"               => cmd_nvidia_gsprm(),
+        "gsp-rm-dryrun" | "gsprm-dryrun" => cmd_nvidia_gsprm_dryrun(),
+        "gsp-rm-load" | "gsprm-load"     => cmd_nvidia_gsprm_load(),
+        "gsp-rm-boot" | "gsprm-boot"     => cmd_nvidia_gsprm_boot(),
+        "gsp-rm-boot-full" | "gsprm-boot-full" | "gsp-boot" => cmd_nvidia_gsprm_boot_full(),
+        "nvdec-scrub" | "scrub" | "scrubber" => cmd_nvidia_nvdec_scrub(),
+        "sec2-acr" | "sec2acr" | "acr-boot" => cmd_nvidia_sec2_acr(),
+        "sec2-acr-v2" | "sec2acrv2" | "acr-boot-v2" => cmd_nvidia_sec2_acr_v2(),
+        "wpr-state" | "wpr"              => cmd_nvidia_wpr_state(),
+        "msgq-test" | "msgq"             => cmd_nvidia_msgq_test(),
+        "rpc-test" | "rpc"               => cmd_nvidia_rpc_test(),
         "next" | "todo" | "roadmap"      => cmd_nvidia_next(),
         "help" | "?"                     => cmd_nvidia_help_local(),
         _ => {
-            crate::println!("Usage: nvidia [info|debug|firmware|falcon|ungate|pmc-scan|dma-state|fbif-scan|fbif-decode|dma-test|imem-test|acr-info|gsp|next|splash|help]");
+            crate::println!("Usage: nvidia [info|list|debug|firmware|falcon|ungate|pmc-scan|dma-state|fbif-scan|fbif-decode|dma-test|imem-test|acr-info|temp|gsp|gsp-rm|gsp-rm-dryrun|gsp-rm-load|gsp-rm-boot|gsp-rm-boot-full|nvdec-scrub|sec2-acr|sec2-acr-v2|next|splash|help]");
         }
     }
 }
@@ -34,6 +47,7 @@ pub fn cmd_nvidia(arg: &str) {
 fn cmd_nvidia_help_local() {
     cprintln!(118, 185, 0, "  nvidia subcommands");
     crate::println!("    info                - summary (default)");
+    crate::println!("    list (ls)           - enumerate all recognized NVIDIA GPUs (any family)");
     crate::println!("    debug               - full BAR0 register dump (PMC, PBUS, PFIFO, PTOP)");
     crate::println!("    firmware (fw)       - list embedded TU116 blobs and their NVFW headers");
     crate::println!("    falcon              - per-engine (sec2/gsp/nvdec/fecs/gpccs) liveness");
@@ -52,9 +66,62 @@ fn cmd_nvidia_help_local() {
     crate::println!("                           set_imem_tag=true (the path used to load HS ucode)");
     crate::println!("    acr-info (acr)      - dump structure of every SEC2 ACR blob: NVFW container,");
     crate::println!("                           inner-header bytes, payload prefix (read-only)");
+    crate::println!("    temp (thermal)      - read the on-die temperature sensor + thermal limits");
+    crate::println!("    nvdec-scrub (scrub) - run NVDEC scrubber first-contact boot (zeroes WPR region)");
     crate::println!("    gsp                 - run GSP first-contact boot on demand");
+    crate::println!("    gsp-rm (gsprm)      - VRAM size + WPR2 layout + GSP ABI scaffolding");
+    crate::println!("    gsp-rm-dryrun       - self-test radix3 + WPR-meta path with a synthetic ELF");
+    crate::println!("    gsp-rm-load         - parse embedded GSP-RM ELF, stage .fwimage, build radix3 + meta (pins state)");
+    crate::println!("    gsp-rm-boot         - hand the pinned WPR-meta to the GSP booter and kick booter_load");
+    crate::println!("    gsp-rm-boot-full    - drive the entire boot pipeline (scrub->load->ACR->WPR2->booter->handshake)");
+    crate::println!("    sec2-acr            - first-contact SEC2 ACR boot: stage ahesasc in sysmem,");
+    crate::println!("                           upload acr/bl into SEC2 IMEM (SECURE), kick, observe halt");
+    crate::println!("    sec2-acr-v2         - same path but parse ahesasc HS layers and upload a real");
+    crate::println!("                           flcn_bl_dmem_desc to SEC2 DMEM before kick");
+    crate::println!("    wpr-state (wpr)     - dump PFB MMU WPR1/WPR2 lock registers (read-only)");
+    crate::println!("    msgq-test (msgq)    - alloc + verify GSP CMDQ/MSGQ ring layout in sysmem");
+    crate::println!("    rpc-test  (rpc)     - GSP RPC frame round-trip self-test (no GPU traffic)");
     crate::println!("    next                - inspect state and prescribe the next concrete step");
     crate::println!("    splash              - redraw the boot splash via the framebuffer");
+}
+
+// nvidia list - enumerate every NVIDIA GPU the driver recognized, across
+// all families. The GTX 1650 (if present) runs the full firmware pipeline;
+// any other card is brought up host-side only and listed from the generic
+// registry
+fn cmd_nvidia_list() {
+    use crate::nvidia::{generic, with_gtx1650};
+
+    cprintln!(118, 185, 0, "  recognized NVIDIA GPUs");
+
+    let mut total = 0usize;
+
+    let gtx = with_gtx1650(|dev| {
+        crate::println!(
+            "    [{:04x}:{:04x}] {} ({}) - full driver (firmware pipeline)",
+            dev.pci.vendor, dev.pci.device, dev.model_name, dev.chip.codename()
+        );
+    });
+    if gtx.is_some() { total += 1; }
+
+    generic::with_generic_gpus(|gpus| {
+        for g in gpus {
+            crate::println!(
+                "    [{:04x}:{:04x}] {} ({}) - host-side only{}",
+                g.pci.vendor, g.pci.device, g.profile.model_hint, g.chip.codename(),
+                if g.profile.has_firmware { "" } else { " (no firmware bundle)" }
+            );
+        }
+        total += gpus.len();
+    });
+
+    if total == 0 {
+        crate::print_warn!("  no NVIDIA GPU recognized");
+        crate::println!("  (on QEMU without VFIO this is expected; the host owns the device)");
+    } else {
+        crate::println!("");
+        crate::println!("  {} GPU(s); {} brought up host-side", total, generic::count());
+    }
 }
 
 fn cmd_nvidia_info() {
@@ -145,7 +212,7 @@ fn cmd_nvidia_info() {
     }
 }
 
-// nvidia debug - BAR0 register dump.
+// nvidia debug - BAR0 register dump
 //
 // Dumps every register the host can read without engaging an engine. Useful
 // when (a) on QEMU the card is not bound, in which case 'info' will print
@@ -211,10 +278,11 @@ fn cmd_nvidia_debug() {
 fn cmd_nvidia_firmware() {
     use crate::nvidia::gtx1650::tu116_fw::{self, NvfwBinHdr, Engine as FwEngine};
 
-    cprintln!(118, 185, 0, "  TU116 firmware bundle (compile-time embedded)");
+    cprintln!(118, 185, 0, "  TU116 firmware bundle (on firmware store, loaded on demand)");
     crate::println!("    blobs:        {}", tu116_fw::TU116_FIRMWARE.len());
     crate::println!("    total size:   {} bytes", tu116_fw::total_size());
     crate::println!("    gsp line:     {}", tu116_fw::GSP_DEFAULT_LINE);
+    crate::println!("    store:        {}", if crate::fwload::available() { "mounted" } else { "NOT FOUND" });
     crate::println!("");
     crate::println!("    {:<32} {:<6} {:>7} {:<24}", "blob", "engine", "bytes", "container");
     for b in tu116_fw::TU116_FIRMWARE {
@@ -226,12 +294,22 @@ fn cmd_nvidia_firmware() {
             FwEngine::Gpccs  => "gpccs",
             FwEngine::HostSw => "host",
         };
+        // Pull each blob from the store on demand; the buffer is freed when
+        // `fw` drops at the end of the iteration.
+        let fw = match crate::fwload::request(b.path) {
+            Ok(fw) => fw,
+            Err(e) => {
+                crate::println!("    {:<32} {:<6} {:>7} unavailable ({:?})", b.name, eng, "-", e);
+                continue;
+            }
+        };
+        let bytes = fw.bytes();
         let container = if b.wrapped {
-            if NvfwBinHdr::parse(b.bytes).is_some() { "NVFW v1" } else { "NVFW (parse failed)" }
+            if NvfwBinHdr::parse(bytes).is_some() { "NVFW v1" } else { "NVFW (parse failed)" }
         } else { "raw" };
-        crate::println!("    {:<32} {:<6} {:>7} {:<24}", b.name, eng, b.bytes.len(), container);
+        crate::println!("    {:<32} {:<6} {:>7} {:<24}", b.name, eng, bytes.len(), container);
         if b.wrapped {
-            if let Some(h) = NvfwBinHdr::parse(b.bytes) {
+            if let Some(h) = NvfwBinHdr::parse(bytes) {
                 crate::println!(
                     "        ver={} bin_size={:#x} hdr@{:#x} data@{:#x}+{:#x}",
                     h.bin_ver, h.bin_size, h.header_offset, h.data_offset, h.data_size
@@ -240,11 +318,12 @@ fn cmd_nvidia_firmware() {
         }
     }
     crate::println!("");
-    crate::println!("  NOTE: GSP-RM image (gsp_t.bin) is NOT in this bundle. The booter alone");
-    crate::println!("        cannot run a kernel-resident GPU OS without staging GSP-RM in WPR.");
+    crate::println!("  NOTE: GSP-RM image (gsp-570.144.bin) lives on the firmware store too,");
+    crate::println!("        not in this bundle list. The booter alone cannot run a kernel-");
+    crate::println!("        resident GPU OS without staging GSP-RM in WPR.");
 }
 
-// nvidia falcon -- liveness probe of every Falcon engine.
+// nvidia falcon - liveness probe of every Falcon engine
 fn cmd_nvidia_falcon() {
     use crate::nvidia::with_gtx1650;
     use crate::nvidia::gtx1650::falcon::{
@@ -280,7 +359,7 @@ fn cmd_nvidia_falcon() {
                 }
                 Liveness::GatedPriSentinel => {
                     crate::println!(
-                        "    {:<7} {:#010x} GATED  PRI sentinel {:#010x} -- engine off in PMC_ENABLE/DEVICE_ENABLE",
+                        "    {:<7} {:#010x} GATED  PRI sentinel {:#010x} - engine off in PMC_ENABLE/DEVICE_ENABLE",
                         name, base, e.hwcfg());
                 }
                 Liveness::NoResponse => {
@@ -317,7 +396,7 @@ fn cmd_nvidia_ungate() {
             crate::println!("    (bits were already set)");
         } else {
             crate::println!("    set bits: {:#010x}", after & !before);
-            crate::println!("    rerun `nvidia falcon` to confirm FECS / GPCCS now report alive");
+            crate::println!("    rerun 'nvidia falcon' to confirm FECS / GPCCS now report alive");
         }
     });
     if shown.is_none() {
@@ -330,11 +409,11 @@ fn cmd_nvidia_ungate() {
 // without committing a guess at a hard-coded offset
 //
 // Heuristics:
-//   - skip zeros and the 0xFFFF_FFFF "no decode" pattern
-//   - flag values that look like bitmasks (popcount <= 8) or sentinels
+//     skip zeros and the 0xFFFF_FFFF "no decode" pattern
+//     flag values that look like bitmasks (popcount <= 8) or sentinels
 //     (0xBADF_xxxx is a PRI bus reject - never a device enable)
-//   - annotate well-known offsets we already understand
-//   - collapse runs of identical reads into a single line so the output
+//     annotate well-known offsets we already understand
+//     collapse runs of identical reads into a single line so the output
 //     is easy to skim on a real serial log
 //
 // This subcommand never writes; it is safe to run on a live system
@@ -484,8 +563,8 @@ fn cmd_nvidia_dma_state() {
         }
         crate::println!("");
         crate::println!("  notes:");
-        crate::println!("    - all values are pre-DMA-setup; we have not configured any FBIF yet.");
-        crate::println!("    - idle=1 means the engine is ready to accept a dma_load call once");
+        crate::println!("      all values are pre-DMA-setup; we have not configured any FBIF yet.");
+        crate::println!("      idle=1 means the engine is ready to accept a dma_load call once");
         crate::println!("      step (A) lands a buffer allocator + FBIF aperture programming.");
     });
     if shown.is_none() {
@@ -493,7 +572,7 @@ fn cmd_nvidia_dma_state() {
     }
 }
 
-// nvidia fbif-scan - read-only sweep of each live falcon's FBIF window.
+// nvidia fbif-scan - read-only sweep of each live falcon's FBIF window
 //
 // Goal: identify the actual offset of FBIF_TRANSCFG (per-context-DMA
 // aperture descriptor) and FBIF_REGIONCFG (WPR region selector) on TU116
@@ -503,12 +582,12 @@ fn cmd_nvidia_dma_state() {
 // 0x600 or +0x800 with FBIF registers in the first 0x100 bytes
 //
 // Heuristics applied to identify FBIF registers:
-//   - TRANSCFG entries (8 of them, 4 bytes each) read as 0 at boot if
+//     TRANSCFG entries (8 of them, 4 bytes each) read as 0 at boot if
 //     no driver has programmed them, or as a bitmask with low bits set
-//     (target type + access mode) if hw POST set defaults.
-//   - REGIONCFG is a 4-bit-per-context array (32 bits, 8 contexts)
-//   - PRI sentinels (0xBADF_xxxx) flag dead/gated regions and let us
-//     bound the actually-decoded part of the FBIF window.
+//     (target type + access mode) if hw POST set defaults
+//     REGIONCFG is a 4-bit-per-context array (32 bits, 8 contexts)
+//     PRI sentinels (0xBADF_xxxx) flag dead/gated regions and let us
+//     bound the actually-decoded part of the FBIF window
 //
 // Read-only: safe on any live system
 fn cmd_nvidia_fbif_scan() {
@@ -562,9 +641,9 @@ fn cmd_nvidia_fbif_scan() {
         }
 
         crate::println!("  reading the output:");
-        crate::println!("    - 8 consecutive small bitmasks at fixed stride (typically 4B) ==> TRANSCFG[0..7]");
-        crate::println!("    - a single 32-bit value with 4-bit fields per ctx     ==> REGIONCFG");
-        crate::println!("    - the first non-sentinel offset is usually FBIF_BASE relative to engine");
+        crate::println!("      8 consecutive small bitmasks at fixed stride (typically 4B) ==> TRANSCFG[0..7]");
+        crate::println!("      a single 32-bit value with 4-bit fields per ctx     ==> REGIONCFG");
+        crate::println!("      the first non-sentinel offset is usually FBIF_BASE relative to engine");
     });
     if shown.is_none() {
         crate::print_warn!("  no NVIDIA GPU bound - fbif-scan needs real silicon");
@@ -654,9 +733,9 @@ fn cmd_nvidia_fbif_decode() {
 //   7) report which 32-bit slots match / mismatch
 //
 // Failure modes we expect to recover from cleanly:
-//   - DMATRFCMD_ERROR set: layout mismatch -> reported, buffer freed
-//   - dma_load returns Timeout: GPU hung in DMA -> diagnostic, buffer freed
-//   - read-back mismatch: aperture/address-translation issue -> diagnostic
+//     DMATRFCMD_ERROR set: layout mismatch -> reported, buffer freed
+//     dma_load returns Timeout: GPU hung in DMA -> diagnostic, buffer freed
+//     read-back mismatch: aperture/address-translation issue -> diagnostic
 fn cmd_nvidia_dma_test() {
     use crate::nvidia::with_gtx1650;
     use crate::nvidia::gtx1650::falcon::{
@@ -812,7 +891,7 @@ fn cmd_nvidia_dma_test() {
         // buf drops here, frames are returned to pmm
     });
     if shown.is_none() {
-        crate::print_warn!("  no NVIDIA GPU bound -- dma-test needs real silicon");
+        crate::print_warn!("  no NVIDIA GPU bound - dma-test needs real silicon");
     }
 }
 
@@ -928,9 +1007,9 @@ fn cmd_nvidia_imem_test() {
             }
         }
 
-        // IMEM port read: byte offset 0 | AINCR. If IMEM is PRIV-locked the
+        // IMEM port read: byte offset 0 / AINCR. If IMEM is PRIV-locked the
         // bus returns 0xBADFxxxx sentinels; treat that as "unreadable from
-        // host PRIV but write side validated by dma_load=OK"
+        // host PRIV but write side validated by dma_load=ok"
         sec2.write(FALCON_IMEM_C0, MEM_C_AINCR);
         let mut readback = [0u32; 64];
         for w in &mut readback {
@@ -972,11 +1051,11 @@ fn cmd_nvidia_imem_test() {
         crate::println!("    sec2 TRANSCFG[{}] restored to {:#010x}", CTX, restored);
     });
     if shown.is_none() {
-        crate::print_warn!("  no NVIDIA GPU bound -- imem-test needs real silicon");
+        crate::print_warn!("  no NVIDIA GPU bound - imem-test needs real silicon");
     }
 }
 
-// nvidia acr-info - read-only structural dump of every SEC2 ACR blob.
+// nvidia acr-info - read-only structural dump of every SEC2 ACR blob
 //
 // For each blob we print:
 //     raw size, container kind (NVFW vs raw)
@@ -1000,12 +1079,22 @@ fn cmd_nvidia_acr_info() {
         if !b.name.starts_with("acr/") { continue; }
         shown += 1;
 
+        // Fetch from the firmware store; freed when fw drops at loop end.
+        let fw = match crate::fwload::request(b.path) {
+            Ok(fw) => fw,
+            Err(e) => {
+                crate::print_warn!("  {} unavailable ({:?})", b.name, e);
+                continue;
+            }
+        };
+        let bytes = fw.bytes();
+
         crate::println!("");
         cprintln!(180, 220, 255,
-            "  {} ({} bytes)", b.name, b.bytes.len());
+            "  {} ({} bytes)", b.name, bytes.len());
 
         // Outer NVFW container
-        let bin_hdr = match NvfwBinHdr::parse(b.bytes) {
+        let bin_hdr = match NvfwBinHdr::parse(bytes) {
             Some(h) => h,
             None => {
                 crate::print_warn!("    NVFW parse failed (magic/size mismatch)");
@@ -1021,7 +1110,7 @@ fn cmd_nvidia_acr_info() {
         // Middle HS header. bl.bin / unload_bl.bin are NVFW-wrapped but
         // their inner 0x100..0x200 region is an LS bootloader descriptor,
         // not an HS header. looks_valid() filters those out
-        let hs_hdr = match NvfwHsHeader::parse(b.bytes, bin_hdr.header_offset as usize) {
+        let hs_hdr = match NvfwHsHeader::parse(bytes, bin_hdr.header_offset as usize) {
             Some(h) => h,
             None => {
                 crate::print_warn!("    nvfw_hs_header parse failed at off {:#x}",
@@ -1035,12 +1124,12 @@ fn cmd_nvidia_acr_info() {
             let desc_start = bin_hdr.header_offset as usize;
             let desc_end   = bin_hdr.data_offset as usize;
             let desc_len   = desc_end.saturating_sub(desc_start).min(64);
-            if desc_len > 0 && desc_end <= b.bytes.len() {
+            if desc_len > 0 && desc_end <= bytes.len() {
                 crate::println!("    descriptor[0..{:#x}] (abs off {:#x}):",
                     desc_len, desc_start);
-                dump_hex(&b.bytes[desc_start..desc_start + desc_len], 0);
+                dump_hex(&bytes[desc_start..desc_start + desc_len], 0);
             }
-            let payload = bin_hdr.data(b.bytes);
+            let payload = bin_hdr.data(bytes);
             let pn = payload.len().min(32);
             crate::println!("    payload[0..{:#x}] (abs off {:#x}):",
                 pn, bin_hdr.data_offset);
@@ -1054,8 +1143,8 @@ fn cmd_nvidia_acr_info() {
             hs_hdr.sig_dbg_offset, hs_hdr.sig_dbg_size);
         crate::println!("      sig_prod: off={:#x} size={:#x}",
             hs_hdr.sig_prod_offset, hs_hdr.sig_prod_size);
-        let pl_val = hs_hdr.read_patch_loc_value(b.bytes).unwrap_or(0xFFFF_FFFF);
-        let ps_val = hs_hdr.read_patch_sig_value(b.bytes).unwrap_or(0xFFFF_FFFF);
+        let pl_val = hs_hdr.read_patch_loc_value(bytes).unwrap_or(0xFFFF_FFFF);
+        let ps_val = hs_hdr.read_patch_sig_value(bytes).unwrap_or(0xFFFF_FFFF);
         crate::println!("      patch_loc: ptr={:#x} *ptr={:#x}",
             hs_hdr.patch_loc, pl_val);
         crate::println!("      patch_sig: ptr={:#x} *ptr={:#x}",
@@ -1064,7 +1153,7 @@ fn cmd_nvidia_acr_info() {
             hs_hdr.hdr_offset, hs_hdr.hdr_size);
 
         // Inner HS load header
-        match NvfwHsLoadHeader::parse(b.bytes, hs_hdr.hdr_offset as usize, hs_hdr.hdr_size) {
+        match NvfwHsLoadHeader::parse(bytes, hs_hdr.hdr_offset as usize, hs_hdr.hdr_size) {
             Some(lh) => {
                 crate::println!("    nvfw_hs_load_header:");
                 crate::println!("      non_sec_code : off={:#x} size={:#x}",
@@ -1084,7 +1173,7 @@ fn cmd_nvidia_acr_info() {
         }
 
         // Payload prefix
-        let payload = bin_hdr.data(b.bytes);
+        let payload = bin_hdr.data(bytes);
         let pn = payload.len().min(32);
         crate::println!("    payload[0..{:#x}] (abs off {:#x}):",
             pn, bin_hdr.data_offset);
@@ -1117,7 +1206,452 @@ fn dump_hex(bytes: &[u8], base: usize) {
     }
 }
 
+// nvidia temp - read the on-die temperature sensor (PTHERM). Non-destructive
+fn cmd_nvidia_rpc_test() {
+    use crate::nvidia::with_gtx1650;
+    use crate::nvidia::gtx1650::rpc;
+
+    let shown = with_gtx1650(|_dev| {
+        cprintln!(118, 185, 0, "  GSP RPC frame round-trip self-test (no GPU traffic)");
+        match rpc::self_test() {
+            Ok(r) => {
+                crate::println!("    encoded function={:#x} sequence={:#x} length={}",
+                    r.function, r.seq, r.length);
+                if r.frame_decoded_ok {
+                    cprintln!(120, 220, 150, "    frame round-trip ok (header + payload)");
+                } else {
+                    crate::print_warn!("    frame round-trip failed");
+                }
+            }
+            Err(e) => crate::print_warn!("    self-test failed: {:?}", e),
+        }
+    });
+    if shown.is_none() {
+        crate::print_warn!("  no NVIDIA GPU bound");
+    }
+}
+
+fn cmd_nvidia_msgq_test() {
+    use crate::nvidia::with_gtx1650;
+    use crate::nvidia::gtx1650::msgq;
+
+    let shown = with_gtx1650(|_dev| {
+        cprintln!(118, 185, 0, "  GSP msgq layout self-test (allocates 128 sysmem pages)");
+        match msgq::self_test() {
+            Ok(r) => {
+                crate::println!("    region: base={:#x} size={} bytes entries={}",
+                    r.phys_base, r.size, r.entries);
+                crate::println!("    CMDQ.TxHdr @ {:#x}  CMDQ.RxHdr @ {:#x}",
+                    r.cmdq_tx_phys, r.cmdq_rx_phys);
+                crate::println!("    MSGQ.TxHdr @ {:#x}  MSGQ.RxHdr @ {:#x}",
+                    r.msgq_tx_phys, r.msgq_rx_phys);
+                crate::println!("    CMDQ data @ {:#x}   MSGQ data @ {:#x}",
+                    r.cmdq_data_phys, r.msgq_data_phys);
+                if r.ok {
+                    cprintln!(120, 220, 150, "    layout ok (pointer round-trip + page alignment)");
+                } else {
+                    crate::print_warn!("    layout failed self-test");
+                }
+            }
+            Err(e) => crate::print_warn!("    msgq alloc failed: {:?}", e),
+        }
+    });
+    if shown.is_none() {
+        crate::print_warn!("  no NVIDIA GPU bound");
+    }
+}
+
+fn cmd_nvidia_wpr_state() {
+    use crate::nvidia::with_gtx1650;
+    use crate::nvidia::gtx1650::regs::{
+        decode_wpr_addr,
+        PFB_PRI_MMU_ALLOW_READ, PFB_PRI_MMU_ALLOW_WRITE,
+        PFB_PRI_MMU_WPR1_ADDR_HI, PFB_PRI_MMU_WPR1_ADDR_LO,
+        PFB_PRI_MMU_WPR2_ADDR_HI, PFB_PRI_MMU_WPR2_ADDR_LO,
+    };
+
+    let shown = with_gtx1650(|dev| {
+        cprintln!(118, 185, 0, "  PFB MMU WPR-region state (read-only)");
+        let bar0 = &dev.bar0;
+
+        let wpr1_lo_raw = bar0.read32(PFB_PRI_MMU_WPR1_ADDR_LO);
+        let wpr1_hi_raw = bar0.read32(PFB_PRI_MMU_WPR1_ADDR_HI);
+        let wpr2_lo_raw = bar0.read32(PFB_PRI_MMU_WPR2_ADDR_LO);
+        let wpr2_hi_raw = bar0.read32(PFB_PRI_MMU_WPR2_ADDR_HI);
+        let allow_r    = bar0.read32(PFB_PRI_MMU_ALLOW_READ);
+        let allow_w    = bar0.read32(PFB_PRI_MMU_ALLOW_WRITE);
+
+        let wpr1_lo = decode_wpr_addr(wpr1_lo_raw);
+        let wpr1_hi = decode_wpr_addr(wpr1_hi_raw);
+        let wpr2_lo = decode_wpr_addr(wpr2_lo_raw);
+        let wpr2_hi = decode_wpr_addr(wpr2_hi_raw);
+
+        crate::println!("    WPR1: lo={:#010x} hi={:#010x}", wpr1_lo_raw, wpr1_hi_raw);
+        crate::println!("          [{:#x} .. {:#x}]", wpr1_lo, wpr1_hi);
+        crate::println!("    WPR2: lo={:#010x} hi={:#010x}", wpr2_lo_raw, wpr2_hi_raw);
+        crate::println!("          [{:#x} .. {:#x}]", wpr2_lo, wpr2_hi);
+        crate::println!("    ALLOW_READ  = {:#010x}", allow_r);
+        crate::println!("    ALLOW_WRITE = {:#010x}", allow_w);
+
+        if wpr2_lo != 0 && wpr2_lo <= wpr2_hi {
+            cprintln!(120, 220, 150,
+                "    WPR2 LOCKED: {} MiB at top of VRAM",
+                (wpr2_hi.saturating_sub(wpr2_lo)) >> 20);
+        } else {
+            cprintln!(235, 200, 90,
+                "    WPR2 NOT locked - run 'nvidia sec2-acr-v2' to attempt ACR boot");
+        }
+    });
+    if shown.is_none() {
+        crate::print_warn!("  no NVIDIA GPU bound - nothing to read");
+    }
+}
+
+fn cmd_nvidia_temp() {
+    use crate::nvidia::with_gtx1650;
+    use crate::nvidia::gtx1650::therm;
+
+    let shown = with_gtx1650(|dev| {
+        cprintln!(118, 185, 0, "  GPU thermal sensor (PTHERM, read-only)");
+        let t = therm::read(&dev.bar0);
+        crate::println!("    TEMP_SENSOR = {:#010x}  valid={}  shadowed={}",
+            t.raw, t.valid, t.shadowed);
+        if t.valid {
+            let (r, g, b) = if t.celsius >= 90 { (235, 80, 80) }
+                            else if t.celsius >= 75 { (235, 200, 90) }
+                            else { (120, 220, 150) };
+            cprintln!(r, g, b, "    temperature: {} C{}", t.celsius,
+                if t.shadowed { " (stale latch)" } else { "" });
+        } else {
+            crate::print_warn!("    sensor reports no valid reading");
+        }
+        match t.slowdown_celsius() {
+            Some(c) => crate::println!("    slowdown threshold: {} C ({:#010x})", c, t.slowdown_raw),
+            None    => crate::println!("    slowdown threshold: not programmed (VBIOS devinit not run)"),
+        }
+        match t.shutdown_celsius() {
+            Some(c) => crate::println!("    shutdown threshold: {} C ({:#010x})", c, t.shutdown_raw),
+            None    => crate::println!("    shutdown threshold: not programmed (VBIOS devinit not run)"),
+        }
+    });
+    if shown.is_none() {
+        crate::print_warn!("  no NVIDIA GPU bound - nothing to read");
+    }
+}
+
+// nvidia gsp-rm - walk the GSP-RM bring-up scaffolding (VRAM size, WPR2
+// layout, ABI sizes). Stops at MissingFirmware; no GSP-RM blob is shipped
+fn cmd_nvidia_gsprm() {
+    use crate::nvidia::with_gtx1650;
+    use crate::nvidia::gtx1650::gsprm::{self, GsprmError};
+
+    let shown = with_gtx1650(|dev| {
+        cprintln!(118, 185, 0, "  GSP-RM bring-up scaffolding");
+        match gsprm::prepare(&dev.bar0) {
+            Ok(prep) => {
+                crate::println!("    VRAM: {} MiB total, {} MiB usable (ecc_reserved={})",
+                    prep.vram.total_bytes >> 20, prep.vram.usable_bytes >> 20,
+                    prep.vram.ecc_reserved);
+                let l = prep.layout;
+                crate::println!("    WPR2: [{:#x} .. {:#x}]", l.gsp_fw_wpr_start, l.gsp_fw_wpr_end);
+                crate::println!("      heap   @ {:#x} + {:#x}", l.gsp_fw_heap_offset, l.gsp_fw_heap_size);
+                crate::println!("      fw elf @ {:#x} + {:#x}", l.gsp_fw_offset, l.gsp_fw_size);
+                crate::println!("      bootbin@ {:#x}", l.boot_bin_offset);
+                crate::println!("      frts   @ {:#x} + {:#x}", l.frts_offset, l.frts_size);
+                crate::println!("      non-wpr@ {:#x} + {:#x}", l.non_wpr_heap_offset, l.non_wpr_heap_size);
+            }
+            Err(GsprmError::NoVram) => {
+                crate::print_warn!("    PFB reports 0 VRAM - devinit has not run, layout unavailable");
+            }
+            Err(GsprmError::MissingFirmware) => {
+                crate::println!("    scaffolding OK (see serial log for VRAM / WPR2 layout)");
+                crate::print_warn!("    next step needs a signed GSP-RM image (gsp-*.bin) - not in tree");
+            }
+            Err(e) => {
+                crate::print_warn!("    gsp-rm prepare failed: {:?}", e);
+            }
+        }
+    });
+    if shown.is_none() {
+        crate::print_warn!("  no NVIDIA GPU bound - nothing to do");
+    }
+}
+
+// nvidia gsp-rm-dryrun - self-test the radix3 + WPR-meta path with a
+// synthetic in-memory ELF (default 256 pages = 1 MiB)
+fn cmd_nvidia_gsprm_dryrun() {
+    use crate::nvidia::with_gtx1650;
+    use crate::nvidia::gtx1650::gsprm;
+
+    let shown = with_gtx1650(|dev| {
+        cprintln!(118, 185, 0, "  GSP-RM scaffolding dry-run (synthetic ELF, 256 pages)");
+        match gsprm::dryrun(&dev.bar0, 256) {
+            Ok(r) => {
+                crate::println!("    fake ELF: {} pages @ {:#x}", r.fake_elf_pages, r.fake_elf_phys);
+                crate::println!("    radix3:   root @ {:#x}  (lvl1={} pages, lvl2={} pages)",
+                    r.radix3_root_phys, r.lvl1_pages, r.lvl2_pages);
+                crate::println!("    resolved page0 via lvl0->lvl1->lvl2 = {:#x}", r.resolved_first_page);
+                crate::println!("    WprMeta size = {} bytes", r.meta_size);
+                if r.ok {
+                    cprintln!(120, 220, 150, "    PASS - radix3 chain resolves, meta block consistent");
+                } else {
+                    crate::print_warn!("    FAIL - chain mismatch (see serial log)");
+                }
+            }
+            Err(e) => crate::print_warn!("    dry-run failed: {:?}", e),
+        }
+    });
+    if shown.is_none() {
+        crate::print_warn!("  no NVIDIA GPU bound - nothing to do");
+    }
+}
+
+// nvidia gsp-rm-load - parse the GSP-RM ELF (fetched from the firmware
+// store on demand), stage .fwimage, build the radix3 + WPR-meta.
+fn cmd_nvidia_gsprm_load() {
+    use crate::nvidia::with_gtx1650;
+    use crate::nvidia::gtx1650::{gsprm, tu116_fw};
+    use crate::nvidia::gtx1650::gsprm::LoadError;
+
+    let shown = with_gtx1650(|dev| {
+        cprintln!(118, 185, 0, "  GSP-RM load (TU116, line 570.144)");
+        let gsp_rm_fw = tu116_fw::gsp_rm_570();
+        let blob = gsp_rm_fw.bytes();
+        if blob.is_empty() {
+            crate::print_warn!("    GSP-RM firmware not available on the firmware store.");
+            crate::println!("    Expected at /nvidia/tu116/gsp/gsp-570.144.bin on the store.");
+            crate::println!("    The builder stages it from src/nvidia/gtx1650/tu116/gsp/gsp-570.144.bin");
+            crate::println!("    (zstd -dc /usr/lib/firmware/nvidia/tu102/gsp/gsp-570.144.bin.zst > that path)");
+            return;
+        }
+        match gsprm::load(&dev.bar0, blob) {
+            Ok(r) => {
+                let ver = core::str::from_utf8(&r.version)
+                    .unwrap_or("?").trim_end_matches('\0');
+                crate::println!("    fwimage   = {} bytes  signature = {} bytes  version = {}",
+                    r.fwimage_len, r.signature_len, ver);
+                crate::println!("    VRAM      = {} MiB", r.vram_total >> 20);
+                crate::println!("    staged    @ {:#x}  ({} pages)", r.staged_phys, r.staged_pages);
+                crate::println!("    radix3    root @ {:#x}  (lvl1={} pages, lvl2={} pages)  resolves={}",
+                    r.radix3_root_phys, r.radix3_lvl1_pages, r.radix3_lvl2_pages, r.radix3_resolves);
+                let l = r.layout;
+                crate::println!("    WPR2      [{:#x} .. {:#x}]  fw@{:#x}+{:#x}  heap@{:#x}+{:#x}",
+                    l.gsp_fw_wpr_start, l.gsp_fw_wpr_end, l.gsp_fw_offset, l.gsp_fw_size,
+                    l.gsp_fw_heap_offset, l.gsp_fw_heap_size);
+                crate::println!("    WprMeta   @ {:#x}  ({} bytes, pinned)", r.meta_phys, r.meta_size);
+                if r.radix3_resolves {
+                    cprintln!(120, 220, 150, "    OK - staged & pinned; run `nvidia gsp-rm-boot` to hand it to the booter");
+                } else {
+                    crate::print_warn!("    radix3 chain does NOT resolve - see serial log");
+                }
+            }
+            Err(LoadError::NoFirmware) => {
+                crate::print_warn!("    GSP-RM firmware slice empty (feature off)");
+            }
+            Err(LoadError::Elf(e)) => {
+                crate::print_warn!("    GSP-RM ELF parse failed: {:?}", e);
+            }
+            Err(LoadError::Gsprm(e)) => {
+                crate::print_warn!("    GSP-RM staging failed: {:?}", e);
+                if matches!(e, gsprm::GsprmError::Alloc(_)) {
+                    crate::println!("    (could not get ~28 MiB of physically-contiguous sysmem)");
+                }
+            }
+            Err(LoadError::BadBootloader) => {
+                crate::print_warn!("    GSP RISC-V bootloader (bootloader-570.144.bin) did not parse");
+            }
+        }
+    });
+    if shown.is_none() {
+        crate::print_warn!("  no NVIDIA GPU bound - nothing to do");
+    }
+}
+
+// nvidia gsp-rm-boot - hand the pinned WPR-meta to the GSP booter and kick
+// booter_load. Requires 'nvidia gsp-rm-load' to have run first
+fn cmd_nvidia_gsprm_boot() {
+    use crate::nvidia::with_gtx1650;
+    use crate::nvidia::gtx1650::gsprm::{self, BooterError};
+
+    let shown = with_gtx1650(|dev| {
+        cprintln!(118, 185, 0, "  GSP-RM booter handoff");
+        if !gsprm::is_loaded() {
+            crate::print_warn!("    GSP-RM not loaded - run 'nvidia gsp-rm-load' first");
+            return;
+        }
+        let meta_phys = gsprm::with_state(|s| s.meta_phys()).unwrap_or(0);
+        crate::println!("    WPR-meta @ {:#x} -> GSP MAILBOX0/MAILBOX1, kicking booter_load...", meta_phys);
+        match gsprm::boot_booter(&dev.bar0) {
+            Ok(st) => {
+                crate::println!("    booter halted: mb0={:#010x} mb1={:#010x} cpuctl={:#010x}",
+                    st.mb0, st.mb1, st.cpuctl);
+                if st.mb1 == 0 {
+                    crate::println!("    mb1=0 - booter exited early (expected: WPR2 not locked by SEC2 ACR yet)");
+                } else if st.mb1 & 0xFFFF_0000 == 0xBADF_0000 {
+                    crate::print_warn!("    mb1 = WPR / image-header error class ({:#x})", st.mb1);
+                } else {
+                    crate::println!("    mb1 = opaque booter code {:#x}", st.mb1);
+                }
+            }
+            Err(BooterError::NotLoaded) => crate::print_warn!("    GSP-RM not loaded"),
+            Err(BooterError::Gsp(e))    => crate::print_warn!("    GSP booter aborted: {:?}", e),
+        }
+    });
+    if shown.is_none() {
+        crate::print_warn!("  no NVIDIA GPU bound - nothing to do");
+    }
+}
+
+// nvidia gsp-rm-boot-full - drive the entire GSP-RM boot pipeline end to end
+//
+// Runs scrubber -> load -> SEC2 ACR -> WPR2 verify -> booter_load -> MSGQ
+// handshake in order, stopping at the first stage whose hardware
+// precondition is unmet and reporting exactly where and why
+fn cmd_nvidia_gsprm_boot_full() {
+    use crate::nvidia::with_gtx1650;
+    use crate::nvidia::gtx1650::gsprm::{self, BootStage};
+
+    let shown = with_gtx1650(|dev| {
+        cprintln!(118, 185, 0, "  GSP-RM full boot pipeline (6 stages)");
+        let rep = gsprm::boot(&dev.bar0, &dev.pci);
+
+        let stage_num = match rep.reached {
+            BootStage::Scrubber     => 1,
+            BootStage::Load         => 2,
+            BootStage::Fwsec        => 3,
+            BootStage::Acr          => 3,
+            BootStage::Wpr2Locked   => 4,
+            BootStage::Booter       => 5,
+            BootStage::GspHandshake => 6,
+        };
+        crate::println!("    reached stage {}/6 ({:?})", stage_num, rep.reached);
+
+        if rep.wpr2_locked {
+            cprintln!(100, 220, 150,
+                "    WPR2 locked: {:#x}..{:#x} ({} MiB)",
+                rep.wpr2_lo, rep.wpr2_hi, (rep.wpr2_hi.saturating_sub(rep.wpr2_lo)) >> 20);
+        } else {
+            crate::print_warn!("    WPR2 not locked - FWSEC FRTS did not lock the region");
+            crate::println!("    check the FWSEC desc parse + frts_err={:#06x} in the serial log", rep.frts_err);
+        }
+
+        match rep.reached {
+            BootStage::GspHandshake => cprintln!(100, 220, 150,
+                "    GSP-RM responded: function={:#x} result={:#x}",
+                rep.gsp_msg_function, rep.gsp_msg_result),
+            BootStage::Booter => {
+                crate::println!("    booter ran (mb1={:#010x}) but GSP-RM has not posted to our queue;",
+                    rep.booter_mb1);
+                crate::println!("    next step: pass the CMDQ/MSGQ phys to GSP-RM via the boot args (libos)");
+            }
+            _ => {}
+        }
+    });
+    if shown.is_none() {
+        crate::print_warn!("  no NVIDIA GPU bound - GSP boot only runs against real silicon");
+        crate::println!("  (on QEMU without VFIO this is expected)");
+    }
+}
+
+// nvidia sec2-acr - first-contact SEC2 ACR boot
+//
+// Stages ucode_ahesasc into sysmem, points FBIF ctx0 at it, loads
+// acr/bl into SEC2 IMEM (SECURE), hands the ahesasc phys address via
+// MAILBOX0/MAILBOX1, kicks CPUCTL and reports the halt status.
+// Without the full DMEM scratch layout the ACR bl is expected to
+// halt early; the diagnostic value is observing the engine engaging
+// our HS-signed upload
+fn cmd_nvidia_sec2_acr() {
+    use crate::nvidia::with_gtx1650;
+    use crate::nvidia::gtx1650::sec2;
+
+    let shown = with_gtx1650(|dev| {
+        cprintln!(118, 185, 0, "  SEC2 ACR first-contact boot");
+        match sec2::attempt_acr(&dev.bar0) {
+            Ok(st) => {
+                crate::println!("    ahesasc staged: @ {:#x} ({} bytes)", st.ahesasc_phys, st.ahesasc_size);
+                cprintln!(100, 220, 150,
+                    "    halted: mb0={:#010x} mb1={:#010x} cpuctl={:#010x}",
+                    st.mb0, st.mb1, st.cpuctl);
+                if st.mb1 == 0 {
+                    crate::println!("    mb1=0 - ACR exited early (expected: DMEM scratch layout not populated yet)");
+                } else if st.mb1 & 0xFFFF_0000 == 0xBADF_0000 {
+                    crate::print_warn!("    mb1 = PRI / sentinel error class ({:#x})", st.mb1);
+                } else {
+                    crate::println!("    mb1 = opaque ACR code {:#x}", st.mb1);
+                }
+            }
+            Err(e) => crate::print_warn!("    aborted: {:?}", e),
+        }
+    });
+    if shown.is_none() {
+        crate::print_warn!("  no NVIDIA GPU bound - nothing to do");
+    }
+}
+
+// nvidia sec2-acr-v2 - SEC2 ACR boot with a real flcn_bl_dmem_desc
+//
+// Parses ahesasc HS layers (NVFW -> HS header -> HS load_header),
+// builds a flcn_bl_dmem_desc pointing at the sysmem-staged image,
+// uploads it to SEC2 DMEM, then kicks bl. A correct desc moves bl
+// past the early-exit mb1=0 path into actually DMA-ing the HS image
+fn cmd_nvidia_sec2_acr_v2() {
+    use crate::nvidia::with_gtx1650;
+    use crate::nvidia::gtx1650::sec2;
+
+    let shown = with_gtx1650(|dev| {
+        cprintln!(118, 185, 0, "  SEC2 ACR v2 boot (with bl_dmem_desc)");
+        match sec2::attempt_acr_v2(&dev.bar0) {
+            Ok(st) => {
+                crate::println!("    ahesasc: @ {:#x} ({} bytes)", st.ahesasc_phys, st.ahesasc_size);
+                cprintln!(100, 220, 150,
+                    "    halted: mb0={:#010x} mb1={:#010x} cpuctl={:#010x}",
+                    st.mb0, st.mb1, st.cpuctl);
+                if st.mb1 == 0 {
+                    crate::println!("    mb1=0 - clean exit or pre-DMA halt");
+                } else if st.mb1 & 0xFFFF_0000 == 0xBADF_0000 {
+                    crate::print_warn!("    mb1 = PRI / sentinel error class ({:#x})", st.mb1);
+                } else {
+                    crate::println!("    mb1 = opaque ACR code {:#x}", st.mb1);
+                }
+            }
+            Err(e) => crate::print_warn!("    aborted: {:?}", e),
+        }
+    });
+    if shown.is_none() {
+        crate::print_warn!("  no NVIDIA GPU bound - nothing to do");
+    }
+}
+
 // nvidia gsp - run the GSP first-contact boot from gsp::attempt_boot
+fn cmd_nvidia_nvdec_scrub() {
+    use crate::nvidia::with_gtx1650;
+    use crate::nvidia::gtx1650::nvdec;
+
+    let shown = with_gtx1650(|dev| {
+        cprintln!(118, 185, 0, "  NVDEC scrubber first-contact boot");
+        match nvdec::attempt_scrub(&dev.bar0) {
+            Ok(st) => {
+                cprintln!(100, 220, 150,
+                    "    halted: mb0={:#010x} mb1={:#010x} cpuctl={:#010x}",
+                    st.mb0, st.mb1, st.cpuctl);
+                if st.mb0 == 0 {
+                    crate::println!("    interpretation: scrubber clean exit - region zeroed or descriptor empty");
+                } else if st.mb0 & 0xFFFF_0000 == 0xBADF_0000 {
+                    crate::println!("    interpretation: scrubber rejected the descriptor (PRI / descriptor class)");
+                } else {
+                    crate::println!("    interpretation: opaque code; cross-reference the nvdec scrubber ucode");
+                }
+            }
+            Err(e) => crate::print_warn!("    aborted: {:?}", e),
+        }
+    });
+    if shown.is_none() {
+        crate::print_warn!("  no NVIDIA GPU bound - nothing to scrub");
+        crate::println!("  (on QEMU without VFIO this is expected; NVDEC scrub only runs against real silicon)");
+    }
+}
+
 fn cmd_nvidia_gsp() {
     use crate::nvidia::with_gtx1650;
     use crate::nvidia::gtx1650::gsp;

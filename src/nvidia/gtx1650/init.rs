@@ -89,6 +89,20 @@ pub fn init(gpu: &pci::GpuDevice) -> Result<(), &'static str> {
         );
     }
 
+    // Resolve per-chip quirks (PMC reset masks, firmware blob refs, ...)
+    // and report so the operator can confirm the right variant was
+    // selected before any engine work runs
+    match super::quirks::for_chip(chip) {
+        Some(q) => serial_println!(
+            "[gtx1650] quirks: {} (sec2_pmc={:#x} gsp_pmc={:#x} acr_wpr2={})",
+            q.codename, q.sec2_pmc_reset_mask, q.gsp_pmc_reset_mask, q.needs_acr_wpr2
+        ),
+        None => serial_println!(
+            "[gtx1650] warn: no quirks entry for impl={:#x} - engine paths fall back to defaults",
+            chip.implementation
+        ),
+    }
+
     // Pick the model name from whichever silicon table claims this device id
     let model_name = super::model_name(gpu.device);
     serial_println!(
@@ -199,6 +213,31 @@ pub fn init(gpu: &pci::GpuDevice) -> Result<(), &'static str> {
         serial_println!("[gtx1650] warn: PTIMER did not advance");
     }
 
+    // On-die temperature sensor, live straight out of POST with no devinit or
+    // GSP required. This is a real reading of the silicon.
+    let t = super::therm::read(&bar0_region);
+    if t.valid {
+        serial_println!(
+            "[gtx1650] GPU temp: {} C{} (TEMP_SENSOR={:#010x})",
+            t.celsius,
+            if t.shadowed { " (shadowed/stale)" } else { "" },
+            t.raw
+        );
+    } else {
+        serial_println!(
+            "[gtx1650] GPU temp: sensor not valid (TEMP_SENSOR={:#010x})",
+            t.raw
+        );
+    }
+    match (t.slowdown_celsius(), t.shutdown_celsius()) {
+        (Some(s), Some(h)) => serial_println!(
+            "[gtx1650] thermal limits: slowdown={} C shutdown={} C", s, h
+        ),
+        _ => serial_println!(
+            "[gtx1650] thermal limits: not programmed (VBIOS devinit not run)"
+        ),
+    }
+
     serial_println!(
         "[gtx1650] BAR0: phys={:#x} size={:#x} (virt via HHDM)",
         bar0.phys, bar0.size
@@ -239,17 +278,39 @@ pub fn init(gpu: &pci::GpuDevice) -> Result<(), &'static str> {
         probe_tu116_firmware(&bar0_region);
     }
 
-    // TU116-only: GSP first-contact boot. PIO-uploads the booter HS
-    // image, kicks GSP CPUCTL, polls for halt with a bounded timeout,
-    // and reports MAILBOX0/MAILBOX1 status. No effect on the rest of
-    // init regardless of outcome - see gsp.rs for the safety story
+    // TU116-only: full GSP-RM bring-up pipeline. Three steps in order,
+    // each non-fatal so the device still registers and the operator can
+    // inspect state through the shell on any partial failure:
+    //
+    //   1) gsprm::load - parse GSP-RM ELF, stage .fwimage in phys-contig
+    //      sysmem, build a radix3 page table, materialize the WPR-meta
+    //      block. After this 'is_loaded()'' is true
+    //   2) sec2::attempt_acr_v2 - run SEC2 ACR. On success the WPR2 lock
+    //      is now active at the top of VRAM; that's the destination the
+    //      booter will DMA into. WPR2 status is logged at the tail
+    //   3) gsprm::boot_booter - hand the WPR-meta sysmem phys to the GSP
+    //      booter_load HS image via MAILBOX0/1 and kick GSP CPUCTL. The
+    //      booter DMAs the radix3-described pages into locked WPR2,
+    //      verifies signatures, and jumps into GSP-RM
     if tu116::matches(gpu.device) {
-        match super::gsp::attempt_boot(&bar0_region) {
-            Ok(st) => serial_println!(
-                "[gtx1650/tu116] gsp boot returned: mb0={:#010x} mb1={:#010x} cpuctl={:#010x}",
-                st.mb0, st.mb1, st.cpuctl
+        // Stage the GSP-RM image (parse ELF, build radix3, materialize the
+        // WPR-meta in sysmem). This is fast and allocation-bound; no Falcon
+        // is started, so it does not slow the boot. After this `is_loaded()`
+        // is true and the device is ready for an on-demand boot.
+        //
+        // The actual engine bring-up (NVDEC scrubber -> SEC2 ACR -> booter ->
+        // GSP handshake) is NOT run here on purpose: those kick Falcons and
+        // poll for a halt that, until the ACR WPR2-lock gate is solved, never
+        // comes (which previously added tens of seconds of MMIO spinning to
+        // every kernel boot. Run it explicitly with `nvidia gsp-rm-boot-full`
+        let gsp_rm_fw = super::tu116_fw::gsp_rm_570();
+        match super::gsprm::load(&bar0_region, gsp_rm_fw.bytes()) {
+            Ok(rep) => serial_println!(
+                "[gtx1650/tu116] gsp-rm staged: fwimage={}B sig={}B radix3@{:#x} meta@{:#x} resolves={} (run 'nvidia gsp-rm-boot-full' to boot)",
+                rep.fwimage_len, rep.signature_len,
+                rep.radix3_root_phys, rep.meta_phys, rep.radix3_resolves
             ),
-            Err(e) => serial_println!("[gtx1650/tu116] gsp boot aborted: {:?}", e),
+            Err(e) => serial_println!("[gtx1650/tu116] gsp-rm load failed: {:?}", e),
         }
     }
 
@@ -316,22 +377,35 @@ fn probe_tu116_firmware(bar0: &MmioRegion) {
             FwEngine::Gpccs  => "gpccs",
             FwEngine::HostSw => "host",
         };
+        // Fetch from the firmware store on demand. The buffer is dropped at
+        // the end of each iteration, so this probe never pins firmware in RAM.
+        let fw = match crate::fwload::request(b.path) {
+            Ok(fw) => fw,
+            Err(e) => {
+                serial_println!(
+                    "[gtx1650/tu116] {:<32} engine={:<5} unavailable ({:?})",
+                    b.name, engine_str, e
+                );
+                continue;
+            }
+        };
+        let bytes = fw.bytes();
         if b.wrapped {
-            match NvfwBinHdr::parse(b.bytes) {
+            match NvfwBinHdr::parse(bytes) {
                 Some(h) => serial_println!(
                     "[gtx1650/tu116] {:<32} engine={:<5} size={:>6} ver={} hdr@{:#x} data@{:#x}+{:#x}",
-                    b.name, engine_str, b.bytes.len(),
+                    b.name, engine_str, bytes.len(),
                     h.bin_ver, h.header_offset, h.data_offset, h.data_size
                 ),
                 None => serial_println!(
                     "[gtx1650/tu116] {:<32} engine={:<5} size={:>6} (NVFW header parse failed)",
-                    b.name, engine_str, b.bytes.len()
+                    b.name, engine_str, bytes.len()
                 ),
             }
         } else {
             serial_println!(
                 "[gtx1650/tu116] {:<32} engine={:<5} size={:>6} (raw)",
-                b.name, engine_str, b.bytes.len()
+                b.name, engine_str, bytes.len()
             );
         }
     }

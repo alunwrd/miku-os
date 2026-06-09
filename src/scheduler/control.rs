@@ -10,7 +10,9 @@ use x86_64::instructions::interrupts;
 use crate::percpu;
 use crate::process::{STATE_BLOCKED, STATE_DEAD, STATE_READY, STATE_RUNNING, STATE_SLEEPING};
 
-use super::core_sched::{software_context_switch, TICK_SCALE};
+use super::core_sched::{
+    sleeper_dec_saturating, sleeper_inc, software_context_switch, TICK_SCALE,
+};
 use super::proc_index::PROC_INDEX;
 use super::runqueue::{pick_cpu_for, rq_push_sorted, weight};
 
@@ -50,7 +52,8 @@ pub fn sleep(ticks: u64) {
         if ptr.is_null() { return; }
         let p = unsafe { &*ptr };
         p.sleep_until.store(wake_tick, Ordering::Relaxed);
-        p.state.store(STATE_SLEEPING, Ordering::Relaxed);
+        let prev = p.state.swap(STATE_SLEEPING, Ordering::Relaxed);
+        if prev != STATE_SLEEPING { sleeper_inc(); }
     });
     unsafe { software_context_switch() }
 }
@@ -81,7 +84,14 @@ pub fn wakeup(pid: u64) {
         let min_vr = cpu.min_vruntime.load(Ordering::Relaxed);
         let vr     = p.vruntime.load(Ordering::Relaxed).max(min_vr);
         p.vruntime.store(vr, Ordering::Relaxed);
-        p.state.store(STATE_READY, Ordering::Relaxed);
+        // CAS to avoid racing wake_sleepers_isr; whichever lands the
+        // SLEEPING->READY transition first owns the SLEEPER_COUNT dec
+        let won = p.state.compare_exchange(
+            state, STATE_READY,
+            Ordering::AcqRel, Ordering::Relaxed,
+        ).is_ok();
+        if !won { return; }
+        if state == STATE_SLEEPING { sleeper_dec_saturating(); }
 
         cpu.run_queue.with(|inner| unsafe { rq_push_sorted(inner, ptr) });
 

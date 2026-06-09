@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use x86_64::structures::paging::PageTableFlags;
 use crate::vmm::AddressSpace;
 
@@ -71,6 +71,20 @@ pub struct Process {
     pub pending_sig: AtomicU32,
     pub wait_target: AtomicU64,
     pub collected:   AtomicBool,
+
+    /// Per-process current working directory (VFS inode id). 0 = root.
+    /// Inherited on fork, preserved across exec. Reads use the scheduler
+    /// helper 'crate::scheduler::current_cwd()'
+    pub cwd:         AtomicU64,
+
+    // Per-process VFS-side identity, synced into vfs.ctx on every with_vfs()
+    // call. This keeps the existing ctx.umask/ctx.cred read sites in MikuVFS
+    // correct without requiring changes at each call site.
+    pub umask:       AtomicU16,
+    pub uid:         AtomicU16,
+    pub gid:         AtomicU16,
+    pub euid:        AtomicU16,
+    pub egid:        AtomicU16,
 }
 
 impl Process {
@@ -107,6 +121,12 @@ impl Process {
             pending_sig:      AtomicU32::new(0),
             wait_target:      AtomicU64::new(0),
             collected:        AtomicBool::new(false),
+            cwd:              AtomicU64::new(0),
+            umask:            AtomicU16::new(0o022),
+            uid:              AtomicU16::new(0),
+            gid:              AtomicU16::new(0),
+            euid:             AtomicU16::new(0),
+            egid:             AtomicU16::new(0),
         })
     }
 
@@ -149,6 +169,12 @@ impl Process {
             pending_sig:      AtomicU32::new(0),
             wait_target:      AtomicU64::new(0),
             collected:        AtomicBool::new(false),
+            cwd:              AtomicU64::new(0),
+            umask:            AtomicU16::new(0o022),
+            uid:              AtomicU16::new(0),
+            gid:              AtomicU16::new(0),
+            euid:             AtomicU16::new(0),
+            egid:             AtomicU16::new(0),
         })
     }
 
@@ -277,6 +303,12 @@ impl Process {
             pending_sig:      AtomicU32::new(0),
             wait_target:      AtomicU64::new(0),
             collected:        AtomicBool::new(false),
+            cwd:              AtomicU64::new(crate::scheduler::cwd_of(parent_pid)),
+            umask:            AtomicU16::new(crate::scheduler::umask_of(parent_pid)),
+            uid:              AtomicU16::new(crate::scheduler::uid_of(parent_pid)),
+            gid:              AtomicU16::new(crate::scheduler::gid_of(parent_pid)),
+            euid:             AtomicU16::new(crate::scheduler::euid_of(parent_pid)),
+            egid:             AtomicU16::new(crate::scheduler::egid_of(parent_pid)),
         });
 
         // Build timer-ISR-compatible frame for child (20 u64 slots = 0xA0 bytes)

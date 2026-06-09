@@ -22,6 +22,7 @@ pub mod http;
 pub mod tls_ecdh;
 pub mod http2;
 pub mod tls_gcm;
+pub mod socket;
 
 extern crate alloc;
 use alloc::boxed::Box;
@@ -406,6 +407,71 @@ pub fn get_ip() -> [u8; 4] { NET.lock().ip }
 
 pub fn get_dns() -> [u8; 4] { NET.lock().dns }
 pub fn set_dns(dns: [u8; 4]) { NET.lock().dns = dns; }
+
+/// netd is a mikuD background service, roughly analogous to systemd-networkd.
+/// It waits for link-up, runs DHCP, and sleeps once a lease is applied.
+/// Failures are logged but do not block boot; the shell still comes up.
+fn netd_link_wait(timeout_ticks: u64) -> bool {
+    let start = crate::vfs::procfs::uptime_ticks();
+    loop {
+        if is_ready() {
+            let up = { NET.lock().driver.as_ref().map(|d| d.link_up()).unwrap_or(false) };
+            if up { return true; }
+        }
+        if crate::vfs::procfs::uptime_ticks().wrapping_sub(start) >= timeout_ticks {
+            return false;
+        }
+        crate::scheduler::sleep(25); // 100 ms at 250 Hz
+    }
+}
+
+pub fn netd_thread() -> ! {
+    // Without a NIC there is nothing for us to do; idle quietly
+    if !is_ready() {
+        crate::serial_println!("[netd] no network adapter - going dormant");
+        loop { crate::scheduler::sleep(60_000); }
+    }
+
+    // Real switches and PHYs need a moment to come up. 3 s is generous
+    // for most desktop NICs; if the cable is unplugged we still proceed
+    // (the discover will simply time out and we'll retry later)
+    let linked = netd_link_wait(750); // 3 s
+    if !linked {
+        crate::serial_println!("[netd] link not up after 3 s - trying DHCP anyway");
+    } else {
+        crate::serial_println!("[netd] link up - starting DHCP");
+    }
+
+    // Try a few times before giving up; do_dhcp() already retries
+    // discover 4x internally so this mostly covers cable-unplug scenarios
+    let mut got_lease = false;
+    for attempt in 1..=3u32 {
+        match dhcp::do_dhcp() {
+            Some(r) => {
+                set_ip(r.ip, r.gw, r.mask);
+                set_dns(r.dns);
+                crate::serial_println!(
+                    "[netd] DHCP lease: ip={}.{}.{}.{} gw={}.{}.{}.{} dns={}.{}.{}.{}",
+                    r.ip[0], r.ip[1], r.ip[2], r.ip[3],
+                    r.gw[0], r.gw[1], r.gw[2], r.gw[3],
+                    r.dns[0], r.dns[1], r.dns[2], r.dns[3],
+                );
+                got_lease = true;
+                break;
+            }
+            None => {
+                crate::serial_println!("[netd] DHCP attempt {} timed out", attempt);
+                crate::scheduler::sleep(500); // 2 s
+            }
+        }
+    }
+    if !got_lease {
+        crate::serial_println!("[netd] no DHCP response - run `dhcp` manually once a server is reachable");
+    }
+
+    // Stay alive; lease renewal can be added here later (every leasetime/2)
+    loop { crate::scheduler::sleep(60_000); }
+}
 
 pub fn cmd_dhcp() {
     if !is_ready() {

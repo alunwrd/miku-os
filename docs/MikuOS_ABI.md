@@ -1,4 +1,4 @@
-# MikuOS ABI v0.3.0
+# MikuOS ABI v0.2.2-rc
 
 Application Binary Interface for MikuOS userspace.
 
@@ -6,14 +6,14 @@ Application Binary Interface for MikuOS userspace.
 
 ## 1. Overview
 
-MikuOS is an x86_64 OS. Userspace programs run in Ring 3 and communicate with the kernel via `syscall`. The standard library **libmiku** links dynamically through **ld-miku**.
+MikuOS is an x86_64 OS. Userspace programs run in Ring 3 and communicate with the kernel via `syscall` (entries 0..59; socket syscalls occupy 56..59). The standard library **libmiku** links dynamically through **ld-miku**.
 
 ```
 +----------------------------------+
 |        Program (ELF)             |
 |  _start -> _start_main -> code  |
 +----------------------------------+
-|    libmiku.so  (962 functions)  |
+|    libmiku.so  (956 functions)  |
 |  63 modules: string/ mem/ heap/ |
 |  io/ fmt/ file/ libc/ json/...  |
 +----------------------------------+
@@ -21,7 +21,7 @@ MikuOS is an x86_64 OS. Userspace programs run in Ring 3 and communicate with th
 |  loads .so, PLT, relocations    |
 +----------------------------------+
 |     MikuOS Kernel               |
-|  syscall nr=0..46, mikuD init   |
+|  syscall nr=0..59, mikuD init   |
 +----------------------------------+
 ```
 
@@ -37,13 +37,13 @@ rustup toolchain install nightly
 rustup component add rust-src --toolchain nightly
 
 # GCC (for stub generation)
-You need to install GCC for you OS
+You need to install GCC for your OS
 
 # e2tools (copying to ext4)
-You need to install e2tools for you OS
+You need to install e2tools for your OS
 ```
 
-### 2.4 Kernel Environment
+### 2.2 Kernel environment
 
 New hardware subsystems initialized before userspace starts:
 
@@ -55,9 +55,11 @@ New hardware subsystems initialized before userspace starts:
 | **PS/2** | Keyboard controller initialization |
 | **USB** | USB legacy handoff (EHCI/xHCI BIOS release) |
 | **Splash** | Boot splash via framebuffer before shell starts |
-| **NVIDIA** | GTX 1650/1660 (TU117/TU116) host-side driver: PCI probe, BAR0 MMIO, Falcon engine management, DMA loopback |
+| **NVIDIA** | GSP-era GPU driver: GTX 1650/1660 full pipeline + generic host-side bring-up for any Turing/Ampere/Ada GPU |
+| **fwload** | On-demand firmware loader from `/lib/firmware` (Linux `request_firmware` model) |
+| **netd** | mikuD service: auto-DHCP at MultiUser target, runs as a background thread, does not block boot |
 
-### 2.2 SDK Structure
+### 2.3 SDK Structure
 
 ```
 src/lib/userspace/
@@ -71,9 +73,9 @@ src/lib/userspace/
     └── test_full.rs        test suite
 ```
 
-### 2.3 libmiku Structure
+### 2.4 libmiku Structure
 
-63 modules, 962 exported functions. Modules:
+63 modules, 956 exported functions. Modules:
 
 | Category | Modules |
 |---|---|
@@ -107,7 +109,7 @@ Return:       rax (negative = errno)
 Clobbered:    rcx, r11
 ```
 
-### 3.2 Syscall Table
+### 3.2 Syscall table
 
 | Nr | Name | rdi | rsi | rdx | r10 | Return |
 |---|---|---|---|---|---|---|
@@ -124,7 +126,7 @@ Clobbered:    rcx, r11
 | 10 | get_tls | | | | | addr |
 | 11 | open | path | len | | | fd / -errno |
 | 12 | close | fd | | | | 0 / -errno |
-| 13 | seek | fd | offset | | | 0 / -errno |
+| 13 | seek | fd | offset | whence | | new_offset / -errno |
 | 14 | fsize | fd | | | | size / -errno |
 | 15 | map_lib | name | len | | | base / -errno |
 | 16 | sleep | ticks | | | | 0 |
@@ -134,7 +136,7 @@ Clobbered:    rcx, r11
 | 20 | mkdir | path | path_len | mode | | 0 / -errno |
 | 21 | rmdir | path | path_len | | | 0 / -errno |
 | 22 | unlink | path | path_len | | | 0 / -errno |
-| 23 | readdir | fd | buf | count | | entries / -errno |
+| 23 | readdir | path | path_len | buf | max_entries | entries / -errno |
 | 24 | rename | old_path | old_len | new_path | new_len | 0 / -errno |
 | 25 | link | target | target_len | link_path | link_len | 0 / -errno |
 | 26 | chmod | path | path_len | mode | | 0 / -errno |
@@ -149,15 +151,40 @@ Clobbered:    rcx, r11
 | 35 | chdir | path | path_len | | | 0 / -errno |
 | 36 | statfs | path | path_len | buf | | 0 / -errno |
 | 37 | fallocate | fd | offset | len | | 0 / -errno |
-| 38 | getxattr | path | name | value | size | len / -errno |
-| 39 | setxattr | path | name | value | size | 0 / -errno |
-| 40 | utimensat | path | path_len | times | | 0 / -errno |
+| 38 | getxattr | ino | name | name_len | buf | len / -errno (ext-only) |
+| 39 | setxattr | ino | name | value | (name_len<<16)\|value_len | 0 / -errno (ext-only) |
+| 40 | utimensat | ino | atime | mtime | | 0 / -errno (ext-only) |
 | 41 | fsync | fd | | | | 0 / -errno |
 | 42 | punch_hole | fd | offset | len | | 0 / -errno |
 | 43 | fork | | | | | child_pid / 0 / -errno |
 | 44 | wait4 | pid | status_ptr | options | | pid / -errno |
 | 45 | kill | pid | sig | | | 0 / -errno |
-| 46 | exec | path | path_len | argv | argc | pid / -errno |
+| 46 | exec | path | path_len | argv | argc | never (success) / -errno |
+| 47 | umask | mask | | | | previous_mask |
+| 48 | getuid | | | | | uid |
+| 49 | getgid | | | | | gid |
+| 50 | geteuid | | | | | euid |
+| 51 | getegid | | | | | egid |
+| 52 | setuid | uid | | | | 0 / -EPERM |
+| 53 | setgid | gid | | | | 0 / -EPERM |
+| 54 | seteuid | euid | | | | 0 / -EPERM |
+| 55 | setegid | egid | | | | 0 / -EPERM |
+| 56 | socket | domain | type | protocol | | fd / -errno |
+| 57 | connect | fd | sockaddr* | addrlen | | 0 / -errno |
+| 58 | send | fd | buf | len | flags | n / -errno |
+| 59 | recv | fd | buf | len | flags | n (0=EOF) / -errno |
+
+Socket fds are returned in a dedicated range (`SOCK_FD_BASE = 4096`..) and are
+also usable with `read`/`write`/`close` (which route to recv/send/close by fd
+range). Phase 1 is AF_INET / SOCK_STREAM (TCP client) with blocking semantics;
+`sockaddr` is the 16-byte `sockaddr_in` (family LE u16, port BE u16, addr[4]).
+
+The kernel socket layer (`net/socket.rs`) maintains a per-process table of up to
+64 sockets. A blocking recv/connect times out after 7500 ticks (~30 s) so a dead
+peer cannot wedge a process forever. Sockets are freed automatically when the
+owning process exits (`close_all_for_pid`). The `sys_close` handler routes any
+fd >= `SOCK_FD_BASE` directly to the socket layer and validates pid ownership
+before releasing it.
 
 ### 3.3 Constants
 
@@ -166,25 +193,55 @@ PROT_READ  = 1
 PROT_WRITE = 2
 PROT_EXEC  = 4
 
-O_READ    = 0
-O_WRITE   = 1
-O_CREATE  = 2
-O_TRUNC   = 4
-O_APPEND  = 8
+O_READ      = 0x0001
+O_WRITE     = 0x0002
+O_APPEND    = 0x0004
+O_CREATE    = 0x0008
+O_EXCLUSIVE = 0x0010
+O_TRUNC     = 0x0020
+O_DIRECTORY = 0x0040
+O_NOFOLLOW  = 0x0080
+O_DIRECT    = 0x0100
+O_SYNC      = 0x0200
+O_NONBLOCK  = 0x0400
+O_CLOEXEC   = 0x0800     // closed by exec(); preserved otherwise
+O_NOATIME   = 0x1000
 
-ENOENT = -2     (file not found)
-EBADF  = -9     (bad file descriptor)
-ENOMEM = -12    (out of memory)
-EFAULT = -14    (bad address)
-EEXIST = -17    (file exists)
-EINVAL = -22    (invalid argument)
-ENOSYS = -38    (syscall does not exist)
+EPERM        = -1
+ENOENT       = -2     (file not found)
+ESRCH        = -3     (no such process)
+EIO          = -5     (I/O error)
+EBADF        = -9     (bad file descriptor)
+EAGAIN       = -11    (try again / resource temporarily unavailable)
+ENOMEM       = -12    (out of memory)
+EACCES       = -13    (permission denied)
+EFAULT       = -14    (bad address)
+EBUSY        = -16    (device or resource busy)
+EEXIST       = -17    (file exists)
+ENOTDIR      = -20    (not a directory)
+EISDIR       = -21    (is a directory)
+EINVAL       = -22    (invalid argument)
+EMFILE       = -24    (too many open files)
+ECHILD       = -10    (no child processes)
+ENOSPC       = -28    (no space left)
+EPIPE        = -32    (broken pipe)
+ENAMETOOLONG = -36    (file name too long)
+ENOSYS       = -38    (syscall does not exist)
+ENOTEMPTY    = -39    (directory not empty)
+EPROTONOSUPPORT = -93  (protocol not supported)
+EAFNOSUPPORT    = -97  (address family not supported)
+ECONNRESET      = -104 (connection reset by peer)
+EISCONN         = -106 (socket is already connected)
+ENOTCONN        = -107 (socket is not connected)
+ECONNREFUSED    = -111 (connection refused)
 
 SIGKILL = 9
 SIGTERM = 15
 SIGCHLD = 17
 
-PIT frequency: 250 Hz (1 tick ~= 4 ms)
+Timer: Local APIC timer at 250 Hz (1 tick ~= 4 ms). PIT is used only for
+       LAPIC calibration; runtime ticks come from LAPIC. See
+       `apic::TIMER_HZ_DEFAULT` in src/apic.rs.
 ```
 
 ### 3.4 File Descriptors
@@ -200,7 +257,7 @@ PIT frequency: 250 Hz (1 tick ~= 4 ms)
 
 ## 4. ELF Format
 
-### 4.1 Binary Requirements
+### 4.1 Binary requirements
 
 - Format: ELF64, ET_EXEC
 - `.interp` points to `/lib/ld-miku.so`
@@ -209,7 +266,7 @@ PIT frequency: 250 Hz (1 tick ~= 4 ms)
 - No PIE (fixed addresses)
 - No red zone (`-mno-red-zone`)
 
-### 4.2 Loading Sequence
+### 4.2 Loading sequence
 
 1. Kernel reads ELF, maps segments
 2. Loads `ld-miku.so` from `.interp`
@@ -217,20 +274,26 @@ PIT frequency: 250 Hz (1 tick ~= 4 ms)
 4. `ld-miku` resolves PLT/GOT
 5. Jumps to `_start` in the program
 
-### 4.3 Address Space Layout
+### 4.3 Address space layout
 
 ```
-0x0000_0000_0020_0000 .. 0x0000_0000_0040_0000  program (code + data)
+0x0000_0000_0040_0000 .. 0x0000_0000_0080_0000  PIE program (code + data, ASLR-shifted)
+0x0000_0000_4100_0000                            TLS area
+0x0000_0000_6000_0000_0000                       brk arena base
 0x0000_0001_0000_0000 .. 0x0000_7F00_0000_0000  mmap / libmiku / heap
-0x0000_7F00_0000_0000                            ld-miku
-0x0000_7FFF_FFFE_0000 .. 0x0000_7FFF_FFFF_0000  stack
+0x0000_7F00_0000_0000                            ld-miku interpreter load base
+0x0000_7FFF_FFEF_0000 .. 0x0000_7FFF_FFFF_0000  user stack (1 MiB, 256 pages)
 ```
+
+Exact constants live in `src/elf_loader.rs` (`PIE_BASE`, `TLS_VIRT`,
+`INTERP_BASE`, `USER_STACK_TOP`, `STACK_PAGES`) and `src/mmap.rs`
+(`MMAP_BASE`, `MMAP_LIMIT`, `BRK_BASE`).
 
 ---
 
 ## 5. libmiku API
 
-### 5.1 Module `io` -- Input / Output
+### 5.1 Module `io`: input / output
 
 ```c
 long miku_write(unsigned long fd, const char *buf, unsigned long len);
@@ -244,7 +307,7 @@ int  miku_readline(char *buf, unsigned long max);  // reads until \n
 char *miku_getline(void);                          // malloc, caller must free
 ```
 
-### 5.2 Module `string` -- Strings
+### 5.2 Module `string`: strings
 
 ```c
 // Basic
@@ -291,7 +354,7 @@ char *miku_strsep(char **stringp, const char *delim);    // BSD-style tokenizati
 char *miku_strtok_r(char *s, const char *delim, char **saveptr); // thread-safe strtok
 ```
 
-### 5.3 Module `num` -- Numbers
+### 5.3 Module `num`: numbers
 
 ```c
 void miku_itoa(long val, char *buf);           // int -> string (buf >= 21 bytes)
@@ -301,7 +364,7 @@ void miku_print_int(long val);                 // print decimal
 void miku_print_hex(unsigned long val);        // print 0x...
 ```
 
-### 5.4 Module `mem` -- Memory
+### 5.4 Module `mem`: memory
 
 ```c
 void *miku_memset(void *dst, int val, unsigned long n);
@@ -315,7 +378,7 @@ const void *miku_memmem(const void *haystack, unsigned long hlen,
                         const void *needle, unsigned long nlen);
 ```
 
-### 5.5 Module `heap` -- Dynamic Memory
+### 5.5 Module `heap`: dynamic memory
 
 ```c
 void *miku_malloc(unsigned long size);
@@ -326,7 +389,7 @@ void *miku_calloc(unsigned long count, unsigned long size);
 
 Implementation: mmap-based slab (128 KB) for allocations under 32 KB. Dedicated `mmap` + `munmap` per allocation for 32 KB and above.
 
-### 5.6 Module `fmt` -- Formatted Output
+### 5.6 Module `fmt`: formatted output
 
 ```c
 int miku_printf(const char *fmt, ...);
@@ -347,7 +410,7 @@ Limitations: up to 5 arguments. `%d/%x/%u` are 32-bit. For 64-bit values use `mi
 
 Implementation: `global_asm!` trampoline saves `rsi`/`rdx`/`rcx`/`r8`/`r9` onto the stack and passes them as an array to the Rust `_impl`. No XMM registers used, no SSE alignment issues.
 
-### 5.7 Module `file` -- File I/O
+### 5.7 Module `file`: file I/O
 
 ```c
 long miku_open(const char *path, unsigned long path_len, int flags, int mode);
@@ -360,16 +423,16 @@ void *miku_read_file(const char *path, unsigned long *out_size);  // malloc
 
 Flags: O_READ=0, O_WRITE=1, O_CREATE=2, O_TRUNC=4, O_APPEND=8.
 
-### 5.8 Module `time` -- Time
+### 5.8 Module `time`: time
 
 ```c
-void miku_sleep(unsigned long ticks);      // ~4 ms per tick (250 Hz PIT)
+void miku_sleep(unsigned long ticks);      // ~4 ms per tick (250 Hz LAPIC)
 void miku_sleep_ms(unsigned long ms);
 unsigned long miku_uptime(void);           // ticks since boot
 unsigned long miku_uptime_ms(void);
 ```
 
-### 5.9 Module `proc` -- Process
+### 5.9 Module `proc`: process
 
 ```c
 void miku_exit(long code);                  // noreturn
@@ -388,7 +451,7 @@ long  miku_map_lib(const char *name, unsigned long name_len);
 
 The former `util` module was split in three. All symbols kept their original names.
 
-#### `math` -- Arithmetic helpers (saturating / overflow-safe)
+#### `math`: arithmetic helpers (saturating / overflow-safe)
 
 ```c
 long  miku_abs(long x);                            // saturating_abs, safe on INT64_MIN
@@ -401,7 +464,7 @@ unsigned long miku_div_ceil(unsigned long a, unsigned long b);
 int   miku_is_prime(unsigned long n);              // trial division, uses miku_isqrt
 ```
 
-#### `random` -- PRNG
+#### `random`: PRNG
 
 ```c
 void  miku_srand(unsigned long seed);                              // xorshift64
@@ -421,7 +484,7 @@ void  miku_rand_shuffle(unsigned char *data, unsigned long count, unsigned long 
 
 Note: `random` is a userspace PRNG (xorshift). The kernel TLS / ECDH paths use RDRAND-backed CSPRNG internally; that is not exposed via libmiku.
 
-#### `panic` -- Assertions and aborts
+#### `panic`: assertions and aborts
 
 ```c
 void miku_assert_fail(const char *expr, const char *file, int line);  // noreturn
@@ -431,7 +494,7 @@ void miku_assert_not_null(const void *ptr, const char *name,
                           const char *file, int line);                // noreturn on NULL
 ```
 
-### 5.11 Module `libc` -- POSIX libc Compatibility
+### 5.11 Module `libc`: POSIX libc compatibility
 
 151 functions providing C standard library compatibility:
 
@@ -515,9 +578,9 @@ fn panic(_: &core::panic::PanicInfo) -> ! { miku::exit(1); }
 | `fn _start_main() -> !` | Entry point (never returns) |
 | `#[panic_handler]` | Panic handler |
 
-The entry point is `_start_main`, not `_start`, because `miku.rs` contains an asm trampoline `_start` that runs `and rsp, -16` then calls `_start_main` to ensure SSE stack alignment.
+The entry point is `_start_main`, not `_start`, because `miku.rs` contains an asm trampoline `_start` that moves `[rsp]` → `rdi` (argc), `lea rsi, [rsp+8]` (argv), runs `and rsp, -16` for SSE alignment, and then calls `_start_main`. Programs that don't care about arguments declare `_start_main() -> !`; programs that do declare `_start_main(argc: i32, argv: *const *const u8) -> !`.
 
-### 6.3 Safe Wrappers (miku.rs)
+### 6.3 Safe wrappers (miku.rs)
 
 ```rust
 miku::print("text");
@@ -537,7 +600,7 @@ miku::max(a, b);
 miku::clamp(val, 0, 100);
 ```
 
-### 6.4 Unsafe Operations
+### 6.4 Unsafe operations
 
 ```rust
 unsafe {
@@ -567,7 +630,7 @@ cstr!("hello")  // -> "hello\0".as_ptr()
 
 Required for C strings passed to `miku_printf`, `miku_open_cstr`, etc.
 
-### 6.6 Registering a Binary
+### 6.6 Registering a binary
 
 In `Cargo.toml`:
 
@@ -655,7 +718,7 @@ ld app.o -o app [link flags]
 e2cp app ~/miku-os/miku-os/data.img:/
 ```
 
-### 8.3 Disk Operations
+### 8.3 Disk operations
 
 ```bash
 # Copy binary:
@@ -687,7 +750,7 @@ cd ~/miku-os/libmiku && cargo clean
 cd ~/miku-os/builder && cargo run
 ```
 
-Userspace binaries do **not** need to be rebuilt -- dynamic linking handles it.
+Userspace binaries do **not** need to be rebuilt; dynamic linking handles it.
 
 ---
 
@@ -785,7 +848,7 @@ readelf -d app | grep NEEDED        # should show libmiku.so
 readelf --dyn-syms app | grep miku  # should list miku_* symbols
 ```
 
-### 11.2 Troubleshooting Table
+### 11.2 Troubleshooting table
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -797,32 +860,86 @@ readelf --dyn-syms app | grep miku  # should list miku_* symbols
 | `[swap] slot=0` spam | `is_swap_pte` false positive | Add `slot != 0` check |
 | Files disappear | ext4 64-bit feature enabled | Format with `mkfs.ext4 -O ^64bit,^metadata_csum` |
 | printf shows garbage for `-99` | 32/64-bit mismatch | `%d` is 32-bit; use `print_int` for 64-bit values |
-| VMA table full | MAX_VMAS was 64 | Update `mmap.rs` to 256 |
+| ~~VMA table full~~ | _historical_ | VMAs now use `BTreeMap`; no fixed cap |
 
 ---
 
 ## 12. Limitations
 
 - `printf`: max 5 arguments; `%d`/`%x` are 32-bit only
-- Single thread per process
-- No errno variable -- errors returned as negative values (libc compat layer provides errno)
+- Single thread per process (no `clone`, no thread syscalls)
+- Cooperative scheduling: preemption from the timer ISR is currently
+  disabled; threads must call `miku_sleep`/`yield`/any blocking syscall
+  for the scheduler to run another task. See the long-form comment on
+  `timer_interrupt_handler` in `src/interrupts.rs`
+- No errno variable; errors returned as negative values (libc compat layer provides errno)
 - No float support in printf
 - Heap slab does not return memory to the kernel when small blocks are freed
-- No networking syscalls from userspace yet
+- Networking from userspace: AF_INET / SOCK_STREAM (TCP client) via syscalls 56-59
+  (`socket`/`connect`/`send`/`recv`). Socket fds start at `SOCK_FD_BASE=4096` and
+  route through the generic `read`/`write`/`close`. No UDP, listen/accept, or
+  non-blocking mode yet. Max 64 sockets per system; connect/recv block with a 30 s
+  hard timeout. The `libmiku/net.rs` module exposes safe Rust wrappers for the
+  socket syscalls.
+- No `fcntl`, `ioctl`, `poll`, `select`, or `epoll`; `pipe` works but cannot be multiplexed
 - NVIDIA GPU driver does not yet expose a userspace API; accessible only via shell commands (nvidia info/debug/falcon/dma-test/gsp etc.)
+- Firmware blobs (NVIDIA GSP, etc.) are loaded on-demand from `/lib/firmware` via
+  the `fwload` module (Linux-style `request_firmware`). They are freed after use
+  and are never pinned for the full uptime.
+
+### 12.1 Hard limits
+
+| Limit | Value | Source |
+|---|---|---|
+| Max open FDs per process | 128 | `src/vfs/types.rs` `MAX_FDS` |
+| Max `exec` argv entries | 64 | `src/elf_loader.rs` `MAX_ARGS` |
+| Max single argv string length | 4096 bytes | `src/syscall/user_mem.rs` `MAX_ARG_BYTES` |
+| Max path length | 4096 bytes | `src/syscall/user_mem.rs` `MAX_PATH_LEN` |
+| Max ELF file size | 64 MiB | `src/elf_loader.rs` `MAX_ELF_SIZE` |
+| `sleep(ticks)` upper bound | 100_000 ticks (~400 s) | `src/syscall/process.rs` clamp |
+| User stack | 256 pages = 1 MiB | `src/elf_loader.rs` `STACK_PAGES` |
+
+### 12.2 Signal handling
+
+`kill(pid, sig)`:
+
+| sig | Behaviour |
+|---|---|
+| 0 | Probe: returns 0 if `pid` exists, `-ESRCH` otherwise |
+| 9 (SIGKILL) / 15 (SIGTERM) | Hard terminate, send SIGCHLD to parent |
+| other | Routed through `signal::send_signal`; default action depends on signal number |
+
+### 12.3 xattr / utimensat are ino-based
+
+`getxattr`, `setxattr` and `utimensat` (syscalls 38-40) currently take an
+ext2/ext4 inode number rather than a path, and only operate on the
+active ext filesystem (return `-ENOSYS` otherwise). They have no
+libmiku wrapper yet. Path-based versions will replace these once the
+VFS gains a unified ino-by-path lookup.
+
+### 12.4 `map_lib` syscall
+
+`map_lib` (nr 15) resolves a shared object by name. Lookup order:
+
+1. In-kernel solib cache (includes the preloaded `libmiku.so`).
+2. Filesystem search paths configured via `solib::add_search_path`
+   (default: `/lib`). Reads through the VFS, parses the ELF, maps
+   segments into the caller's address space, returns the load base.
+
+Other shared libraries must be reachable via one of those search paths.
 
 ---
 
 ## 13. Checklist
 
-### New Rust Program
+### New Rust program
 
 1. Create `src/my_app.rs` with `_start_main`, `panic_handler`, and `mod miku`
 2. Add `[[bin]] name = "my_app"` to `Cargo.toml`
 3. Run `./build.sh my_app`
 4. In MikuOS: `ext4mount 3` then `exec my_app`
 
-### New C Program
+### New C program
 
 1. Write `app.c` with `_start` and extern declarations
 2. Compile: `gcc ... -c app.c -o app.o`

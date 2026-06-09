@@ -13,7 +13,7 @@
 //                                  Driven only from the BSP timer ISR so
 //                                  nobody pushes the same task twice
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::percpu;
 use crate::process::{
@@ -31,8 +31,33 @@ pub(super) const TICK_SCALE: u64 = 1_000_000;
 
 pub static TOTAL_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
+// Count of processes in STATE_SLEEPING. When zero we skip the per-tick
+// 4096-pointer scan in wake_sleepers_isr entirely; the common case on
+// an otherwise-idle BSP
+pub(super) static SLEEPER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+pub(super) fn sleeper_inc() {
+    SLEEPER_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(super) fn sleeper_dec_saturating() {
+    let mut cur = SLEEPER_COUNT.load(Ordering::Relaxed);
+    while cur > 0 {
+        match SLEEPER_COUNT.compare_exchange_weak(
+            cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 #[inline(always)]
 unsafe fn wake_sleepers_isr(tick: u64) {
+    if SLEEPER_COUNT.load(Ordering::Relaxed) == 0 { return; }
+
     let max = pid_range().min(MAX_PROCS as u64) as usize;
     let arr = &*PROC_INDEX.0.get();
 
@@ -47,6 +72,8 @@ unsafe fn wake_sleepers_isr(tick: u64) {
             STATE_SLEEPING, STATE_READY,
             Ordering::AcqRel, Ordering::Relaxed,
         ).is_err() { continue; }
+
+        SLEEPER_COUNT.fetch_sub(1, Ordering::Relaxed);
 
         let target = pick_cpu_for(p.cpu_mask);
         let cpu    = percpu::get(target);

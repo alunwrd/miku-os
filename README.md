@@ -4,7 +4,7 @@
 
 **An experimental operating system kernel written in Rust**
 
-*Powered by Rust and a few developers :D*
+*Powered by Rust and one developer :D*
 
 <img src="https://raw.githubusercontent.com/alunwrd/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
 
@@ -23,7 +23,7 @@
 
 ## About
 
-**Miku OS** is a operating system developed from scratch in a `no_std` environment.
+**Miku OS** is an operating system developed from scratch in a `no_std` environment.
 It does not use any standard library (`libc`), maintaining full control over hardware and memory architecture.
 ELF dynamic linking, shared libraries, userspace processes, an init daemon (mikuD), and process management (fork/exec/wait) are implemented from scratch.
 
@@ -44,7 +44,7 @@ ELF dynamic linking, shared libraries, userspace processes, an init daemon (miku
 | **PIC** | PIC8259 (offset 32/40) |
 | **SSE** | CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1 |
 | **Heap** | 32 MB, linked list allocator |
-| **Syscall** | SYSCALL/SYSRET via MSR, naked asm handler, R8/R9/R10 preservation (модульный: syscall/) |
+| **Syscall** | SYSCALL/SYSRET via MSR, naked asm handler, R8/R9/R10 preservation (modular: syscall/) |
 | **Signals** | SIGKILL (9), SIGTERM (15), SIGCHLD (17), 32-bit bitmask |
 | **Init** | mikuD (PID 1) - systemd-like service supervisor |
 | **ACPI** | RSDP/RSDT/XSDT parser, MADT enumeration (LAPIC + IOAPIC discovery) |
@@ -53,6 +53,7 @@ ELF dynamic linking, shared libraries, userspace processes, an init daemon (miku
 | **PS/2** | Keyboard controller initialization |
 | **USB** | USB legacy handoff (EHCI/xHCI BIOS release) |
 | **Splash** | Boot splash screen via framebuffer |
+| **fwload** | On-demand firmware loader from `/lib/firmware` (Linux `request_firmware` model) |
 
 ---
 
@@ -332,7 +333,7 @@ The kernel parses ELF segments and maps the shared library directly into the pro
 
 #### Overview
 
-libmiku is a C-compatible standard library for MikuOS. Written in Rust, it provides 63 modules and 962 exported functions covering everything from basic I/O to data structures, cryptography, parsing, and a full POSIX libc compatibility layer (stdio, stdlib, string.h, etc.).
+libmiku is a C-compatible standard library for MikuOS. Written in Rust, it provides 63 modules and 956 exported functions covering everything from basic I/O to data structures, cryptography, parsing, and a full POSIX libc compatibility layer (stdio, stdlib, string.h, etc.).
 Dynamically loaded by ld-miku, used by all userspace programs.
 
 #### Module Categories
@@ -606,6 +607,7 @@ Additional check: slot number != 0 (false positive prevention)
 | **kill()** | Send signal to process (SIGTERM, SIGKILL, SIGCHLD) |
 | **Zombie reaping** | Automatic via mikuD and wait4 |
 | **Process hierarchy** | Parent-child tracking via ppid |
+| **Per-process identity** | `cwd`, `umask`, `uid`, `gid`, `euid`, `egid` — stored atomically on `Process`, inherited by `fork()`, synced into VFS context on every syscall |
 
 ---
 
@@ -676,8 +678,21 @@ Additional check: slot number != 0 (false positive prevention)
 | **44** | `sys_wait4` | Wait for child process |
 | **45** | `sys_kill` | Send signal to process |
 | **46** | `sys_exec` | Execute ELF binary |
+| **47** | `sys_umask` | Set file-creation mask (returns previous) |
+| **48** | `sys_getuid` | Get real user ID |
+| **49** | `sys_getgid` | Get real group ID |
+| **50** | `sys_geteuid` | Get effective user ID |
+| **51** | `sys_getegid` | Get effective group ID |
+| **52** | `sys_setuid` | Set real UID (-EPERM if not root) |
+| **53** | `sys_setgid` | Set real GID (-EPERM if not root) |
+| **54** | `sys_seteuid` | Set effective UID (-EPERM if not root) |
+| **55** | `sys_setegid` | Set effective GID (-EPERM if not root) |
+| **56** | `sys_socket` | Create socket (AF_INET/SOCK_STREAM) → fd ≥ 4096 |
+| **57** | `sys_connect` | Connect socket to (ip, port) |
+| **58** | `sys_send` | Send data on socket fd |
+| **59** | `sys_recv` | Receive data from socket fd (0 = EOF) |
 
-FD table is managed per-process (BTreeMap<pid, ProcessFds>).
+Total: 60 syscalls (0..59). Socket fds start at `SOCK_FD_BASE = 4096`; `read`/`write`/`close` route to the socket layer by fd range. Timer is the LAPIC at 250 Hz; PIT is only used for LAPIC calibration. FD table is per-process: `MikuVFS::fd_tables` is a `BTreeMap<pid, FdTable>`. `fork()` clones the parent table for the child; process exit drops the entry and dec_refs each held vnode. Per-process identity (`cwd`, `umask`, `uid`, `gid`, `euid`, `egid`) is stored atomically on the `Process` struct and inherited at `fork()`.
 
 ---
 
@@ -705,6 +720,9 @@ FD table is managed per-process (BTreeMap<pid, ProcessFds>).
 | **L4** | UDP, TCP (listener + client, state machine, retransmits) |
 | **Application** | DHCP, DNS, NTP, HTTP/1.1, HTTP/2 (HPACK), Ping, Traceroute |
 | **Security** | TLS 1.2 / 1.3 (ECDHE + RSA + AES-GCM, constant-time) |
+| **Userspace sockets** | AF_INET/SOCK_STREAM via syscalls 56-59; `SOCK_FD_BASE=4096`; blocking TCP client with 30 s timeout; up to 64 sockets system-wide |
+
+**netd** — a mikuD service registered at `MultiUser` target that runs automatic DHCP after link comes up, so network is ready without any manual `dhcp` command.
 
 </details>
 
@@ -941,7 +959,7 @@ The immutable flag prevents unlink / write / rename.
 |:--|:--|
 | `nvidia` / `nvidia info` | GPU summary: PCI, chip, BAR0/1/3, PTIMER, MSI, scanout |
 | `nvidia debug` | Full BAR0 register dump (PMC, PBUS, PFIFO, PTOP, PTIMER) |
-| `nvidia firmware` | List embedded TU116 blobs с NVFW headers |
+| `nvidia firmware` | List embedded TU116 blobs with NVFW headers |
 | `nvidia falcon` | Per-engine liveness: SEC2, GSP, NVDEC, FECS, GPCCS0/1 |
 | `nvidia ungate` | Set PMC_ENABLE.GR + CE0 (bring up FECS / GPCCS / CE0) |
 | `nvidia pmc-scan` | Read-only sweep PMC area (0x000..0x1000) |
@@ -950,8 +968,17 @@ The immutable flag prevents unlink / write / rename.
 | `nvidia fbif-decode` | Decode all 8 TRANSCFG slots per live engine |
 | `nvidia dma-test` | End-to-end DMA loopback: sysmem -> SEC2 DMEM (256 B, CAFE pattern) |
 | `nvidia imem-test` | IMEM variant DMA loopback: sysmem -> SEC2 IMEM |
-| `nvidia acr-info` | Structural dump каждого SEC2 ACR blob (NVFW container + HS headers) |
+| `nvidia acr-info` | Structural dump of each SEC2 ACR blob (NVFW container + HS headers) |
 | `nvidia gsp` | GSP first-contact boot via `gsp::attempt_boot` |
+| `nvidia gsp-rm` / `gsprm` | Prepare GSP-RM staging (VRAM probe, WPR2 layout, sysmem alloc) |
+| `nvidia gsp-rm-dryrun` | Build the radix3 page table and verify chain integrity |
+| `nvidia gsp-rm-load` | Stage signed GSP-RM blob into WPR2 (fails with MissingFirmware if absent) |
+| `nvidia gsp-rm-boot` | Kick the GSP booter HS image and watch the result |
+| `nvidia sec2-acr` / `sec2-acr-v2` | SEC2 ACR first-contact boot (ahesasc upload + bl kick) |
+| `nvidia wpr-state` | Dump current WPR / WPR2 register state |
+| `nvidia msgq` | CMDQ/MSGQ ring self-test (host-side framing only) |
+| `nvidia rpc` | GSP-RM RPC header framing self-test |
+| `nvidia temp` | PTHERM on-die temperature + slowdown/shutdown thresholds |
 | `nvidia next` | Inspect live state, prescribe next driver bring-up step |
 | `nvidia splash` | Redraw boot splash via framebuffer |
 
@@ -1034,32 +1061,48 @@ The immutable flag prevents unlink / write / rename.
 
 #### Overview
 
-MikuOS includes a native driver for NVIDIA Turing-series GPUs (GTX 1650 / 1660).
-Written from scratch in Rust without `std`, uses MMIO over HHDM.
+MikuOS includes a native driver for NVIDIA GSP-era GPUs. Written from scratch
+in Rust without `std`, uses MMIO over HHDM.
 
-> Turing is the first NVIDIA generation with a GSP (GPU System Processor) on an embedded RISC-V core
+> Turing is the first NVIDIA generation with a GSP (GPU System Processor) on an embedded RISC-V core.
 > Without signed GSP firmware, most engines are unavailable.
-> The current driver covers host-side probe + Falcon engine management + DMA loopback
+> The GTX 1650 (TU116/TU117) runs the full host-side probe + Falcon engine management + DMA loopback + GSP-RM staging.
+> Every other NVIDIA card (other Turing SKUs, Ampere, Ada, ...) is recognized and brought up host-side via the generic path.
 
 #### Supported GPUs
+
+The driver splits device support into two tiers:
+
+**Full driver (embedded firmware, GSP-RM pipeline):**
 
 | Silicon | SKU | Device ID |
 |:--|:--|:--|
 | **TU117** | GTX 1650 GDDR5 / GDDR6, Mobile/Max-Q | 0x1F82..0x1FBA |
 | **TU116** | GTX 1650 SUPER, GTX 1660 / 1660 Ti / 1660 SUPER | 0x2182..0x21C4 |
 
+**Generic host-side bring-up (recognition + diagnostics, no firmware):**
+
+Any NVIDIA GPU whose architecture is identified from `PMC_BOOT_0` - the whole
+Turing / Ampere / Ada Lovelace lineup (and unrecognized newer families,
+probed read-only with the Turing register map). These are mapped, identified,
+MSI/VBIOS-probed and Falcon-liveness-checked, then registered in the generic
+GPU table (`nvidia list`). The GSP-RM offload pipeline stays gated behind a
+per-chip firmware bundle, which only TU116 ships today.
+
 #### Module Structure (nvidia/)
 
 | Module | Description |
 |:--|:--|
-| **mod.rs** | Root: probe entry, driver registry, `ACTIVE_GTX1650` global handle |
+| **mod.rs** | Root: probe entry, dispatch (gtx1650 vs generic), `ACTIVE_GTX1650` global handle |
 | **pci.rs** | PCI scan (class 0x03 + vendor 0x10DE), BAR sizing |
 | **mmio.rs** | MMIO primitives: volatile r/w over HHDM |
-| **chip.rs** | Chip identification via `PMC_BOOT_0` (arch / implementation / rev / stepping) |
+| **chip.rs** | Chip identification via `PMC_BOOT_0` (arch / implementation / rev / stepping); codenames for Turing/Ampere/Hopper/Ada |
+| **profile.rs** | Per-chip profile: Falcon engine base offsets + whether an embedded firmware bundle exists |
+| **generic.rs** | Host-side bring-up for any NVIDIA GPU + the generic GPU registry |
 | **msi.rs** | PCI MSI / MSI-X capability walker |
 | **vbios.rs** | VBIOS image extraction from PCI expansion ROM |
 | **fb.rs** | Framebuffer: boot scanout detection, BAR index and offset |
-| **gtx1650/** | Main GTX 1650 / 1660 driver (TU117 + TU116) |
+| **gtx1650/** | Full GTX 1650 / 1660 driver (TU117 + TU116), the one chip with embedded firmware |
 
 #### GTX 1650 Driver (nvidia/gtx1650/)
 
@@ -1073,6 +1116,12 @@ Written from scratch in Rust without `std`, uses MMIO over HHDM.
 | **fbif.rs** | FBIF TRANSCFG / REGIONCFG: encode, decode, program aperture for DMA |
 | **dma_buf.rs** | `DmaBuffer`: physically contiguous buffer from PMM, write barrier |
 | **gsp.rs** | GSP first-contact boot (`attempt_boot`) |
+| **gsprm.rs** | GSP-RM staging: VRAM probe, WPR2 layout, radix3 page table, sysmem alloc |
+| **msgq.rs** | CMDQ/MSGQ ring buffer framing (host-producer + gsp-producer pages) |
+| **rpc.rs** | GSP-RM RPC header (r535: version 0x03000000) + function dispatch |
+| **sec2.rs** | SEC2 ACR first-contact boot (`attempt_acr`, `attempt_acr_v2`) |
+| **therm.rs** | PTHERM on-die temperature sensor + slowdown/shutdown thresholds |
+| **quirks.rs** | Per-chip table (PMC_ENABLE bits, falcon bases, firmware refs, feature flags) |
 | **nvfw_hs.rs** | NVFW HS header / HS load header parser (ACR blob analysis) |
 | **tu116_fw.rs** | Embedded TU116 firmware bundle (compile-time `include_bytes!`) |
 | **tu116.rs** | TU116 SKU/device-id table and `model_name` |
@@ -1080,11 +1129,17 @@ Written from scratch in Rust without `std`, uses MMIO over HHDM.
 
 #### Chip Architectures
 
-| Arch code | Family | Examples |
-|:--:|:--|:--|
-| 0x16 | Turing | TU102, TU104, TU106, TU116 (0x8), TU117 (0x7) |
-| 0x17 | Ampere | GA102, GA104 |
-| 0x19 | Ada Lovelace | AD102, AD104 |
+| Arch code | Family | Examples | Driver tier |
+|:--:|:--|:--|:--|
+| 0x16 | Turing | TU102, TU104, TU106, TU116 (0x8), TU117 (0x7) | TU116/TU117 full; others host-side |
+| 0x17 | Ampere | GA100, GA102, GA103, GA104, GA106, GA107 | host-side |
+| 0x18 | Hopper | GH100 | host-side |
+| 0x19 | Ada Lovelace | AD102, AD103, AD104, AD106, AD107 | host-side |
+| 0x1A/0x1B | Blackwell | GB10x / GB100 | host-side (read-only probe) |
+
+Host-side tier = chip recognized, BAR/MSI/VBIOS/PMC/thermal/Falcon-liveness
+probed, registered in `nvidia list`. Full tier additionally runs the
+firmware pipeline (scrubber -> SEC2 ACR -> GSP booter -> GSP-RM).
 
 #### Falcon Engines
 
@@ -1135,10 +1190,11 @@ The GSP-RM image (`gsp_t.bin`) is **not** included - it requires nvidia-open-ker
 | 4 | done | SEC2 / GSP falcon alive probe |
 | 5 | done | FBIF scan + TRANSCFG decode |
 | 6 | done | DMA loopback (DMEM + IMEM) |
-| 7 | - | SEC2 ACR boot (WPR setup) |
-| 8 | - | NVDEC scrubber pass |
-| 9 | - | GSP-RM staging + GSP RPC |
+| 7 | wip | SEC2 ACR first-contact (`sec2::attempt_acr` / `_v2`); full WPR2 lock pending |
+| 8 | wip | NVDEC scrubber first-contact (`nvdec::attempt_scrub`); full scrub-descriptor staging pending |
+| 9 | wip | GSP-RM staging (`gsprm`) + full boot orchestrator (`gsprm::boot`, `nvidia gsp-rm-boot-full`): scrub->load->ACR->WPR2->booter->MSGQ handshake. GSP-RM blob embedded. Two gates remain: ACR WPR2 lock (needs `RM_FLCN_ACR_DESC` in SEC2 DMEM) and GSP boot-args queue handoff |
 | 10 | - | FECS/GPCCS contexts, PGRAPH usable |
+| - | done | PTHERM on-die temperature read-out (`nvidia temp`) |
 
 </details>
 
@@ -1160,7 +1216,7 @@ The GSP-RM image (`gsp_t.bin`) is **not** included - it requires nvidia-open-ker
 ### Running
 
 ```bash
-git clone https://github.com/altushkaso2/miku-os
+git clone https://github.com/alunwrd/miku-os
 cd miku-os/builder
 cargo run
 ```
@@ -1235,4 +1291,4 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
 
 *With love*
 
-<img src="https://raw.githubusercontent.com/altushkaso2/alunwrd/main/docs/miku.png" width="220" alt="Miku Logo">
+<img src="https://raw.githubusercontent.com/alunwrd/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">

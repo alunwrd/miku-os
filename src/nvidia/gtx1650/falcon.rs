@@ -3,11 +3,11 @@
 // Every NVIDIA secure micro-controller is a "Falcon" core. Its register
 // window has the same shape regardless of which engine wraps it; only the
 // base offset inside BAR0 changes. This module covers:
-//   - engine base addresses for TU116
-//   - Falcon register offsets relative to that base
-//   - IMEM (instruction memory) and DMEM (data memory) upload via the
+//     engine base addresses for TU116
+//     Falcon register offsets relative to that base
+//     IMEM (instruction memory) and DMEM (data memory) upload via the
 //     port-based PIO interface
-//   - CPUCTL kick (start/stop) and HALT polling
+//     CPUCTL kick (start/stop) and HALT polling
 //
 // Sources cross-checked: nouveau (drivers/gpu/drm/nouveau/nvkm/falcon),
 // open-gpu-kernel-modules (src/common/inc/swref/published/turing/tu102),
@@ -50,6 +50,15 @@ pub const FALCON_MAILBOX0:     u32 = 0x040;
 pub const FALCON_MAILBOX1:     u32 = 0x044;
 
 pub const FALCON_RM:           u32 = 0x084;
+
+/// Falcon engine reset register. Source: open-gpu-kernel-modules
+/// 'NV_PFALCON_FALCON_ENGINE'. Writing 1 to bit 0 asserts engine reset
+/// (halts CPU, clears IMEM/DMEM virtual state, clears EXCI). Must be
+/// followed by writing 0 to deassert. Available on Maxwell+, used by
+/// nouveau 'gp102_flcn_reset_eng' for Volta+ falcons. This is the
+/// authoritative reset path - 'FALCON_RM' at 0x084 is NOT a reset
+pub const FALCON_ENGINE:        u32 = 0x3c0;
+pub const FALCON_ENGINE_RESET:  u32 = 1 << 0;
 pub const FALCON_CPUCTL:       u32 = 0x100;
 pub const FALCON_BOOTVEC:      u32 = 0x104;
 pub const FALCON_HWCFG:        u32 = 0x108;
@@ -99,14 +108,14 @@ pub const MEM_C_SECURE:     u32 = 1 << 28;
 // rnndb hw/falcon/falcon.xml. IDLE at bit 1 is confirmed empirically against
 // TU116 silicon (sec2/gsp/fecs all read 0x00000002 post-POST, which is the
 // IDLE-only state). An earlier version of this file placed IDLE at bit 0 -
-// that was a misreading.
+// that was a misreading
 //
 //   [0]     WRITE_OR_FREE write-only "release/free" sub-command. NOT a
 //                         normal-transfer flag: when set, the engine performs
 //                         a release operation and stays IDLE without moving
 //                         data. OpenGPU's falcon load path leaves it 0;
 //                         setting it from the host gives a no-op transfer
-//                         that returns OK with empty IMEM/DMEM.
+//                         that returns ok with empty IMEM/DMEM.
 //   [1]     IDLE          read-only status; hw sets when transfer drains
 //   [4]     WRITE         direction: 1 = falcon -> FB, 0 = FB -> falcon
 //   [5]     IMEM          target: 1 = IMEM, 0 = DMEM
@@ -211,7 +220,7 @@ pub fn is_pri_sentinel(val: u32) -> bool {
 pub enum Liveness {
     /// HWCFG decodes to a plausible imem/dmem geometry
     Alive,
-    /// Window returns the `0xBADF_xxxx` PRI sentinel - engine is gated
+    /// Window returns the '0xBADF_xxxx' PRI sentinel: engine is gated
     /// in PMC_ENABLE / NV_PMC_DEVICE_ENABLE or floor-swept
     GatedPriSentinel,
     /// Window returns 0 or all-ones - bus stalled or no decode at all
@@ -235,6 +244,10 @@ impl<'a> Engine<'a> {
     }
 
     #[inline] pub fn base(&self) -> u32 { self.base }
+
+    /// Access to the underlying BAR0 region for absolute MMIO accesses
+    /// (e.g., PMC registers, which are not engine-relative)
+    #[inline] pub fn bar0(&self) -> &'a MmioRegion { self.bar0 }
 
     #[inline]
     pub fn read(&self, off: u32) -> u32 {
@@ -268,6 +281,48 @@ impl<'a> Engine<'a> {
             core::hint::spin_loop();
         }
         false
+    }
+
+    /// Spin until HALTED or timeout_ns of wall-clock has elapsed, measured
+    /// by PTIMER (the free-running ns counter at BAR0+0x9400). Returns true
+    /// if the engine halted.
+    ///
+    /// This is the preferred halt poll: an HS falcon either halts within a
+    /// few hundred microseconds or never, so a raw spin-count budget of tens
+    /// of millions just burns seconds of MMIO reads on a failed boot. Bounding
+    /// by real time keeps the wait short and identical across host CPU speeds.
+    /// A backstop iteration cap guards the rare case where PTIMER is not
+    /// advancing (VBIOS devinit has not run), so this never spins forever.
+    pub fn wait_halted_ns(&self, timeout_ns: u64) -> bool {
+        const PTIMER_TIME_0: u32 = 0x0000_9400;
+        const BACKSTOP_ITERS: u32 = 2_000_000;
+        let start = self.bar0.read32(PTIMER_TIME_0);
+        let budget = timeout_ns.min(u32::MAX as u64) as u32;
+        for _ in 0..BACKSTOP_ITERS {
+            if self.is_halted() { return true; }
+            let now = self.bar0.read32(PTIMER_TIME_0);
+            if now.wrapping_sub(start) >= budget { return false; }
+            core::hint::spin_loop();
+        }
+        false
+    }
+
+    /// Read 16 bytes of IMEM starting at byte offset 'dst'. Uses the
+    /// same C0/D0 windowed port as 'imem_load' but in AINCR mode.
+    /// Returns zeros if the page is SECURE and HSCB blocks host
+    /// readback; this is a normal protection feature, not an error.
+    /// Useful as a sanity check that our IMEM port writes landed:
+    /// reading back the first non-secure dwords should match the bytes
+    /// we wrote
+    pub fn imem_peek16(&self, dst: u32) -> [u8; 16] {
+        let ctrl = (dst & 0x0000_FFFF) | MEM_C_AINCR;
+        self.write(FALCON_IMEM_C0, ctrl);
+        let mut out = [0u8; 16];
+        for i in 0..4 {
+            let w = self.read(FALCON_IMEM_D0);
+            out[i*4..i*4+4].copy_from_slice(&w.to_le_bytes());
+        }
+        out
     }
 
     /// Upload 'data' to IMEM starting at byte offset 'dst'. 'tag' is the
@@ -361,9 +416,9 @@ impl<'a> Engine<'a> {
     // a Falcon. PIO via IMEM_C/DMEM_C works for the few-KB booter HS
     // image (see 'imem_load' above) but is too slow for full GR ctx
     // restore or VRAM scrubbing. Once the caller has:
-    //   1. allocated a DMA-visible buffer (sysmem PA or VRAM offset),
-    //   2. populated it with the ucode/data,
-    //   3. configured an FBIF context-DMA channel for that buffer,
+    //   1) allocated a DMA-visible buffer (sysmem PA or VRAM offset),
+    //   2) populated it with the ucode/data,
+    //   3) configured an FBIF context-DMA channel for that buffer,
     // they can issue one or more 'dma_load' calls to transfer chunks
     // into IMEM/DMEM with the falcon halted.
     //
@@ -388,10 +443,10 @@ impl<'a> Engine<'a> {
     /// Issue one Falcon DMA transfer and wait for completion
     ///
     /// Caller invariants (NOT checked here):
-    ///   - The Falcon CPU is halted (HALTED bit set in CPUCTL).
-    ///   - 'xfer.ctxdma' has been programmed in the engine's FBIF window
+    ///     The Falcon CPU is halted (HALTED bit set in CPUCTL).
+    ///     'xfer.ctxdma' has been programmed in the engine's FBIF window
     ///     to point at the right aperture (sysmem-coherent / VRAM / etc).
-    ///   - The buffer at 'xfer.src_phys + xfer.src_off_bytes' is
+    ///     The buffer at 'xfer.src_phys + xfer.src_off_bytes' is
     ///     readable by the FBIF for at least '4 << xfer.size_log2' bytes
     ///
     /// Returns Ok(()) on a successful idle. The transfer moves exactly

@@ -42,27 +42,49 @@ pub unsafe fn rq_push_sorted(inner: &mut RunQueueInner, p: *mut Process) {
     (*p).rq_next.store(null_mut(), Ordering::Relaxed);
     (*p).on_rq.store(true, Ordering::Relaxed);
 
-    let before_head = inner.head.is_null() || {
-        let h_vr = (*inner.head).vruntime.load(Ordering::Relaxed);
-        p_vr < h_vr || (p_vr == h_vr && p_pid < (*inner.head).pid)
-    };
+    // Empty list - O(1)
+    if inner.head.is_null() {
+        inner.head = p;
+        inner.tail = p;
+        inner.len  = 1;
+        return;
+    }
 
-    if before_head {
+    // Insert-before-head - O(1)
+    let h_vr  = (*inner.head).vruntime.load(Ordering::Relaxed);
+    let h_pid = (*inner.head).pid;
+    if p_vr < h_vr || (p_vr == h_vr && p_pid < h_pid) {
         (*p).rq_next.store(inner.head, Ordering::Relaxed);
         inner.head = p;
         inner.len += 1;
         return;
     }
 
+    // Append-after-tail - O(1). This is the hot path for yielding tasks
+    // whose vruntime has just grown past everyone else's
+    if !inner.tail.is_null() {
+        let t_vr  = (*inner.tail).vruntime.load(Ordering::Relaxed);
+        let t_pid = (*inner.tail).pid;
+        if p_vr > t_vr || (p_vr == t_vr && p_pid > t_pid) {
+            (*inner.tail).rq_next.store(p, Ordering::Relaxed);
+            inner.tail = p;
+            inner.len += 1;
+            return;
+        }
+    }
+
+    // Middle insertion - walk forward
     let mut curr = inner.head;
     loop {
         let next = (*curr).rq_next.load(Ordering::Relaxed);
         if next.is_null() {
             (*curr).rq_next.store(p, Ordering::Relaxed);
+            inner.tail = p;
             break;
         }
-        let nv = (*next).vruntime.load(Ordering::Relaxed);
-        if p_vr < nv || (p_vr == nv && p_pid < (*next).pid) {
+        let nv   = (*next).vruntime.load(Ordering::Relaxed);
+        let npid = (*next).pid;
+        if p_vr < nv || (p_vr == nv && p_pid < npid) {
             (*p).rq_next.store(next, Ordering::Relaxed);
             (*curr).rq_next.store(p, Ordering::Relaxed);
             break;
@@ -86,9 +108,10 @@ pub unsafe fn rq_pop_min(inner: &mut RunQueueInner) -> Option<*mut Process> {
             let next = (*curr).rq_next.load(Ordering::Relaxed);
             if prev.is_null() { inner.head = next; }
             else { (*prev).rq_next.store(next, Ordering::Relaxed); }
+            if inner.tail == curr { inner.tail = prev; }
             (*curr).rq_next.store(null_mut(), Ordering::Relaxed);
             (*curr).on_rq.store(false, Ordering::Relaxed);
-            inner.len -= 1;
+            inner.len = inner.len.saturating_sub(1);
             return Some(curr);
         }
         prev = curr;
@@ -117,9 +140,10 @@ pub unsafe fn rq_remove(inner: &mut RunQueueInner, pid: u64) -> bool {
     if (*inner.head).pid == pid {
         let p = inner.head;
         inner.head = (*p).rq_next.load(Ordering::Relaxed);
+        if inner.tail == p { inner.tail = null_mut(); }
         (*p).rq_next.store(null_mut(), Ordering::Relaxed);
         (*p).on_rq.store(false, Ordering::Relaxed);
-        inner.len -= 1;
+        inner.len = inner.len.saturating_sub(1);
         return true;
     }
 
@@ -130,9 +154,10 @@ pub unsafe fn rq_remove(inner: &mut RunQueueInner, pid: u64) -> bool {
         if (*next).pid == pid {
             let after = (*next).rq_next.load(Ordering::Relaxed);
             (*curr).rq_next.store(after, Ordering::Relaxed);
+            if inner.tail == next { inner.tail = curr; }
             (*next).rq_next.store(null_mut(), Ordering::Relaxed);
             (*next).on_rq.store(false, Ordering::Relaxed);
-            inner.len -= 1;
+            inner.len = inner.len.saturating_sub(1);
             return true;
         }
         curr = next;

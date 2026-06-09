@@ -21,15 +21,23 @@
 pub mod tu117;
 pub mod tu116;
 pub mod tu116_fw;
+pub mod quirks;
 pub mod nvfw_hs;
 pub mod falcon;
 pub mod fbif;
 pub mod dma_buf;
 pub mod gsp;
+pub mod gsprm;
+pub mod msgq;
+pub mod rpc;
+pub mod sec2;
+pub mod fwsec;
+pub mod nvdec;
 pub mod regs;
 pub mod device;
 pub mod init;
 pub mod pmc;
+pub mod therm;
 
 pub use device::Gtx1650;
 

@@ -18,7 +18,7 @@ impl MikuVFS {
     }
 
     pub fn fstat(&mut self, fd: usize) -> VfsResult<VNodeStat> {
-        let vid = self.fd_table.get(fd)?.vnode_id as usize;
+        let vid = self.fds().get(fd)?.vnode_id as usize;
         if !self.valid_vnode(vid) {
             return Err(VfsError::BadFd);
         }
@@ -193,9 +193,14 @@ impl MikuVFS {
     }
 
     pub fn is_vnode_open(&self, vid: usize) -> bool {
-        for i in 0..MAX_OPEN_FILES {
-            if self.fd_table.files[i].active && self.fd_table.files[i].vnode_id as usize == vid {
-                return true;
+        // Walk every process's FD table - a vnode is "open" if any
+        // process holds an active descriptor on it
+        for table in self.fd_tables.values() {
+            for i in 0..MAX_OPEN_FILES {
+                let f = &table.files[i];
+                if f.active && f.vnode_id as usize == vid {
+                    return true;
+                }
             }
         }
         false

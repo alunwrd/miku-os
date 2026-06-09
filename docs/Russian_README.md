@@ -4,7 +4,7 @@
 
 **Экспериментальная ОС на Rust**
 
-*Работает на Rust и нескольких разработчиках :D*
+*Работает на Rust и одном разработчике :D*
 
 <img src="https://raw.githubusercontent.com/alunwrd/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
 
@@ -54,6 +54,7 @@ ELF динамическая линковка, разделяемые библи
 | **PS/2** | Инициализация контроллера клавиатуры |
 | **USB** | USB legacy handoff (освобождение EHCI/xHCI от BIOS) |
 | **Splash** | Загрузочный экран через фреймбуфер |
+| **fwload** | Загрузчик прошивок по требованию из `/lib/firmware` (модель Linux `request_firmware`) |
 
 ---
 
@@ -334,7 +335,7 @@ WantedBy=multi-user
 
 #### Обзор
 
-libmiku это C-совместимая стандартная библиотека для MikuOS. Написана на Rust, 63 модуля, 962 экспортируемые функции.
+libmiku это C-совместимая стандартная библиотека для MikuOS. Написана на Rust, 63 модуля, 956 экспортируемые функции.
 Загружается динамически через ld-miku, используется всеми userspace программами.
 Включает POSIX libc-совместимый слой (stdio, stdlib, string.h и т.д.).
 
@@ -669,6 +670,7 @@ bits 12.. = номер swap слота
 | **kill()** | Отправка сигнала процессу (SIGTERM, SIGKILL, SIGCHLD) |
 | **Сбор зомби** | Автоматический через mikuD и wait4 |
 | **Иерархия процессов** | Отслеживание родитель-потомок через ppid |
+| **Per-process идентичность** | `cwd`, `umask`, `uid`, `gid`, `euid`, `egid` — атомарно хранятся в `Process`, наследуются при `fork()`, синхронизируются в VFS-контекст при каждом syscall |
 
 ---
 
@@ -739,8 +741,21 @@ bits 12.. = номер swap слота
 | **44** | `sys_wait4` | Ожидание дочернего процесса |
 | **45** | `sys_kill` | Отправка сигнала |
 | **46** | `sys_exec` | Выполнение ELF-бинарника |
+| **47** | `sys_umask` | Установка маски создания файлов (возвращает прежнюю) |
+| **48** | `sys_getuid` | Получить реальный UID |
+| **49** | `sys_getgid` | Получить реальный GID |
+| **50** | `sys_geteuid` | Получить эффективный UID |
+| **51** | `sys_getegid` | Получить эффективный GID |
+| **52** | `sys_setuid` | Установить реальный UID (-EPERM если не root) |
+| **53** | `sys_setgid` | Установить реальный GID (-EPERM если не root) |
+| **54** | `sys_seteuid` | Установить эффективный UID (-EPERM если не root) |
+| **55** | `sys_setegid` | Установить эффективный GID (-EPERM если не root) |
+| **56** | `sys_socket` | Создать сокет (AF_INET/SOCK_STREAM) → fd ≥ 4096 |
+| **57** | `sys_connect` | Подключить сокет к (ip, port) |
+| **58** | `sys_send` | Отправить данные через сокет fd |
+| **59** | `sys_recv` | Получить данные из сокета fd (0 = EOF) |
 
-Таблица FD управляется per-process (BTreeMap<pid, ProcessFds>).
+Всего: 60 syscall (0..59). Socket fd начинаются с `SOCK_FD_BASE = 4096`; `read`/`write`/`close` маршрутизируются в слой сокетов по диапазону fd. Таймер - LAPIC на 250 Гц; PIT используется только для калибровки LAPIC. Таблица FD per-process: `MikuVFS::fd_tables` это `BTreeMap<pid, FdTable>`. `fork()` клонирует таблицу родителя ребёнку; при exit таблица удаляется и каждый держимый vnode dec_ref. Per-process идентичность (`cwd`, `umask`, `uid`, `gid`, `euid`, `egid`) хранится атомарно в структуре `Process`, наследуется при `fork()` и синхронизируется в `vfs.ctx` при каждом вызове syscall.
 
 ---
 
@@ -768,6 +783,9 @@ bits 12.. = номер swap слота
 | **L4** | UDP, TCP (listener + client, state machine, ретрансмиты) |
 | **Приложение** | DHCP, DNS, NTP, HTTP/1.1, HTTP/2 (HPACK), Ping, Traceroute |
 | **Безопасность** | TLS 1.2 / 1.3 (ECDHE + RSA + AES-GCM, constant-time) |
+| **Userspace сокеты** | AF_INET/SOCK_STREAM через syscall 56-59; `SOCK_FD_BASE=4096`; блокирующий TCP-клиент, таймаут 30 с; до 64 сокетов |
+
+**netd** — сервис mikuD, зарегистрированный на таргете `MultiUser`, автоматически выполняет DHCP после появления линка, не блокируя загрузку.
 
 </details>
 
@@ -1015,6 +1033,15 @@ bits 12.. = номер swap слота
 | `nvidia imem-test` | IMEM-вариант DMA loopback: sysmem -> SEC2 IMEM |
 | `nvidia acr-info` | Структурный дамп каждого ACR blob SEC2 (контейнер NVFW + заголовки HS) |
 | `nvidia gsp` | First-contact загрузка GSP через gsp::attempt_boot |
+| `nvidia gsp-rm` / `gsprm` | Подготовка staging GSP-RM (VRAM probe, layout WPR2, sysmem alloc) |
+| `nvidia gsp-rm-dryrun` | Сборка radix3 таблицы и проверка целостности цепочки |
+| `nvidia gsp-rm-load` | Загрузка подписанного GSP-RM blob в WPR2 (MissingFirmware если отсутствует) |
+| `nvidia gsp-rm-boot` | Запуск GSP booter HS-образа и наблюдение результата |
+| `nvidia sec2-acr` / `sec2-acr-v2` | SEC2 ACR first-contact (загрузка ahesasc + запуск bl) |
+| `nvidia wpr-state` | Дамп состояния регистров WPR / WPR2 |
+| `nvidia msgq` | Self-test колец CMDQ/MSGQ (только host-side framing) |
+| `nvidia rpc` | Self-test framing RPC-заголовков GSP-RM |
+| `nvidia temp` | PTHERM температура кристалла + пороги slowdown/shutdown |
 | `nvidia next` | Анализ состояния и рекомендация следующего шага разработки драйвера |
 | `nvidia splash` | Перерисовка загрузочного экрана через фреймбуфер |
 
@@ -1085,40 +1112,56 @@ bits 12.. = номер swap слота
 
 #### Обзор
 
-MikuOS включает собственный драйвер для GPU NVIDIA серии Turing (GTX 1650 / 1660).
-Написан с нуля на Rust без std, использует MMIO поверх HHDM.
+MikuOS включает собственный драйвер для GPU NVIDIA эпохи GSP. Написан с нуля
+на Rust без std, использует MMIO поверх HHDM.
 
 > Turing - первое поколение NVIDIA с GSP (GPU System Processor) на встроенном ядре RISC-V.
 > Без подписанного firmware GSP большинство движков недоступно.
-> Текущий драйвер охватывает host-side probe + управление Falcon-движками + DMA loopback.
+> GTX 1650 (TU116/TU117) проходит полный путь: host-side probe + управление Falcon-движками + DMA loopback + подготовка GSP-RM.
+> Любая другая карта NVIDIA (прочие Turing, Ampere, Ada, ...) распознаётся и поднимается host-side через generic-путь.
 
 #### Поддерживаемые GPU
+
+**Полный драйвер (встроенный firmware, конвейер GSP-RM):**
 
 | Чип | SKU | Диапазон Device ID |
 |:--|:--|:--|
 | **TU117** | GTX 1650 GDDR5 / GDDR6, Mobile/Max-Q | 0x1F82..0x1FBA |
 | **TU116** | GTX 1650 SUPER, GTX 1660 / 1660 Ti / 1660 SUPER | 0x2182..0x21C4 |
 
+**Generic host-side bring-up (распознавание + диагностика, без firmware):**
+
+Любой GPU NVIDIA, чья архитектура определяется по PMC_BOOT_0 - вся линейка
+Turing / Ampere / Ada Lovelace (и новые семейства, читаются только на чтение
+с Turing-картой регистров). Карта маппится, идентифицируется, проверяется
+MSI/VBIOS и живучесть Falcon, затем регистрируется в общей таблице GPU
+(`nvidia list`). Конвейер GSP-RM остаётся за per-chip firmware-бандлом,
+который пока есть только у TU116.
+
 #### Структура модулей (nvidia/)
 
 | Модуль | Описание |
 |:--|:--|
-| **mod.rs** | Корень: точка входа probe, реестр драйверов, глобальный ACTIVE_GTX1650 |
+| **mod.rs** | Корень: точка входа probe, диспетчеризация (gtx1650 vs generic), глобальный ACTIVE_GTX1650 |
 | **pci.rs** | PCI-сканирование (класс 0x03 + vendor 0x10DE), определение размера BAR |
 | **mmio.rs** | MMIO-примитивы: volatile чтение/запись через HHDM |
-| **chip.rs** | Идентификация чипа по PMC_BOOT_0 (arch / implementation / rev / stepping) |
+| **chip.rs** | Идентификация чипа по PMC_BOOT_0; codename для Turing/Ampere/Hopper/Ada |
+| **profile.rs** | Профиль чипа: базы Falcon-движков + наличие firmware-бандла |
+| **generic.rs** | Host-side bring-up для любого GPU NVIDIA + реестр generic-GPU |
 | **msi.rs** | Обход возможностей PCI MSI / MSI-X |
 | **vbios.rs** | Извлечение образа VBIOS из PCI expansion ROM |
 | **fb.rs** | Фреймбуфер: определение boot scanout, BAR-индекс и смещение |
-| **gtx1650/** | Основной драйвер GTX 1650 / 1660 (TU117 + TU116) |
+| **gtx1650/** | Полный драйвер GTX 1650 / 1660 (TU117 + TU116), единственный чип со встроенным firmware |
 
 #### Архитектуры чипов
 
-| Код arch | Семейство | Примеры |
-|:--:|:--|:--|
-| 0x16 | Turing | TU102, TU104, TU106, TU116 (0x8), TU117 (0x7) |
-| 0x17 | Ampere | GA102, GA104 |
-| 0x19 | Ada Lovelace | AD102, AD104 |
+| Код arch | Семейство | Примеры | Уровень драйвера |
+|:--:|:--|:--|:--|
+| 0x16 | Turing | TU102, TU104, TU106, TU116 (0x8), TU117 (0x7) | TU116/TU117 полный; прочие host-side |
+| 0x17 | Ampere | GA100, GA102, GA103, GA104, GA106, GA107 | host-side |
+| 0x18 | Hopper | GH100 | host-side |
+| 0x19 | Ada Lovelace | AD102, AD103, AD104, AD106, AD107 | host-side |
+| 0x1A/0x1B | Blackwell | GB10x / GB100 | host-side (только чтение) |
 
 #### Falcon-движки
 
@@ -1170,8 +1213,8 @@ MikuOS включает собственный драйвер для GPU NVIDIA 
 | 5 | готово | FBIF scan + декодирование TRANSCFG |
 | 6 | готово | DMA loopback (DMEM + IMEM) |
 | 7 | - | Загрузка ACR через SEC2 (установка WPR) |
-| 8 | - | Проход скруббера NVDEC |
-| 9 | - | Подготовка GSP-RM + GSP RPC |
+| 8 | wip | Первый контакт скруббера NVDEC (`nvdec::attempt_scrub`); полная подготовка дескриптора скраба ожидается |
+| 9 | wip | Подготовка GSP-RM (`gsprm`) + полный orchestrator загрузки (`gsprm::boot`, `nvidia gsp-rm-boot-full`): scrub->load->ACR->WPR2->booter->MSGQ handshake. Blob GSP-RM встроен. Осталось 2 гейта: lock WPR2 в ACR (нужен `RM_FLCN_ACR_DESC` в SEC2 DMEM) и передача адреса очереди через GSP boot-args |
 | 10 | - | Контексты FECS/GPCCS, доступ к PGRAPH |
 
 </details>
@@ -1206,7 +1249,7 @@ MikuOS включает собственный драйвер для GPU NVIDIA 
 ### Порядок запуска
 
 ```bash
-git clone https://github.com/altushkaso2/miku-os
+git clone https://github.com/alunwrd/miku-os
 cd miku-os/builder
 cargo run
 ```
@@ -1248,7 +1291,7 @@ cd src/lib/userspace
     <img src="https://github.com/alunwrd.png" width="100" style="border-radius:50%;" alt="alunwrd">
   </a>
   <br><br>
-  <a href="https://github.com/altushkaso2"><b>@alunwrd</b></a>
+  <a href="https://github.com/alunwrd"><b>@alunwrd</b></a>
   <br>
   <sub>Автор и единственный разработчик Miku OS</sub>
   <br>
@@ -1281,4 +1324,4 @@ cd src/lib/userspace
 
 *С любовью*
 
-<img src="https://raw.githubusercontent.com/altushkaso2/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
+<img src="https://raw.githubusercontent.com/alunwrd/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">

@@ -8,6 +8,12 @@ extern "C" {
     pub fn miku_write(fd: u64, buf: *const u8, len: usize) -> i64;
     pub fn miku_read(fd: u64, buf: *mut u8, len: usize) -> i64;
 
+    // net (TCP client sockets); fd is also usable with miku_read/write/close
+    pub fn miku_socket() -> i64;
+    pub fn miku_connect(fd: i64, ip: *const u8, port: u16) -> i64;
+    pub fn miku_send(fd: i64, buf: *const u8, len: usize) -> i64;
+    pub fn miku_recv(fd: i64, buf: *mut u8, len: usize) -> i64;
+
     // stdio
     pub fn miku_print(s: *const u8);
     pub fn miku_println(s: *const u8);
@@ -2148,9 +2154,17 @@ macro_rules! cstr {
     };
 }
 
+// SysV-style initial stack layout: [rsp]=argc, [rsp+8]=argv[0], ...
+// Pass argc/argv to _start_main via rdi/rsi so 'extern "C" fn
+// _start_main(argc: i32, argv: *const *const u8)'' works, while
+// argless _start_main signatures (the original convention) keep
+// compiling; extra register args are harmless for a callee that
+// doesn't read them
 core::arch::global_asm!(
     ".global _start",
     "_start:",
+    "mov rdi, [rsp]",
+    "lea rsi, [rsp + 8]",
     "and rsp, -16",
     "call _start_main",
     "ud2",

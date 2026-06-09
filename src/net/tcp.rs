@@ -10,8 +10,14 @@ pub const FLAG_PSH: u8 = 0x08;
 pub const FLAG_ACK: u8 = 0x10;
 
 const MAX_RETRIES: usize = 5;
-const RETRANSMIT_TICKS: u64 = 18;
-const RX_BUF: usize = 8192;
+const RX_BUF: usize = 32768;
+
+// RFC 6298 RTO bounds (tick = 4 ms at TIMER_HZ_DEFAULT 250). We start
+// with a 1 s RTO before any RTT has been measured, allow it to shrink to
+// 250 ms once SRTT settles, and cap it at 60 s
+const INIT_RTO_TICKS: u32 = 250;   // 1 s
+const MIN_RTO_TICKS:  u32 = 62;    // ~250 ms (Linux-style floor, < RFC 1 s but practical)
+const MAX_RTO_TICKS:  u32 = 15000; // 60 s
 
 #[inline]
 fn wrapping_gt(a: u32, b: u32) -> bool {
@@ -182,6 +188,18 @@ pub struct TcpSocket {
     pub retransmit_dl: u64,
     pub retransmit_count: usize,
     pub peer_acked: u32,
+
+    // RFC 6298 round-trip-time / retransmission-timeout state.
+    // srtt/rttvar are 0 until the first RTT sample lands. send_ts records
+    // when the currently-pending segment was first transmitted, so the
+    // ACK path can compute R = now - send_ts. Karn's algorithm: if the
+    // pending segment was retransmitted we skip the sample (the ACK is
+    // ambiguous about which copy it acknowledges)
+    pub srtt_ticks:      u32,
+    pub rttvar_ticks:    u32,
+    pub rto_ticks:       u32,
+    pub send_ts:         u64,
+    pub send_was_resend: bool,
 }
 
 impl TcpSocket {
@@ -206,7 +224,35 @@ impl TcpSocket {
             retransmit_dl: 0,
             retransmit_count: 0,
             peer_acked: 0,
+            srtt_ticks: 0,
+            rttvar_ticks: 0,
+            rto_ticks: INIT_RTO_TICKS,
+            send_ts: 0,
+            send_was_resend: false,
         }
+    }
+
+    /// Update SRTT, RTTVAR and RTO from a fresh round-trip-time sample
+    /// per RFC 6298 §2 with the standard alpha=1/8, beta=1/4 weights
+    fn update_rtt(&mut self, r_ticks: u32) {
+        let r = r_ticks.max(1);
+        if self.srtt_ticks == 0 {
+            // First measurement: SRTT = R, RTTVAR = R/2
+            self.srtt_ticks = r;
+            self.rttvar_ticks = r / 2;
+        } else {
+            // RTTVAR = 3/4 RTTVAR + 1/4 |SRTT - R|
+            // SRTT   = 7/8 SRTT   + 1/8 R
+            let diff = if r > self.srtt_ticks { r - self.srtt_ticks } else { self.srtt_ticks - r };
+            self.rttvar_ticks = (self.rttvar_ticks - (self.rttvar_ticks >> 2))
+                .saturating_add(diff >> 2);
+            self.srtt_ticks = (self.srtt_ticks - (self.srtt_ticks >> 3))
+                .saturating_add(r >> 3);
+        }
+        // RTO = SRTT + max(G, 4 * RTTVAR), G = 1 tick (clock granularity)
+        let k_rttvar = self.rttvar_ticks.saturating_mul(4).max(1);
+        let rto = self.srtt_ticks.saturating_add(k_rttvar);
+        self.rto_ticks = rto.clamp(MIN_RTO_TICKS, MAX_RTO_TICKS);
     }
 
     fn send_segment(&self, flags: u8, payload: &[u8]) {
@@ -463,7 +509,12 @@ impl TcpSocket {
             self.last_sent_payload[..self.last_sent_len].copy_from_slice(&chunk[..self.last_sent_len]);
             self.last_sent_flags = flags;
             self.retransmit_seq = sent_seq;
-            self.retransmit_dl = crate::vfs::procfs::uptime_ticks().wrapping_add(RETRANSMIT_TICKS);
+            // Record the first-transmission timestamp so the ACK path can
+            // sample R = now - send_ts. Karn flag stays false until a
+            // retransmit happens (then we skip the RTT sample)
+            self.send_ts = crate::vfs::procfs::uptime_ticks();
+            self.send_was_resend = false;
+            self.retransmit_dl = self.send_ts.wrapping_add(self.rto_ticks as u64);
             self.retransmit_count = 0;
 
             self.send_segment(flags, chunk);
@@ -487,8 +538,16 @@ impl TcpSocket {
                 self.recv_one();
 
                 if self.state == TcpState::Closed { return false; }
-                
+
                 if self.peer_acked == expected_ack || wrapping_gt(self.peer_acked, expected_ack) {
+                    // Karn's algorithm: only sample RTT if the acknowledged
+                    // segment was sent exactly once. Ambiguous ACKs after a
+                    // retransmit would otherwise corrupt SRTT/RTTVAR
+                    if !self.send_was_resend {
+                        let now = crate::vfs::procfs::uptime_ticks();
+                        let r = now.wrapping_sub(self.send_ts).min(u32::MAX as u64) as u32;
+                        self.update_rtt(r);
+                    }
                     return true;
                 }
 
@@ -498,16 +557,21 @@ impl TcpSocket {
             }
 
             self.retransmit_count += 1;
-            crate::log!("tcp: retransmit #{} seq={}", self.retransmit_count, self.retransmit_seq);
+            crate::log!("tcp: retransmit #{} seq={} rto={}t",
+                self.retransmit_count, self.retransmit_seq, self.rto_ticks);
 
             self.seq = self.retransmit_seq;
-            
+
             let mut tmp = [0u8; 1400];
             tmp[..self.last_sent_len].copy_from_slice(&self.last_sent_payload[..self.last_sent_len]);
-            
+
             self.send_segment(self.last_sent_flags, &tmp[..self.last_sent_len]);
             self.seq = self.seq.wrapping_add(self.last_sent_len as u32);
-            self.retransmit_dl = crate::vfs::procfs::uptime_ticks().wrapping_add(RETRANSMIT_TICKS * (1 << self.retransmit_count as u64));
+            // RFC 6298 §5.5: exponential backoff on each retransmit
+            self.rto_ticks = self.rto_ticks.saturating_mul(2).min(MAX_RTO_TICKS);
+            self.send_was_resend = true;
+            self.retransmit_dl = crate::vfs::procfs::uptime_ticks()
+                .wrapping_add(self.rto_ticks as u64);
         }
 
         crate::log_err!("tcp: max retransmits reached, closing");

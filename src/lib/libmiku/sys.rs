@@ -39,6 +39,12 @@ pub const SYS_READLINK:   u64 = 33;
 pub const SYS_PIPE:       u64 = 34;
 pub const SYS_CHDIR:      u64 = 35;
 
+// Socket syscalls (kernel dispatch 56-59)
+pub const SYS_SOCKET:     u64 = 56;
+pub const SYS_CONNECT:    u64 = 57;
+pub const SYS_SEND:       u64 = 58;
+pub const SYS_RECV:       u64 = 59;
+
 pub const NR_SYSCALLS: u64 = 36;
 
 // raw syscall wrappers

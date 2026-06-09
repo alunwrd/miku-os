@@ -309,6 +309,16 @@ pub fn h2_request(
     let mut done           = false;
     let mut idle           = 0usize;
 
+    // HTTP/2 flow control: per RFC 7540 §6.9.1 every received DATA frame
+    // consumes the full frame payload length on BOTH the stream and the
+    // connection windows. The server stops sending once either window
+    // reaches zero. Without periodic WINDOW_UPDATE the response freezes
+    // after the initial INIT_WINDOW bytes (this is the wget/curl-on-RTL8168
+    // freeze symptom). Refill every WU_REFILL bytes to keep both windows open
+    let mut stream_recv: u32 = 0;
+    let mut conn_recv:   u32 = 0;
+    const WU_REFILL: u32 = INIT_WINDOW / 2;
+
     loop {
         if CTRL_C.load(Ordering::SeqCst) { return None; }
         if done { break; }
@@ -374,6 +384,21 @@ pub fn h2_request(
                         if end > 1 { body_out.extend_from_slice(&payload[1..end]); }
                     } else {
                         body_out.extend_from_slice(payload);
+                    }
+                    // Flow-control accounting (full frame payload length,
+                    // including padding) for both stream and connection.
+                    // Refill as soon as either side passes WU_REFILL so the
+                    // server can keep sending without stalling
+                    let frame_len = len as u32;
+                    stream_recv = stream_recv.saturating_add(frame_len);
+                    conn_recv   = conn_recv.saturating_add(frame_len);
+                    if stream_recv >= WU_REFILL {
+                        tls.send(&window_update(1, stream_recv));
+                        stream_recv = 0;
+                    }
+                    if conn_recv >= WU_REFILL {
+                        tls.send(&window_update(0, conn_recv));
+                        conn_recv = 0;
                     }
                     if flags & FL_END_STREAM != 0 { done = true; }
                 }

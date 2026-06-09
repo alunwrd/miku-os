@@ -30,6 +30,53 @@ pub const PTIMER_DENOMINATOR:     u32 = 0x0000_9210;
 pub const PFB_PRI_MMU_CTRL:       u32 = 0x0010_0CC0;
 pub const PFB_FB_MMU_CTRL:        u32 = 0x0010_FC20;
 
+// NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE - encodes the local (on-board) VRAM
+// size. Layout (from nouveau gp100_fb_oneinit / envytools): bits [3:0] =
+// scale, bits [9:4] = magnitude; size in bytes = magnitude << (scale+20).
+// Bit 16 clear means ECC reservation is active and trims usable VRAM by
+// 1/16. Treated as best-effort; cross-check against BAR1 size
+pub const PFB_LOCAL_MEMORY_RANGE:        u32 = 0x0010_0CE0;
+pub const PFB_LMR_SCALE_MASK:            u32 = 0x0000_000F;
+pub const PFB_LMR_MAG_SHIFT:             u32 = 4;
+pub const PFB_LMR_MAG_MASK:              u32 = 0x0000_003F;
+pub const PFB_LMR_ECC_RESERVED:          u32 = 1 << 16;
+
+// NV_PFB_PRI_MMU_WPR* (Turing TU10x/TU11x) - write-protect-region lock
+// registers. WPR2 is set up by FWSEC running the FRTS command (and later
+// re-checked by the booter). Addresses are the authoritative TU102 values
+// from open-gpu-kernel-modules 'src/common/inc/swref/published/turing/
+// tu102/dev_fb.h' (NV_PFB_PRI_MMU_WPR2_ADDR_LO = 0x001FA824), identical on
+// TU116/TU117. WPR1 follows the gh100 dev_fb.h layout (same MMU base,
+// consecutive registers just below WPR2).
+//
+// An earlier revision placed these in the 0x100CXX MMU_CTRL block, which is
+// a different register window (0x100CE0 is LOCAL_MEMORY_RANGE); reads there
+// never reflected the WPR2 lock, so WPR2 always looked unlocked. The
+// 0x1FAxxx window is the one FWSEC/FRTS and the booter actually program.
+//
+// Encoding: the _VAL field is bits [31:4] and stores 'byte_addr >> 12'
+// (ALIGNMENT = 0xc), so the decoded address is 'val_field << 12'. In raw
+// register terms that is '((reg & 0xFFFF_FFF0) >> 4) << 12', i.e.
+// '(reg & 0xFFFF_FFF0) << 8'. WPR2 is "locked" iff LO <= HI and LO != 0.
+pub const PFB_PRI_MMU_WPR1_ADDR_LO:  u32 = 0x001F_A81C;
+pub const PFB_PRI_MMU_WPR1_ADDR_HI:  u32 = 0x001F_A820;
+pub const PFB_PRI_MMU_WPR2_ADDR_LO:  u32 = 0x001F_A824;
+pub const PFB_PRI_MMU_WPR2_ADDR_HI:  u32 = 0x001F_A828;
+// Diagnostic-only WPR access-control registers. Left at their prior offsets;
+// not used by the FWSEC/booter path (only printed by the nvidia debug cmd)
+pub const PFB_PRI_MMU_ALLOW_READ:    u32 = 0x0010_0CE4;
+pub const PFB_PRI_MMU_ALLOW_WRITE:   u32 = 0x0010_0CE8;
+
+/// Decode a raw WPR address register to a byte address (0 if unset).
+/// The _VAL field [31:4] holds 'byte_addr >> 12', so shift the masked
+/// register value left by 8 ('>> 4' to extract the field, '<< 12' to
+/// scale). Verified against ogkm 'DRF_VAL(_PFB,_PRI_MMU_WPR2_ADDR_LO,_VAL)'
+/// with 'expectedLoVal = frtsOffset >> 12'.
+#[inline]
+pub fn decode_wpr_addr(reg: u32) -> u64 {
+    ((reg as u64) & 0xFFFF_FFF0) << 8
+}
+
 // PFIFO (GP FIFO / host channel dispatcher) - 0x00002000+
 pub const PFIFO_INTR_0:           u32 = 0x0000_2100;
 pub const PFIFO_INTR_EN_0:        u32 = 0x0000_2140;
@@ -37,6 +84,21 @@ pub const PFIFO_INTR_EN_0:        u32 = 0x0000_2140;
 // PTOP (topology info)
 pub const PTOP_DEVICE_INFO:       u32 = 0x0000_2600;  // array, 64 entries on Turing
 pub const PTOP_DEVICE_INFO_COUNT: u32 = 64;
+
+// PTHERM (on-die thermal sensor) - 0x00020000..0x00021000
+// The internal temperature sensor on Pascal+ (and unchanged on Turing) is
+// read from a single fixed-point register. Bit [29] = value valid,
+// bit [30] = sensor was SHADOWed (stale); the value field is bits [16:3]
+// which give integer degrees Celsius once shifted right by 8
+pub const PTHERM_TEMP_SENSOR:      u32 = 0x0002_0460;
+pub const PTHERM_TEMP_VALID:       u32 = 1 << 29;
+pub const PTHERM_TEMP_SHADOWED:    u32 = 1 << 30;
+pub const PTHERM_TEMP_VALUE_MASK:  u32 = 0x0001_FFF8;
+pub const PTHERM_TEMP_VALUE_SHIFT: u32 = 8;
+// Software-readable slowdown / shutdown thresholds programmed by VBIOS
+// devinit. Zero until devinit runs, which the driver does not do yet
+pub const PTHERM_THRS_SLOWDOWN:    u32 = 0x0002_0480;
+pub const PTHERM_THRS_SHUTDOWN:    u32 = 0x0002_0484;
 
 // Falcon / GSP offsets (relative to engine base)
 // Turing+ GSP lives on a RISC-V core exposed through the Falcon register
@@ -60,7 +122,7 @@ pub const PMC_INTR_PGRAPH:        u32 = 1 << 12;
 pub const PMC_INTR_PTIMER:        u32 = 1 << 20;
 pub const PMC_INTR_PBUS:          u32 = 1 << 28;
 
-//           PTOP_DEVICE_INFO entry parser constants
+//      PTOP_DEVICE_INFO entry parser constants
 // Each entry is a single u32 on Turing (NV_PTOP_DEVICE_INFO2 exists too
 // but is more complex). For the legacy single-word form we only rely on
 // the "chain" bit (bit 31) and the engine ID / runlist ID fields

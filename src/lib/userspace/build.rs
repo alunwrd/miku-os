@@ -61,6 +61,16 @@ static inline long miku_syscall3(unsigned long nr, unsigned long a1, unsigned lo
     return ret;
 }
 
+static inline long miku_syscall4(unsigned long nr, unsigned long a1, unsigned long a2, unsigned long a3, unsigned long a4) {
+    long ret;
+    register unsigned long r10 __asm__("r10") = a4;
+    __asm__ __volatile__("syscall"
+                         : "=a"(ret)
+                         : "a"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10)
+                         : "rcx", "r11", "memory");
+    return ret;
+}
+
 /* sys (syscall primitives are inline, no stubs needed) */
 
 /* errno */
@@ -107,6 +117,20 @@ long miku_map_lib(const char *n, unsigned long l) { return 0; }
 /* io */
 long miku_write(unsigned long fd, const void *b, unsigned long l) { return 0; }
 long miku_read(unsigned long fd, void *b, unsigned long l) { return 0; }
+
+/* net (sockets) - real syscalls so even a stub-linked build works */
+long miku_socket(void) { return miku_syscall3(56, 2, 1, 0); }
+long miku_connect(long fd, const unsigned char *ip, unsigned short port) {
+    if (!ip) return -14;
+    unsigned char sa[16] = {0};
+    sa[0] = 2;                 /* AF_INET (LE u16) */
+    sa[2] = (port >> 8) & 0xff;/* port big-endian  */
+    sa[3] = port & 0xff;
+    sa[4] = ip[0]; sa[5] = ip[1]; sa[6] = ip[2]; sa[7] = ip[3];
+    return miku_syscall3(57, (unsigned long)fd, (unsigned long)sa, 16);
+}
+long miku_send(long fd, const void *b, unsigned long l) { return miku_syscall4(58, (unsigned long)fd, (unsigned long)b, l, 0); }
+long miku_recv(long fd, void *b, unsigned long l) { return miku_syscall4(59, (unsigned long)fd, (unsigned long)b, l, 0); }
 
 /* stdio */
 void miku_print(const char *s) {}

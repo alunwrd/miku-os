@@ -108,19 +108,27 @@ fn apply_rela_entries_phys(
     let mut applied = 0usize;
 
     for i in 0..count {
-        let entry_va = rela_va + (i as u64) * 24;
+        let entry_va = match (i as u64).checked_mul(24).and_then(|x| rela_va.checked_add(x)) {
+            Some(v) => v,
+            None => continue,
+        };
         let foff = match va_to_file_offset(info, entry_va) {
             Some(o) => o,
             None => continue,
         };
 
         let r_offset = match read_u64_le(data, foff) { Some(v) => v, None => continue };
-        let r_info = match read_u64_le(data, foff + 8) { Some(v) => v, None => continue };
-        let r_addend = match read_i64_le(data, foff + 16) { Some(v) => v, None => continue };
+        let off_info = match foff.checked_add(8)   { Some(v) => v, None => continue };
+        let r_info = match read_u64_le(data, off_info) { Some(v) => v, None => continue };
+        let off_addend = match foff.checked_add(16) { Some(v) => v, None => continue };
+        let r_addend = match read_i64_le(data, off_addend) { Some(v) => v, None => continue };
 
         let rtype = r_info as u32;
         let rsym = (r_info >> 32) as u32;
-        let target_va = r_offset + load_bias;
+        let target_va = match r_offset.checked_add(load_bias) {
+            Some(v) => v,
+            None    => continue,
+        };
 
         match rtype {
             R_X86_64_RELATIVE => {
@@ -169,17 +177,22 @@ fn resolve_sym_from_file(
     rsym:      u32,
     load_bias: u64,
 ) -> Option<u64> {
-    let sym_file_va = symtab_va + rsym as u64 * syment;
+    let sym_file_va = (rsym as u64)
+        .checked_mul(syment)
+        .and_then(|x| symtab_va.checked_add(x))?;
     let soff = va_to_file_offset(info, sym_file_va)?;
-    if soff + syment as usize > data.len() {
+    let soff_end = soff.checked_add(syment as usize)?;
+    if soff_end > data.len() {
         return None;
     }
-    let st_shndx = read_u16_le(data, soff + 6)?;
-    let st_value = read_u64_le(data, soff + 8)?;
+    let off_shndx = soff.checked_add(6)?;
+    let off_value = soff.checked_add(8)?;
+    let st_shndx = read_u16_le(data, off_shndx)?;
+    let st_value = read_u64_le(data, off_value)?;
     if st_shndx == 0 || st_value == 0 {
         return None;
     }
-    Some(st_value + load_bias)
+    st_value.checked_add(load_bias)
 }
 
 pub fn apply_rela_from_sections(
@@ -202,36 +215,60 @@ pub fn apply_rela_from_sections(
     let mut total_applied = 0usize;
 
     for i in 0..e_shnum {
-        let sh = e_shoff as usize + i * e_shentsize;
-        if sh + e_shentsize > data.len() {
+        let sh = match i.checked_mul(e_shentsize)
+            .and_then(|x| (e_shoff as usize).checked_add(x))
+        {
+            Some(v) => v,
+            None => break,
+        };
+        let sh_end = match sh.checked_add(e_shentsize) {
+            Some(v) => v,
+            None => break,
+        };
+        if sh_end > data.len() {
             break;
         }
 
-        let sh_type = match read_u32_le(data, sh + 4) { Some(v) => v, None => continue };
+        let sh_type_off = sh.checked_add(4).unwrap_or(usize::MAX);
+        let sh_type = match read_u32_le(data, sh_type_off) { Some(v) => v, None => continue };
         if sh_type != SHT_RELA {
             continue;
         }
 
-        let sh_offset = match read_u64_le(data, sh + 24) { Some(v) => v as usize, None => continue };
-        let sh_size = match read_u64_le(data, sh + 32) { Some(v) => v as usize, None => continue };
+        let sh_off_off  = sh.checked_add(24).unwrap_or(usize::MAX);
+        let sh_size_off = sh.checked_add(32).unwrap_or(usize::MAX);
+        let sh_offset = match read_u64_le(data, sh_off_off)  { Some(v) => v as usize, None => continue };
+        let sh_size   = match read_u64_le(data, sh_size_off) { Some(v) => v as usize, None => continue };
 
         let count = sh_size / 24;
         for j in 0..count {
-            let off = sh_offset + j * 24;
-            if off + 24 > data.len() {
+            let off = match j.checked_mul(24).and_then(|x| sh_offset.checked_add(x)) {
+                Some(v) => v,
+                None => break,
+            };
+            let off_end = match off.checked_add(24) {
+                Some(v) => v,
+                None => break,
+            };
+            if off_end > data.len() {
                 break;
             }
 
-            let r_offset = match read_u64_le(data, off) { Some(v) => v, None => continue };
-            let r_info = match read_u64_le(data, off + 8) { Some(v) => v, None => continue };
-            let r_addend = match read_i64_le(data, off + 16) { Some(v) => v, None => continue };
+            let off_info   = off.checked_add(8).unwrap_or(usize::MAX);
+            let off_addend = off.checked_add(16).unwrap_or(usize::MAX);
+            let r_offset = match read_u64_le(data, off)        { Some(v) => v, None => continue };
+            let r_info   = match read_u64_le(data, off_info)   { Some(v) => v, None => continue };
+            let r_addend = match read_i64_le(data, off_addend) { Some(v) => v, None => continue };
 
             let rtype = r_info as u32;
             if rtype != R_X86_64_RELATIVE {
                 continue;
             }
 
-            let target_va = r_offset + load_bias;
+            let target_va = match r_offset.checked_add(load_bias) {
+                Some(v) => v,
+                None => continue,
+            };
             let value = (load_bias as i64).wrapping_add(r_addend) as u64;
             if hhdm_write64(aspace, target_va, value) {
                 total_applied += 1;
@@ -255,8 +292,15 @@ pub fn apply_rela_mapped(
     let mut applied = 0usize;
 
     for i in 0..count {
-        let off = rela_off + i * entry_size;
-        if off + entry_size > data.len() {
+        let off = match i.checked_mul(entry_size).and_then(|x| rela_off.checked_add(x)) {
+            Some(v) => v,
+            None => break,
+        };
+        let off_end = match off.checked_add(entry_size) {
+            Some(v) => v,
+            None => break,
+        };
+        if off_end > data.len() {
             break;
         }
 
@@ -264,7 +308,10 @@ pub fn apply_rela_mapped(
             core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Rela)
         };
 
-        let target_uva = rela.r_offset + load_bias;
+        let target_uva = match rela.r_offset.checked_add(load_bias) {
+            Some(v) => v,
+            None    => continue,
+        };
         let rtype = rela.rtype();
         let sym_idx = rela.sym();
         let addend = rela.r_addend;
@@ -316,8 +363,15 @@ pub fn apply_rel_mapped(
     let mut applied = 0usize;
 
     for i in 0..count {
-        let off = rel_off + i * entry_size;
-        if off + entry_size > data.len() {
+        let off = match i.checked_mul(entry_size).and_then(|x| rel_off.checked_add(x)) {
+            Some(v) => v,
+            None => break,
+        };
+        let off_end = match off.checked_add(entry_size) {
+            Some(v) => v,
+            None => break,
+        };
+        if off_end > data.len() {
             break;
         }
 
@@ -325,7 +379,10 @@ pub fn apply_rel_mapped(
             core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Rel)
         };
 
-        let target_uva = rel.r_offset + load_bias;
+        let target_uva = match rel.r_offset.checked_add(load_bias) {
+            Some(v) => v,
+            None    => continue,
+        };
         let rtype = rel.rtype();
         let sym_idx = rel.sym();
 
@@ -384,26 +441,31 @@ fn va_to_file_offset(info: &ElfInfo, va: u64) -> Option<usize> {
         if ph.p_type != PT_LOAD {
             continue;
         }
-        if va >= ph.p_vaddr && va < ph.p_vaddr + ph.p_filesz {
-            return Some((ph.p_offset + (va - ph.p_vaddr)) as usize);
+        let seg_end = ph.p_vaddr.checked_add(ph.p_filesz)?;
+        if va >= ph.p_vaddr && va < seg_end {
+            let file_off = ph.p_offset.checked_add(va - ph.p_vaddr)?;
+            return Some(file_off as usize);
         }
     }
     None
 }
 
 fn read_u64_le(data: &[u8], off: usize) -> Option<u64> {
-    if off + 8 > data.len() { return None; }
-    Some(u64::from_le_bytes(data[off..off + 8].try_into().ok()?))
+    let end = off.checked_add(8)?;
+    if end > data.len() { return None; }
+    Some(u64::from_le_bytes(data[off..end].try_into().ok()?))
 }
 
 fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
-    if off + 4 > data.len() { return None; }
-    Some(u32::from_le_bytes(data[off..off + 4].try_into().ok()?))
+    let end = off.checked_add(4)?;
+    if end > data.len() { return None; }
+    Some(u32::from_le_bytes(data[off..end].try_into().ok()?))
 }
 
 fn read_u16_le(data: &[u8], off: usize) -> Option<u16> {
-    if off + 2 > data.len() { return None; }
-    Some(u16::from_le_bytes(data[off..off + 2].try_into().ok()?))
+    let end = off.checked_add(2)?;
+    if end > data.len() { return None; }
+    Some(u16::from_le_bytes(data[off..end].try_into().ok()?))
 }
 
 fn read_i64_le(data: &[u8], off: usize) -> Option<i64> {

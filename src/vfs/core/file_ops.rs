@@ -102,7 +102,7 @@ impl MikuVFS {
             return Err(VfsError::ReadOnly);
         }
 
-        let fd = self.fd_table.alloc(id as InodeId, flags)?;
+        let fd = self.fds().alloc(id as InodeId, flags)?;
         self.nodes[id].inc_ref();
 
         crate::serial_println!(
@@ -157,8 +157,8 @@ impl MikuVFS {
     }
 
     pub fn close(&mut self, fd: usize) -> VfsResult<()> {
-        let vid = self.fd_table.get(fd)?.vnode_id as usize;
-        self.fd_table.close(fd)?;
+        let vid = self.fds().get(fd)?.vnode_id as usize;
+        self.fds().close(fd)?;
 
         if self.valid_vnode(vid) && self.nodes[vid].refcount > 0 {
             self.nodes[vid].dec_ref();
@@ -194,8 +194,8 @@ impl MikuVFS {
     }
 
     pub fn dup(&mut self, old_fd: usize) -> VfsResult<usize> {
-        let file = *self.fd_table.get(old_fd)?;
-        let new_fd = self.fd_table.alloc(file.vnode_id, file.flags)?;
+        let file = *self.fds().get(old_fd)?;
+        let new_fd = self.fds().alloc(file.vnode_id, file.flags)?;
 
         let vid = file.vnode_id as usize;
         if self.valid_vnode(vid) {
@@ -203,32 +203,32 @@ impl MikuVFS {
         }
 
         let offset = file.offset;
-        self.fd_table.get_mut(new_fd)?.offset = offset;
+        self.fds().get_mut(new_fd)?.offset = offset;
 
         Ok(new_fd)
     }
 
     pub fn dup_to(&mut self, old_fd: usize, new_fd: usize) -> VfsResult<usize> {
-        let file = *self.fd_table.get(old_fd)?;
+        let file = *self.fds().get(old_fd)?;
 
-        if self.fd_table.get(new_fd).is_ok() {
+        if self.fds().get(new_fd).is_ok() {
             let _ = self.close(new_fd);
         }
 
-        self.fd_table.alloc_at(new_fd, file.vnode_id, file.flags)?;
+        self.fds().alloc_at(new_fd, file.vnode_id, file.flags)?;
 
         let vid = file.vnode_id as usize;
         if self.valid_vnode(vid) {
             self.nodes[vid].inc_ref();
         }
 
-        self.fd_table.get_mut(new_fd)?.offset = file.offset;
+        self.fds().get_mut(new_fd)?.offset = file.offset;
 
         Ok(new_fd)
     }
 
     pub fn read(&mut self, fd: usize, buf: &mut [u8]) -> VfsResult<usize> {
-        let file = self.fd_table.get(fd)?;
+        let file = self.fds().get(fd)?;
         if !file.flags.readable() {
             return Err(VfsError::PermissionDenied);
         }
@@ -249,7 +249,7 @@ impl MikuVFS {
 
         if let Some(dt) = self.get_dev_type(vid) {
             let n = devfs::dev_read(dt, buf, offset)?;
-            self.fd_table.get_mut(fd)?.offset += n as u64;
+            self.fds().get_mut(fd)?.offset += n as u64;
             return Ok(n);
         }
 
@@ -298,8 +298,128 @@ impl MikuVFS {
             self.nodes[vid].touch_atime(ts);
         }
 
-        self.fd_table.get_mut(fd)?.offset += done as u64;
+        self.fds().get_mut(fd)?.offset += done as u64;
         Ok(done)
+    }
+
+    /// Read an entire file by absolute path into an owned buffer, via normal
+    /// VFS path resolution. Kernel-internal: needs no fd table, so it is safe
+    /// to call during early boot. Handles ext-backed and tmpfs regular files.
+    /// This is the path firmware loading takes (see src/fwload.rs) - the same
+    /// resolve_path machinery sys_read uses, just without a process fd.
+    pub fn read_path(&mut self, path: &str) -> VfsResult<alloc::vec::Vec<u8>> {
+        let vid = self.resolve_path_follow(0, path)?;
+        if self.nodes[vid].is_dir() {
+            return Err(VfsError::IsDirectory);
+        }
+
+        if self.nodes[vid].is_ext_backed() {
+            let ext2_ino = self.nodes[vid].ext2_ino;
+            let res = crate::commands::ext2_cmds::with_ext2_pub(
+                |fs| -> VfsResult<alloc::vec::Vec<u8>> {
+                    let inode = fs.read_inode(ext2_ino).map_err(|_| VfsError::IoError)?;
+                    let size = inode.size() as usize;
+                    let mut out = alloc::vec::Vec::new();
+                    out.try_reserve_exact(size).map_err(|_| VfsError::NoSpace)?;
+                    out.resize(size, 0);
+                    let mut done = 0usize;
+                    while done < size {
+                        let n = fs
+                            .read_file(&inode, done as u64, &mut out[done..])
+                            .map_err(|_| VfsError::IoError)?;
+                        if n == 0 {
+                            break;
+                        }
+                        done += n;
+                    }
+                    out.truncate(done);
+                    Ok(out)
+                },
+            );
+            return match res {
+                Some(r) => r,
+                None => Err(VfsError::IoError),
+            };
+        }
+
+        // tmpfs / page-cache backed file
+        let size = self.nodes[vid].size as usize;
+        let mut out = alloc::vec::Vec::new();
+        out.try_reserve_exact(size).map_err(|_| VfsError::NoSpace)?;
+        out.resize(size, 0);
+        let mut done = 0usize;
+        while done < size {
+            let page_num = done / PAGE_SIZE;
+            let page_off = done % PAGE_SIZE;
+            let chunk = (PAGE_SIZE - page_off).min(size - done);
+            if let Some(pid) = self.nodes[vid].addr_space.get_page(page_num) {
+                if let Some(data) = self.page_cache.get_page_data(pid) {
+                    out[done..done + chunk].copy_from_slice(&data[page_off..page_off + chunk]);
+                }
+            }
+            done += chunk;
+        }
+        Ok(out)
+    }
+
+    /// Size of a file by absolute path, without reading its data.
+    pub fn path_size(&mut self, path: &str) -> VfsResult<u64> {
+        let vid = self.resolve_path_follow(0, path)?;
+        if self.nodes[vid].is_dir() {
+            return Err(VfsError::IsDirectory);
+        }
+        if self.nodes[vid].is_ext_backed() {
+            let ext2_ino = self.nodes[vid].ext2_ino;
+            let res = crate::commands::ext2_cmds::with_ext2_pub(|fs| {
+                fs.read_inode(ext2_ino).map(|i| i.size()).map_err(|_| VfsError::IoError)
+            });
+            return match res {
+                Some(r) => r,
+                None => Err(VfsError::IoError),
+            };
+        }
+        Ok(self.nodes[vid].size)
+    }
+
+    /// Graft an ext-mounted directory onto a VFS path as a mount point: after
+    /// this, resolving `parent_path`/`name` descends into the ext filesystem
+    /// at inode `ext_ino`. Mirrors how `cd` into an ext subtree attaches a
+    /// vnode (see commands::fs). Used to mount the root disk's /lib/firmware
+    /// onto the VFS so firmware reads go through the normal path, like Linux.
+    pub fn graft_ext_dir(&mut self, parent_path: &str, name: &str, ext_ino: u32) -> VfsResult<usize> {
+        let parent = self.resolve_path(0, parent_path)?;
+        if !self.nodes[parent].is_dir() {
+            return Err(VfsError::NotDirectory);
+        }
+        let fs_type = crate::commands::ext2_cmds::active_fs_type();
+
+        // Re-grafting an existing mount point just refreshes the target inode.
+        if let Ok(existing) = self.resolve_path(parent, name) {
+            if self.nodes[existing].is_dir() {
+                self.nodes[existing].ext2_ino = ext_ino;
+                self.nodes[existing].fs_type = fs_type;
+                self.nodes[existing].children_loaded = false;
+                return Ok(existing);
+            }
+        }
+
+        let id = self.alloc_vnode()?;
+        let ts = self.now();
+        self.nodes[id].init(
+            id as InodeId,
+            parent as InodeId,
+            name,
+            VNodeKind::Directory,
+            fs_type,
+            FileMode::new(0o755),
+            0,
+            0,
+            ts,
+        );
+        self.nodes[id].ext2_ino = ext_ino;
+        self.nodes[id].children_loaded = false;
+        self.nodes[parent].children.insert(name, id as InodeId);
+        Ok(id)
     }
 
     fn read_procfs(
@@ -330,7 +450,7 @@ impl MikuVFS {
                 let avail = total - off;
                 let to_copy = buf.len().min(avail);
                 buf[..to_copy].copy_from_slice(&proc_buf[off..off + to_copy]);
-                self.fd_table.get_mut(fd)?.offset += to_copy as u64;
+                self.fds().get_mut(fd)?.offset += to_copy as u64;
                 Ok(to_copy)
             }
             Err(e) => Err(e),
@@ -338,7 +458,7 @@ impl MikuVFS {
     }
 
     pub fn write(&mut self, fd: usize, data: &[u8]) -> VfsResult<usize> {
-        let file = self.fd_table.get(fd)?;
+        let file = self.fds().get(fd)?;
         if !file.flags.writable() {
             return Err(VfsError::PermissionDenied);
         }
@@ -361,7 +481,7 @@ impl MikuVFS {
 
         if let Some(dt) = self.get_dev_type(vid) {
             let n = devfs::dev_write(dt, data, offset as u64)?;
-            self.fd_table.get_mut(fd)?.offset += n as u64;
+            self.fds().get_mut(fd)?.offset += n as u64;
             return Ok(n);
         }
 
@@ -435,7 +555,7 @@ impl MikuVFS {
         self.nodes[vid].touch_mtime(ts);
         self.nodes[vid].flags.dirty = true;
 
-        self.fd_table.get_mut(fd)?.offset = new_end as u64;
+        self.fds().get_mut(fd)?.offset = new_end as u64;
 
         if is_sync {
             self.nodes[vid].flags.dirty = false;
@@ -445,7 +565,7 @@ impl MikuVFS {
     }
 
     pub fn seek(&mut self, fd: usize, whence: SeekFrom) -> VfsResult<u64> {
-        let file = self.fd_table.get(fd)?;
+        let file = self.fds().get(fd)?;
         let vid = file.vnode_id as usize;
         let current = file.offset;
 
@@ -465,12 +585,12 @@ impl MikuVFS {
             return Err(VfsError::SeekError);
         }
 
-        self.fd_table.get_mut(fd)?.offset = new_offset as u64;
+        self.fds().get_mut(fd)?.offset = new_offset as u64;
         Ok(new_offset as u64)
     }
 
     pub fn fsync(&mut self, fd: usize) -> VfsResult<()> {
-        let file = self.fd_table.get(fd)?;
+        let file = self.fds().get(fd)?;
         let vid = file.vnode_id as usize;
 
         if !self.valid_vnode(vid) {

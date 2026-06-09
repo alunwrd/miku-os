@@ -265,7 +265,10 @@ impl ElfInfo {
             let p = &self.phdrs[i];
             if p.p_type != PT_LOAD { continue; }
             let vaddr = p.p_vaddr;
-            let end   = vaddr + p.p_memsz;
+            // saturating - the parser already rejects segments whose
+            // file-backed range overflows; p_memsz can legitimately
+            // exceed p_filesz (BSS) so cap rather than wrap
+            let end = vaddr.saturating_add(p.p_memsz);
             if vaddr < lo { lo = vaddr; }
             if end   > hi { hi = end;   }
         }
@@ -275,7 +278,7 @@ impl ElfInfo {
     pub fn interp_path<'a>(&self, data: &'a [u8]) -> Option<&'a str> {
         let (off, sz) = self.interp_offset?;
         let start = off as usize;
-        let end   = start + sz as usize;
+        let end   = start.checked_add(sz as usize)?;
         if end > data.len() { return None; }
         let slice = &data[start..end];
         let nul   = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
@@ -332,8 +335,21 @@ pub fn parse(data: &[u8]) -> Result<ElfInfo, ElfError> {
     let phent = ehdr.e_phentsize as usize;
     let phnum = (ehdr.e_phnum as usize).min(MAX_PHDRS);
 
-    let ph_end = phoff + phent * phnum;
-    if ph_end > data.len() || phent < core::mem::size_of::<Elf64Phdr>() {
+    // All multiplications/additions on attacker-controlled u64 fields
+    // go through checked arithmetic so a crafted ELF cannot wrap and
+    // bypass the data.len() bound below
+    if phent < core::mem::size_of::<Elf64Phdr>() {
+        return Err(ElfError::BadPhdr);
+    }
+    let ph_table_size = match phent.checked_mul(phnum) {
+        Some(v) => v,
+        None    => return Err(ElfError::BadPhdr),
+    };
+    let ph_end = match phoff.checked_add(ph_table_size) {
+        Some(v) => v,
+        None    => return Err(ElfError::BadPhdr),
+    };
+    if ph_end > data.len() {
         return Err(ElfError::BadPhdr);
     }
 
@@ -344,18 +360,43 @@ pub fn parse(data: &[u8]) -> Result<ElfInfo, ElfError> {
     let mut phdr_vaddr     = 0u64;
 
     for i in 0..phnum {
-        let off = phoff + i * phent;
+        // phoff + i*phent is bounded by ph_end above, but compute via
+        // checked_add anyway for defense in depth
+        let off = match phent.checked_mul(i).and_then(|x| phoff.checked_add(x)) {
+            Some(v) => v,
+            None    => return Err(ElfError::BadPhdr),
+        };
         let p   = unsafe {
             core::ptr::read_unaligned(data.as_ptr().add(off) as *const Elf64Phdr)
         };
 
-        if p.p_type == PT_LOAD {
-            has_load = true;
-            if p.p_filesz > 0 {
-                let seg_end = p.p_offset as usize + p.p_filesz as usize;
-                if seg_end > data.len() { return Err(ElfError::SegmentOutOfBounds); }
+        // Any segment with on-disk bytes must reference an in-file range
+        // - applies to PT_INTERP / PT_DYNAMIC / etc. too, not just LOAD,
+        // since those offsets are later used to read strings/tables
+        if p.p_filesz > 0 {
+            let off_us = p.p_offset as usize;
+            let sz_us  = p.p_filesz as usize;
+            let end = match off_us.checked_add(sz_us) {
+                Some(v) => v,
+                None    => return Err(ElfError::SegmentOutOfBounds),
+            };
+            if end > data.len() {
+                return Err(ElfError::SegmentOutOfBounds);
             }
         }
+        // p_memsz can never be smaller than p_filesz; that would leave
+        // file bytes with no in-memory backing
+        if p.p_memsz < p.p_filesz {
+            return Err(ElfError::SegmentOutOfBounds);
+        }
+        // The virtual range must not wrap. p_vaddr+p_memsz is used in
+        // many downstream computations; rejecting wrap here keeps the
+        // loader simple
+        if p.p_vaddr.checked_add(p.p_memsz).is_none() {
+            return Err(ElfError::SegmentOutOfBounds);
+        }
+
+        if p.p_type == PT_LOAD { has_load = true; }
         if p.p_type == PT_INTERP  { interp_offset  = Some((p.p_offset, p.p_filesz)); }
         if p.p_type == PT_DYNAMIC { dynamic_offset  = Some((p.p_offset, p.p_filesz)); }
         if p.p_type == PT_PHDR    { phdr_vaddr      = p.p_vaddr; }

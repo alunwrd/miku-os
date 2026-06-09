@@ -121,11 +121,39 @@ pub fn kill_with_code(pid: u64, code: u64) {
         if ptr.is_null() { return 0u64; }
         let p = unsafe { &*ptr };
         p.exit_code.store(code, Ordering::Relaxed);
-        p.state.store(STATE_DEAD, Ordering::Relaxed);
+        let prev_state = p.state.swap(STATE_DEAD, Ordering::Relaxed);
+        if prev_state == crate::process::STATE_SLEEPING {
+            super::core_sched::sleeper_dec_saturating();
+        }
         remove_from_any_queue(pid);
         crate::serial_println!("[sched] kill pid={} code={}", pid, code);
         p.ppid.load(Ordering::Relaxed)
     });
+
+    // Reparent any children of the dying process to init (PID 1) so
+    // they can still be reaped via wait4 once they exit. Without this
+    // step, an orphaned child whose parent died is held in PROC_TABLE
+    // forever: its ppid points at a stale slot that wait4 can never
+    // walk to. PID 1 is mikuD, which loops waitpid as part of its
+    // reaper duty. If for some reason pid 1 doesn't exist (early boot)
+    // we leave ppid as-is; reap_dead will still free dead processes
+    // whose state is DEAD; only the zombie/wait4 path needs a live parent
+    let init_alive = process_exists(1);
+    if init_alive && pid != 1 {
+        let table = PROC_TABLE.lock();
+        let orphans: Vec<u64> = table.iter()
+            .filter(|(_, c)| c.ppid.load(Ordering::Relaxed) == pid)
+            .map(|(&cpid, _)| cpid)
+            .collect();
+        drop(table);
+        for orphan in orphans {
+            set_parent(orphan, 1);
+            crate::serial_println!("[sched] reparent pid={} -> init (1)", orphan);
+        }
+        // Already-zombie orphans need init to be told; the journal SIGCHLD
+        // delivery is best-effort
+        let _ = init_alive;
+    }
 
     if ppid != 0 { wakeup(ppid); }
 }
@@ -174,6 +202,25 @@ pub fn reap_zombie(pid: u64) {
 }
 
 fn free_process_resources(mut p: Box<Process>, pid: u64) {
+    // Release any network sockets the process still owns. Done before the
+    // VFS fd table teardown; socket fds live in a separate range and are not
+    // tracked by the VFS, so they need their own cleanup pass
+    crate::net::socket::close_all_for_pid(pid);
+
+    // Drop the process's per-process FD table and release the vnode
+    // references it was keeping alive
+    let victims = crate::vfs::core::with_vfs(|vfs| vfs.drop_fds(pid));
+    if !victims.is_empty() {
+        crate::vfs::core::with_vfs(|vfs| {
+            for vid in victims {
+                let idx = vid as usize;
+                if vfs.valid_vnode(idx) {
+                    vfs.nodes[idx].dec_ref();
+                }
+            }
+        });
+    }
+
     crate::mmap::vma_cleanup(p.cr3);
     if let Some(phys) = p.user_stack_phys.take() {
         crate::pmm::free_frames(phys, crate::process::USER_STACK_PAGES);

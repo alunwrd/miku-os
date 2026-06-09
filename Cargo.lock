@@ -96,7 +96,7 @@ version = "0.2.0"
 
 [[package]]
 name = "miku-os-release"
-version = "0.2.0"
+version = "0.2.2-rc"
 dependencies = [
  "fontdue",
  "lazy_static",

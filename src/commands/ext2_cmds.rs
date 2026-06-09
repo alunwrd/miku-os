@@ -514,6 +514,17 @@ pub fn cmd_ext2_mount(args: &str) {
     }
 }
 
+/// Mount the persistent root disk (disk.img = ATA drive 1, primary slave) at
+/// the ext layer if it is not already mounted. Quiet, boot-safe wrapper around
+/// try_mount used by the firmware loader to bring /lib/firmware online. Returns
+/// true if an ext filesystem is mounted on drive 1 afterwards
+pub fn mount_root_disk() -> bool {
+    if STATE.lock().is_already_mounted(1, 0) {
+        return true;
+    }
+    try_mount(1, 0)
+}
+
 fn try_mount(drive_index: usize, start_lba: u32) -> bool {
     let mut state = STATE.lock();
 

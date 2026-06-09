@@ -446,12 +446,13 @@ impl Rtl8168 {
     /// negotiated mode; upper layers keep calling link_up() so we don't have
     /// to block until success
     fn phy_init(&self) {
-        // BMCR (MII reg 0): bit 15 = soft reset, self-clears when complete
-        self.mdio_write(0, 0x8000);
-        for _ in 0..1000 {
-            if self.mdio_read(0) & 0x8000 == 0 { break; }
-            for _ in 0..10_000 { core::hint::spin_loop(); }
-        }
+        // No explicit PHY soft-reset (BMCR 0x8000): the internal PHY was
+        // already reset alongside the MAC soft-reset (CR.RST) in init(), and
+        // a fresh BMCR soft-reset can stall MDIO for up to ~0.5 s per IEEE
+        // 802.3 while it self-clears; that wait was the bulk of the slow
+        // boot. Writing BMCR=0x1200 below already clears the isolate/power-
+        // down bits and restarts auto-neg, which is all we actually need
+        // (this matches what mainline r8169 does on normal bring-up).
 
         // ANAR (reg 4): advertise 10/100 full+half plus the 802.3 selector
         self.mdio_write(4, 0x01E1);
@@ -460,15 +461,11 @@ impl Rtl8168 {
         // BMCR: AutoNegEnable | RestartAutoNeg
         self.mdio_write(0, 0x1200);
 
-        // Give the PHY a moment to converge so the boot log shows a useful
-        // state. We deliberately don't wait the full +-3s of auto-neg here -
-        // the dhcp/arp layers already poll link_up() and will pick up the
-        // link as soon as it comes up
-        for _ in 0..200 {
-            if self.read8(0x6C) & 0x02 != 0 { break; }
-            for _ in 0..200_000 { core::hint::spin_loop(); }
-        }
-
+        // Do NOT wait for auto-neg to converge here: that takes up to ~3 s and
+        // would block boot (the "network subsystem loads slowly" symptom).
+        // netd polls link_up() asynchronously and picks up the link the moment
+        // it comes up, so we just kick auto-neg and read whatever the PHY
+        // reports right now for the boot log
         let s = self.read8(0x6C);
         let speed = if s & 0x10 != 0 { "1000M" }
             else if s & 0x08 != 0 { "100M" }

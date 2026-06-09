@@ -22,6 +22,7 @@ pub fn cmd_gpt_show(drive_str: &str) {
         Err(GptReadError::NotGpt)       => { print_error!("  disk {} has no GPT", idx); return; }
         Err(GptReadError::InvalidFormat) => { print_error!("  corrupted GPT header"); return; }
         Err(GptReadError::Io(e))        => { print_error!("  I/O error: {:?}", e); return; }
+        Err(GptReadError::DiskTooLarge) => { print_error!("  disk too large for LBA28 (>2 TB)"); return; }
     };
 
     cprintln!(57, 197, 187, "  GPT partition table -- disk {}", idx);
@@ -67,8 +68,8 @@ pub fn cmd_gpt_init(drive_str: &str) {
         return;
     }
 
-    cprintln!(255, 80, 80, "  !! warning: GPT will overwrite LBA 0-33 and tail sectors !!");
-    cprintln!(255, 80, 80, "  !! data in those sectors will be destroyed !!");
+    cprintln!(255, 80, 80, "warning: GPT will overwrite LBA 0-33 and tail sectors");
+    cprintln!(255, 80, 80, "data in those sectors will be destroyed");
     println!();
 
     let drive2 = AtaDrive::from_idx(idx);

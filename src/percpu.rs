@@ -21,6 +21,7 @@ pub const MAX_CPUS: usize = 64;
 #[repr(C)]
 pub struct RunQueueInner {
     pub head: *mut Process,
+    pub tail: *mut Process,
     pub len:  usize,
 }
 
@@ -37,7 +38,7 @@ impl RunQueue {
     pub const fn new() -> Self {
         Self {
             lock:  AtomicBool::new(false),
-            inner: UnsafeCell::new(RunQueueInner { head: null_mut(), len: 0 }),
+            inner: UnsafeCell::new(RunQueueInner { head: null_mut(), tail: null_mut(), len: 0 }),
         }
     }
 
@@ -144,6 +145,16 @@ impl Cpu {
         }
     }
 }
+
+// Compile-time check that the field offsets match what the assembly expects.
+// syscall_handler (syscall/mod.rs) and sys_fork (syscall/process.rs) hardcode
+// gs:[0x00], gs:[0x10] and gs:[0x18]. A field reorder breaks this assertion
+// at build time instead of silently corrupting forked processes at runtime.
+const _: () = {
+    assert!(core::mem::offset_of!(Cpu, cpu_index)  == 0x00);
+    assert!(core::mem::offset_of!(Cpu, kernel_rsp) == 0x10);
+    assert!(core::mem::offset_of!(Cpu, user_rsp)   == 0x18);
+};
 
 #[repr(transparent)]
 struct CpuArray([Cpu; MAX_CPUS]);

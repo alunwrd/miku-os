@@ -21,6 +21,14 @@ pub const EPIPE:        i64 = -32;
 pub const ENAMETOOLONG: i64 = -36;
 pub const ENOSYS:       i64 = -38;
 pub const ENOTEMPTY:    i64 = -39;
+pub const EAGAIN:          i64 = -11;
+pub const EBUSY:           i64 = -16;
+pub const EPROTONOSUPPORT: i64 = -93;
+pub const EAFNOSUPPORT:    i64 = -97;
+pub const ECONNRESET:      i64 = -104;
+pub const EISCONN:         i64 = -106;
+pub const ENOTCONN:        i64 = -107;
+pub const ECONNREFUSED:    i64 = -111;
 
 #[inline]
 pub fn err(code: i64) -> u64 { code as u64 }

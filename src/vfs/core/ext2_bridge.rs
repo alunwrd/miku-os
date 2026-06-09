@@ -329,7 +329,7 @@ impl MikuVFS {
             self.nodes[vid].size = disk_size;
         }
 
-        self.fd_table.get_mut(fd)?.offset += n as u64;
+        self.fds().get_mut(fd)?.offset += n as u64;
         Ok(n)
     }
 
@@ -342,7 +342,7 @@ impl MikuVFS {
     ) -> VfsResult<usize> {
         let ext2_ino = self.nodes[vid].ext2_ino;
         let is_sync = self
-            .fd_table
+            .fds()
             .get(fd)
             .map(|f| f.flags.has(OpenFlags::SYNC))
             .unwrap_or(false);
@@ -372,7 +372,7 @@ impl MikuVFS {
             self.nodes[vid].flags.dirty = false;
         }
 
-        self.fd_table.get_mut(fd)?.offset = new_end;
+        self.fds().get_mut(fd)?.offset = new_end;
         Ok(n)
     }
 }

@@ -80,6 +80,11 @@ impl AddressSpace {
     pub fn free_address_space(&mut self) {
         if self.cr3 == 0 { return; }
         let hhdm = grub::hhdm();
+        // Hold SWAP_MAP and PMM locks once for the entire teardown. For a
+        // process with thousands of pages this replaces 3*N lock-cycles
+        // with 2 lock acquisitions total
+        let mut swap_guard = crate::swap_map::lock_batch();
+        let mut pmm_guard  = pmm::lock_for_batch();
         unsafe {
             let p4 = self.cr3.saturating_add(hhdm) as *mut PageTable;
             for i in 0..256 {
@@ -98,18 +103,27 @@ impl AddressSpace {
                                 crate::swap::free_swap_slot(crate::swap_map::slot_from_pte(pte));
                             } else if (&*p1)[m].flags().contains(PageTableFlags::PRESENT) {
                                 let phys = (&*p1)[m].addr().as_u64();
-                                crate::swap_map::untrack(phys);
-                                pmm::free_frame_cow(phys);
+                                // CoW-aware: only untrack/free when this
+                                // is the last reference; if a sibling is
+                                // still alive, leave swap_map entry but
+                                // clear pin (handled inside the helper)
+                                pmm::free_frame_cow_swap(
+                                    &mut pmm_guard,
+                                    &mut swap_guard,
+                                    phys,
+                                );
                             }
                         }
-                        pmm::free_frame((&*p2)[k].addr().as_u64());
+                        pmm_guard.free_frame((&*p2)[k].addr().as_u64());
                     }
-                    pmm::free_frame((&*p3)[j].addr().as_u64());
+                    pmm_guard.free_frame((&*p3)[j].addr().as_u64());
                 }
-                pmm::free_frame((&*p4)[i].addr().as_u64());
+                pmm_guard.free_frame((&*p4)[i].addr().as_u64());
             }
         }
-        pmm::free_frame(self.cr3);
+        pmm_guard.free_frame(self.cr3);
+        drop(pmm_guard);
+        drop(swap_guard);
         self.cr3 = 0;
     }
 
@@ -131,14 +145,60 @@ impl AddressSpace {
     }
 
     pub fn map_range(&self, virt: u64, phys: u64, size: u64, flags: PageTableFlags) -> bool {
-        let mut cv = virt & !0xFFF;
-        let mut cp = phys & !0xFFF;
-        let end = virt.saturating_add(size).saturating_add(0xFFF) & !0xFFF;
-        while cv < end {
-            if !self.map_page(cv, cp, flags) { return false; }
-            cv += 4096;
-            cp += 4096;
+        // Two-level batching: ~512x fewer page-table walks (one per P1
+        // table instead of per page) AND one SWAP_MAP lock acquisition
+        // for the whole range instead of per-page lock/unlock cycles.
+        // On partial failure (get_or_create OOM) every PTE we already
+        // wrote is rolled back via unmap_page_no_free so the address
+        // space stays consistent for the caller
+        let hhdm = grub::hhdm();
+        let virt_start = virt & !0xFFF;
+        let mut cv  = virt_start;
+        let mut cp  = phys & !0xFFF;
+        let end     = virt.saturating_add(size).saturating_add(0xFFF) & !0xFFF;
+        let flags_full = flags | PageTableFlags::PRESENT;
+        let flags_bits = flags_full.bits();
+
+        // Closure that undoes everything written so far. swap_guard is
+        // dropped before the rollback so unmap_page_no_free can take the
+        // global swap_map lock through its normal API
+        let rollback = |mapped_end: u64| {
+            let mut v = virt_start;
+            while v < mapped_end {
+                self.unmap_page_no_free(v);
+                v += 4096;
+            }
+            x86_64::instructions::tlb::flush_all();
+        };
+
+        let mut swap_guard = crate::swap_map::lock_batch();
+
+        unsafe {
+            let p4 = self.cr3.saturating_add(hhdm) as *mut PageTable;
+
+            while cv < end {
+                let Some(p3) = get_or_create(&mut (&mut *p4)[pt_index(cv, 3)], hhdm) else {
+                    drop(swap_guard); rollback(cv); return false;
+                };
+                let Some(p2) = get_or_create(&mut (&mut *p3)[pt_index(cv, 2)], hhdm) else {
+                    drop(swap_guard); rollback(cv); return false;
+                };
+                let Some(p1) = get_or_create(&mut (&mut *p2)[pt_index(cv, 1)], hhdm) else {
+                    drop(swap_guard); rollback(cv); return false;
+                };
+
+                let mut i = pt_index(cv, 0);
+                while cv < end && i < 512 {
+                    (&mut *p1)[i].set_addr(x86_64::PhysAddr::new(cp), flags_full);
+                    let pinned = cv >= 0xFFFF_8000_0000_0000 || cp < 0x40_0000;
+                    swap_guard.track(cp, self.cr3, cv, pinned, flags_bits);
+                    cv += 4096;
+                    cp += 4096;
+                    i  += 1;
+                }
+            }
         }
+        drop(swap_guard);
         x86_64::instructions::tlb::flush_all();
         true
     }
@@ -242,6 +302,12 @@ impl AddressSpace {
             (&mut *dst_p4)[i] = (&*src_p4)[i].clone();
         }
 
+        // Hold SWAP_MAP and PMM across the whole clone walk. set_pinned and
+        // alloc_frame are otherwise hit per-page/per-PT-page, which on a
+        // process with thousands of pages was ~8000+ global lock cycles
+        let mut swap_guard = crate::swap_map::lock_batch();
+        let mut pmm_guard  = pmm::lock_for_batch();
+
         for i in 0..256 {
             if !(&*src_p4)[i].flags().contains(PageTableFlags::PRESENT) {
                 continue;
@@ -249,7 +315,7 @@ impl AddressSpace {
             let src_p3_phys = (&*src_p4)[i].addr().as_u64();
             let src_p3 = src_p3_phys.saturating_add(hhdm) as *mut PageTable;
 
-            let dst_p3_phys = match pmm::alloc_frame() {
+            let dst_p3_phys = match pmm_guard.alloc_frame() {
                 Some(f) => f,
                 None => return false,
             };
@@ -265,7 +331,7 @@ impl AddressSpace {
                 let src_p2_phys = (&*src_p3)[j].addr().as_u64();
                 let src_p2 = src_p2_phys.saturating_add(hhdm) as *mut PageTable;
 
-                let dst_p2_phys = match pmm::alloc_frame() {
+                let dst_p2_phys = match pmm_guard.alloc_frame() {
                     Some(f) => f,
                     None => return false,
                 };
@@ -281,7 +347,7 @@ impl AddressSpace {
                     let src_p1_phys = (&*src_p2)[k].addr().as_u64();
                     let src_p1 = src_p1_phys.saturating_add(hhdm) as *mut PageTable;
 
-                    let dst_p1_phys = match pmm::alloc_frame() {
+                    let dst_p1_phys = match pmm_guard.alloc_frame() {
                         Some(f) => f,
                         None => return false,
                     };
@@ -310,14 +376,16 @@ impl AddressSpace {
 
                         pmm::ref_inc(phys);
 
-                        // Pin the frame in swap_map so it is never evicted
-                        // while COW-shared (swap_map has one entry per frame,
-                        // so we cannot track both parent and child mappings).
-                        crate::swap_map::set_pinned(phys, true);
+                        // Pin the frame so it is never evicted while
+                        // COW-shared (swap_map has one entry per frame,
+                        // so it can't track both parent and child)
+                        swap_guard.set_pinned(phys, true);
                     }
                 }
             }
         }
+        drop(pmm_guard);
+        drop(swap_guard);
         true
     }
 }

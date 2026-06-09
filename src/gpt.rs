@@ -378,7 +378,18 @@ pub fn gpt_read(drive: &mut AtaDrive) -> Result<GptTable, GptReadError> {
         }
     }
 
-    let total_sectors = (header.alternate_lba + 1) as u32;
+    // Compute total sectors with overflow + LBA28 range check. If the
+    // disk genuinely exceeds u32 sectors (>2 TB) we must refuse rather
+    // than silently truncate; downstream sector arithmetic would index
+    // the wrong physical region
+    let total_u64 = match header.alternate_lba.checked_add(1) {
+        Some(v) => v,
+        None    => return Err(GptReadError::InvalidFormat),
+    };
+    if total_u64 > u32::MAX as u64 {
+        return Err(GptReadError::DiskTooLarge);
+    }
+    let total_sectors = total_u64 as u32;
     Ok(GptTable { header, entries, total_sectors })
 }
 
@@ -393,7 +404,13 @@ pub fn gpt_add_partition(
 
     let slot  = tbl.first_free_slot().ok_or(GptWriteError::NoFreeSlot)?;
     let start = tbl.next_free_lba();
-    let end   = start + size_sectors - 1;
+    if size_sectors == 0 { return Err(GptWriteError::NotEnoughSpace); }
+    // checked_add - size_sectors is caller-supplied and could overflow
+    // when combined with start (which itself derives from disk metadata)
+    let end = match start.checked_add(size_sectors).and_then(|v| v.checked_sub(1)) {
+        Some(e) => e,
+        None    => return Err(GptWriteError::NotEnoughSpace),
+    };
     if end > tbl.last_usable_lba() { return Err(GptWriteError::NotEnoughSpace); }
 
     let mut entry    = GptEntry::empty();
@@ -455,6 +472,9 @@ pub enum GptReadError {
     Io(AtaError),
     NotGpt,
     InvalidFormat,
+    /// Disk exceeds the LBA28 addressing window this driver supports.
+    /// Fail loudly so a >2 TB disk isn't silently presented as 2 TB
+    DiskTooLarge,
 }
 
 #[derive(Debug)]

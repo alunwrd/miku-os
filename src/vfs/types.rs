@@ -1,8 +1,12 @@
 pub const MAX_VNODES: usize = 256;
 pub const MAX_DENTRIES: usize = 128;
 pub const MAX_MOUNTS: usize = 8;
-pub const MAX_FDS: usize = 32;
-pub const MAX_OPEN_FILES: usize = 32;
+// Per-process FD table size. With per-process tables (vfs.fd_tables
+// keyed by pid) this is the upper bound for a single process, not a
+// system-wide cap. 128 covers stdio + dynamic linker + heap-allocator
+// fds + dozens of open files comfortably
+pub const MAX_FDS: usize = 128;
+pub const MAX_OPEN_FILES: usize = 128;
 // Syscall layer handles 0/1/2 as stdin/stdout/stderr //
 pub const RESERVED_STDIO_FDS: usize = 3;
 pub const MAX_DATA_PAGES: usize = 128;

@@ -23,6 +23,7 @@ mod file;
 mod fs;
 mod io;
 mod memory;
+mod net;
 mod process;
 mod user_mem;
 
@@ -34,7 +35,7 @@ use errno::{err, ENOSYS};
 use user_mem::current_pid;
 use crate::gdt;
 
-const SYSCALL_TABLE_SIZE: u32 = 47;
+const SYSCALL_TABLE_SIZE: u32 = 56;
 
 // public entry point
 
@@ -117,6 +118,10 @@ unsafe extern "C" fn syscall_handler() {
 // 13  seek           29  dup2            45  kill
 // 14  fsize          30  truncate        46  exec
 // 15  map_lib        31  write_file
+//
+// 47 umask  48 getuid  49 getgid  50 geteuid  51 getegid
+// 52 setuid 53 setgid  54 seteuid 55 setegid
+// 56 socket 57 connect 58 send    59 recv
 
 extern "C" fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     match nr {
@@ -167,6 +172,19 @@ extern "C" fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         44 => process::sys_wait4(a1, a2, a3),
         45 => process::sys_kill(a1, a2),
         46 => process::sys_exec(a1, a2, a3, a4),
+        47 => process::sys_umask(a1),
+        48 => process::sys_getuid(),
+        49 => process::sys_getgid(),
+        50 => process::sys_geteuid(),
+        51 => process::sys_getegid(),
+        52 => process::sys_setuid(a1),
+        53 => process::sys_setgid(a1),
+        54 => process::sys_seteuid(a1),
+        55 => process::sys_setegid(a1),
+        56 => net::sys_socket(a1, a2, a3),
+        57 => net::sys_connect(a1, a2, a3),
+        58 => net::sys_send(a1, a2, a3, a4),
+        59 => net::sys_recv(a1, a2, a3, a4),
         _  => {
             crate::serial_println!("[syscall] unknown nr={}", nr);
             err(ENOSYS)

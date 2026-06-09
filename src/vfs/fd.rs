@@ -26,6 +26,7 @@ impl OpenFile {
     }
 }
 
+#[derive(Clone)]
 pub struct FdTable {
     pub files: [OpenFile; MAX_OPEN_FILES],
 }
@@ -38,7 +39,7 @@ impl FdTable {
     }
 
     pub fn alloc(&mut self, vnode_id: InodeId, flags: OpenFlags) -> VfsResult<usize> {
-        // Keep ordinary VFS fds out of the stdio range reserved by syscalls.
+        // Keep ordinary VFS fds out of the stdio range reserved by syscalls
         for i in RESERVED_STDIO_FDS..MAX_OPEN_FILES {
             if !self.files[i].active {
                 self.files[i] = OpenFile {
@@ -74,7 +75,7 @@ impl FdTable {
         let vnode_id = file.vnode_id;
         let flags = file.flags;
         let offset = file.offset;
-        // Preserve the same reserved range for duplicated descriptors.
+        // Preserve the same reserved range for duplicated descriptors
         for i in RESERVED_STDIO_FDS..MAX_OPEN_FILES {
             if !self.files[i].active {
                 self.files[i] = OpenFile {

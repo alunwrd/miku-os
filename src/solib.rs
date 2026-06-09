@@ -222,7 +222,12 @@ pub fn map_into_process(soname: &str, cr3: u64) -> Result<u64, i64> {
     let lo = lib.lo_vaddr;
     let ehdr_frame = lib.elf_header_frame;
     let total_pages = lib.total_map_pages;
-    let map_size = (total_pages as u64 + 1) * PAGE_SIZE;
+    // saturating - total_pages should be sane but defend against
+    // pathological libraries that bypass parse() checks
+    let map_size = match (total_pages as u64).checked_add(1).and_then(|v| v.checked_mul(PAGE_SIZE)) {
+        Some(v) => v,
+        None    => return Err(-12),
+    };
     let base_va = match crate::mmap::kernel_find_free(cr3, map_size) {
         Some(v) => v,
         None => return Err(-12), // ENOMEM
@@ -296,7 +301,10 @@ pub fn map_into_process(soname: &str, cr3: u64) -> Result<u64, i64> {
         }
     }
 
-    crate::mmap::kernel_register_vma(cr3, base_va, base_va + map_size, 5);
+    // kernel_find_free returns a base s.t. base+map_size <= MMAP_LIMIT,
+    // so saturating_add cannot reach U64::MAX here, but be explicit
+    let vma_end = base_va.saturating_add(map_size);
+    crate::mmap::kernel_register_vma(cr3, base_va, vma_end, 5);
     
     let _ = aspace.into_raw();
 
@@ -328,7 +336,17 @@ fn parse_and_prepare(lib: &mut CachedLib, data: &[u8]) {
 
         let writable = phdr.p_flags & PF_W != 0;
         let page_start = phdr.p_vaddr & !0xFFF;
-        let page_end = (phdr.p_vaddr + phdr.p_memsz + 0xFFF) & !0xFFF;
+        // elf::parse already rejects p_vaddr+p_memsz wrap, but solib
+        // sometimes loads files that bypass that path; be defensive
+        let vaddr_end = match phdr.p_vaddr.checked_add(phdr.p_memsz) {
+            Some(v) => v,
+            None    => continue,
+        };
+        let page_end = match vaddr_end.checked_add(0xFFF) {
+            Some(v) => v & !0xFFF,
+            None    => continue,
+        };
+        if page_end <= page_start { continue; }
         let num_pages = ((page_end - page_start) / PAGE_SIZE) as usize;
 
         let mut frames = Vec::with_capacity(num_pages);
@@ -343,12 +361,23 @@ fn parse_and_prepare(lib: &mut CachedLib, data: &[u8]) {
             }
             let page_va = page_start + (pg as u64) * PAGE_SIZE;
             let copy_start = page_va.max(phdr.p_vaddr);
-            let copy_end = (page_va + PAGE_SIZE).min(phdr.p_vaddr + phdr.p_filesz);
+            let seg_file_end = phdr.p_vaddr.saturating_add(phdr.p_filesz);
+            let page_va_end  = page_va.saturating_add(PAGE_SIZE);
+            let copy_end = page_va_end.min(seg_file_end);
             if copy_end > copy_start {
                 let dst_off = (copy_start - page_va) as usize;
-                let src_off = phdr.p_offset as usize + (copy_start - phdr.p_vaddr) as usize;
+                let src_off = match (phdr.p_offset as usize)
+                    .checked_add((copy_start - phdr.p_vaddr) as usize)
+                {
+                    Some(v) => v,
+                    None    => { frames.push(frame); continue; },
+                };
                 let len = (copy_end - copy_start) as usize;
-                if src_off + len <= data.len() {
+                let in_bounds = src_off
+                    .checked_add(len)
+                    .map(|e| e <= data.len())
+                    .unwrap_or(false);
+                if in_bounds {
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             data.as_ptr().add(src_off),
@@ -383,7 +412,8 @@ fn parse_and_prepare(lib: &mut CachedLib, data: &[u8]) {
         return;
     }
     lo &= !0xFFF;
-    hi = (hi + 0xFFF) & !0xFFF;
+    hi = hi.saturating_add(0xFFF) & !0xFFF;
+    if hi <= lo { return; }
 
     let mut ehdr_frame = 0u64;
     let first_seg_start = segments.first().map(|s| s.vaddr_start).unwrap_or(0);

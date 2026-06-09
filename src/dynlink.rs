@@ -58,9 +58,28 @@ pub fn parse_dynamic(data: &[u8], info: &ElfInfo) -> DynInfo {
         }
 
         let off = ph.p_offset as usize;
-        let end = (off + ph.p_filesz as usize).min(data.len());
+        if off >= data.len() { break; }
+        // checked_add to avoid wrap on attacker-controlled p_filesz
+        let nominal_end = match off.checked_add(ph.p_filesz as usize) {
+            Some(v) => v,
+            None    => break,
+        };
+        let end = nominal_end.min(data.len());
         let bytes = &data[off..end];
         let entry_size = core::mem::size_of::<Elf64Dyn>();
+        // PT_DYNAMIC must be a whole number of Elf64Dyn entries. A
+        // non-multiple p_filesz is either a truncated or hand-crafted
+        // ELF - warn so the user knows downstream relocs may be wrong,
+        // but proceed with the count we can safely cover.
+        // Copy out of the packed struct before formatting to avoid
+        // taking an unaligned reference
+        let p_filesz = ph.p_filesz;
+        if p_filesz as usize % entry_size != 0 {
+            crate::serial_println!(
+                "[dynlink] warn: PT_DYNAMIC filesz {} not a multiple of {} - trailing bytes ignored",
+                p_filesz, entry_size,
+            );
+        }
         let count = bytes.len() / entry_size;
 
         for j in 0..count {
@@ -162,10 +181,15 @@ pub fn get_needed_names<'a>(data: &'a [u8], dyn_info: &DynInfo) -> [Option<&'a s
     }
 
     let strtab_off = dyn_info.strtab_vaddr as usize;
-    let strtab_end = (strtab_off + dyn_info.strtab_size as usize).min(data.len());
     if strtab_off >= data.len() {
         return result;
     }
+    // checked_add - strtab_size is from PT_DYNAMIC, attacker-controlled
+    let nominal_end = match strtab_off.checked_add(dyn_info.strtab_size as usize) {
+        Some(v) => v,
+        None    => return result,
+    };
+    let strtab_end = nominal_end.min(data.len());
     let strtab = &data[strtab_off..strtab_end];
 
     for i in 0..dyn_info.needed_count {

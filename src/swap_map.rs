@@ -21,14 +21,37 @@ struct SwapMap {
     entries:    [ReverseEntry; MAX_TRACKED],
     clock_hand: usize,
     tracked:    usize,
+    // Upper bound (exclusive) on used indices. All scans clip to this.
+    // Without it every age_all / pick_victim walks 64K entries even on
+    // a small workload, and age_all runs in the timer ISR path
+    high_water: usize,
 }
 
 impl SwapMap {
     const fn new() -> Self {
-        Self { entries: [ReverseEntry::empty(); MAX_TRACKED], clock_hand: 0, tracked: 0 }
+        Self {
+            entries:    [ReverseEntry::empty(); MAX_TRACKED],
+            clock_hand: 0,
+            tracked:    0,
+            high_water: 0,
+        }
     }
 
     #[inline] fn frame_idx(phys: u64) -> usize { (phys / 4096) as usize }
+
+    #[inline]
+    fn bump_hw(&mut self, idx: usize) {
+        if idx + 1 > self.high_water { self.high_water = idx + 1; }
+    }
+
+    // Tighten high_water if we just freed the top entry. Only walks while
+    // it actually shrinks; amortized O(1)
+    #[inline]
+    fn trim_hw(&mut self) {
+        while self.high_water > 0 && !self.entries[self.high_water - 1].is_used() {
+            self.high_water -= 1;
+        }
+    }
 
     pub fn track(&mut self, phys: u64, cr3: u64, virt: u64, pinned: bool) {
         let idx = Self::frame_idx(phys);
@@ -37,6 +60,7 @@ impl SwapMap {
         // Read current PTE flags for restoring on swap-in
         let pte_flags = crate::vmm::read_pte_raw(cr3, virt).unwrap_or(0) & 0xFFF;
         self.entries[idx] = ReverseEntry { cr3, virt_addr: virt, pte_flags, age: 1, pinned };
+        self.bump_hw(idx);
     }
 
     pub fn untrack(&mut self, phys: u64) {
@@ -44,6 +68,7 @@ impl SwapMap {
         if idx >= MAX_TRACKED { return; }
         if self.entries[idx].is_used() { self.tracked = self.tracked.saturating_sub(1); }
         self.entries[idx] = ReverseEntry::empty();
+        if idx + 1 == self.high_water { self.trim_hw(); }
     }
 
     pub fn touch(&mut self, phys: u64) {
@@ -61,7 +86,9 @@ impl SwapMap {
     }
 
     pub fn age_all(&mut self) {
-        for e in self.entries.iter_mut() {
+        // Bound by high_water; timer ISR runs this every ~second
+        let hw = self.high_water;
+        for e in self.entries[..hw].iter_mut() {
             if e.is_used() && !e.pinned {
                 e.age = e.age.saturating_add(1);
             }
@@ -70,23 +97,37 @@ impl SwapMap {
 
     pub fn pick_victim(&mut self) -> Option<(u64, u64, u64, u64)> {
         if self.tracked == 0 { return None; }
-        let n = MAX_TRACKED;
+        let hw = self.high_water;
+        if hw == 0 { return None; }
 
-        for _ in 0..n {
-            let idx = self.clock_hand;
-            self.clock_hand = (self.clock_hand + 1) % n;
-            let e = &self.entries[idx];
-            if e.is_used() && !e.pinned && e.age >= 3 {
-                return Some((idx as u64 * 4096, e.cr3, e.virt_addr, e.pte_flags));
-            }
-        }
+        if self.clock_hand >= hw { self.clock_hand = 0; }
 
-        for idx in 0..n {
+        // Single-pass clock scan with fallback memo. Preferred victim is
+        // age>=3; remember first usable any-age entry so we don't need a
+        // second sweep on cold caches
+        let start = self.clock_hand;
+        let mut fallback: Option<usize> = None;
+        let mut steps = 0usize;
+        let mut idx   = start;
+
+        while steps < hw {
             let e = &self.entries[idx];
             if e.is_used() && !e.pinned {
-                self.clock_hand = (idx + 1) % n;
-                return Some((idx as u64 * 4096, e.cr3, e.virt_addr, e.pte_flags));
+                if e.age >= 3 {
+                    self.clock_hand = if idx + 1 >= hw { 0 } else { idx + 1 };
+                    return Some((idx as u64 * 4096, e.cr3, e.virt_addr, e.pte_flags));
+                }
+                if fallback.is_none() { fallback = Some(idx); }
             }
+            idx += 1;
+            if idx >= hw { idx = 0; }
+            steps += 1;
+        }
+
+        if let Some(fi) = fallback {
+            let e = &self.entries[fi];
+            self.clock_hand = if fi + 1 >= hw { 0 } else { fi + 1 };
+            return Some((fi as u64 * 4096, e.cr3, e.virt_addr, e.pte_flags));
         }
         None
     }
@@ -103,6 +144,53 @@ static SWAP_MAP: Mutex<SwapMap> = Mutex::new(SwapMap::new());
 
 pub fn track(phys: u64, cr3: u64, virt: u64, pinned: bool) {
     SWAP_MAP.lock().track(phys, cr3, virt, pinned);
+}
+
+/// Guard that holds SWAP_MAP locked across a batch of tracked frames -
+/// for e.g. a multi-MB map_range. Caller supplies pte_flags directly so
+/// we don't re-walk page tables to recover what was just written
+pub struct SwapMapGuard<'a> {
+    inner: spin::MutexGuard<'a, SwapMap>,
+}
+
+impl<'a> SwapMapGuard<'a> {
+    #[inline]
+    pub fn track(&mut self, phys: u64, cr3: u64, virt: u64, pinned: bool, pte_flags: u64) {
+        let idx = SwapMap::frame_idx(phys);
+        if idx >= MAX_TRACKED { return; }
+        if !self.inner.entries[idx].is_used() { self.inner.tracked += 1; }
+        self.inner.entries[idx] = ReverseEntry {
+            cr3,
+            virt_addr: virt,
+            pte_flags: pte_flags & 0xFFF,
+            age: 1,
+            pinned,
+        };
+        self.inner.bump_hw(idx);
+    }
+
+    #[inline]
+    pub fn untrack(&mut self, phys: u64) {
+        let idx = SwapMap::frame_idx(phys);
+        if idx >= MAX_TRACKED { return; }
+        if self.inner.entries[idx].is_used() {
+            self.inner.tracked = self.inner.tracked.saturating_sub(1);
+        }
+        self.inner.entries[idx] = ReverseEntry::empty();
+        if idx + 1 == self.inner.high_water { self.inner.trim_hw(); }
+    }
+
+    #[inline]
+    pub fn set_pinned(&mut self, phys: u64, pinned: bool) {
+        let idx = SwapMap::frame_idx(phys);
+        if idx < MAX_TRACKED && self.inner.entries[idx].is_used() {
+            self.inner.entries[idx].pinned = pinned;
+        }
+    }
+}
+
+pub fn lock_batch() -> SwapMapGuard<'static> {
+    SwapMapGuard { inner: SWAP_MAP.lock() }
 }
 
 pub fn untrack(phys: u64) {

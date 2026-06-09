@@ -32,6 +32,7 @@ pub enum LoadError {
     InterpReadFailed,
     InterpLoadFailed,
     RelocFailed,
+    ArgvTooLong,
 }
 
 impl LoadError {
@@ -46,6 +47,7 @@ impl LoadError {
             Self::InterpReadFailed => "cannot read ELF interpreter",
             Self::InterpLoadFailed => "cannot load ELF interpreter",
             Self::RelocFailed => "relocation failed",
+            Self::ArgvTooLong => "argv/envp/auxv too large for user stack",
         }
     }
 }
@@ -115,12 +117,14 @@ pub fn load(
         if ph.p_type != PT_LOAD {
             continue;
         }
-        let end = ph.p_vaddr + load_bias + ph.p_memsz;
+        let end = ph.p_vaddr
+            .saturating_add(load_bias)
+            .saturating_add(ph.p_memsz);
         if end > brk {
             brk = end;
         }
     }
-    let brk = (brk + PAGE_MASK) & !PAGE_MASK;
+    let brk = brk.saturating_add(PAGE_MASK) & !PAGE_MASK;
 
     let tls_base = match setup_tls(data, &info, aspace) {
         Ok(b) => b,
@@ -148,17 +152,23 @@ pub fn load(
     let has_interp = interp.is_some();
 
     let phdr_vaddr = if info.phdr_vaddr != 0 {
-        info.phdr_vaddr + load_bias
+        info.phdr_vaddr.saturating_add(load_bias)
     } else {
         // No PT_PHDR - find LOAD segment that covers e_phoff
         let mut fallback = 0u64;
         let phoff = info.ehdr.e_phoff;
         for i in 0..info.phdr_count {
             let ph = &info.phdrs[i];
-            if ph.p_type == PT_LOAD && phoff >= ph.p_offset
-                && phoff < ph.p_offset + ph.p_filesz
-            {
-                fallback = ph.p_vaddr + load_bias + (phoff - ph.p_offset);
+            // parse() already checked p_offset+p_filesz <= data.len(),
+            // but use checked_add for defense in depth
+            let seg_file_end = match ph.p_offset.checked_add(ph.p_filesz) {
+                Some(v) => v,
+                None    => continue,
+            };
+            if ph.p_type == PT_LOAD && phoff >= ph.p_offset && phoff < seg_file_end {
+                fallback = ph.p_vaddr
+                    .saturating_add(load_bias)
+                    .saturating_add(phoff - ph.p_offset);
                 break;
             }
         }
@@ -186,7 +196,7 @@ pub fn load(
     let stack_top = setup_stack(
         stack_phys, stack_size, args, &info,
         load_bias, interp_base, exe_entry, phdr_vaddr,
-    );
+    ).ok_or(LoadError::ArgvTooLong)?;
 
     crate::serial_println!(
         "[elf] ready: jump={:#x} exe={:#x} sp={:#x} brk={:#x} tls={:#x} interp={:#x}",
@@ -278,7 +288,11 @@ fn check_overlaps(info: &ElfInfo) -> Result<(), LoadError> {
         }
 
         let start = p.p_vaddr;
-        let end = p.p_vaddr + p.p_memsz;
+        // parse() already rejects vaddr+memsz wrap, but be defensive
+        let end = match p.p_vaddr.checked_add(p.p_memsz) {
+            Some(v) => v,
+            None    => return Err(LoadError::SegmentOverlap),
+        };
         for j in 0..count {
             let (rs, re) = ranges[j];
             if start < re && end > rs {
@@ -319,15 +333,21 @@ fn map_load_segment(
         return Ok(());
     }
 
-    let vaddr = phdr.p_vaddr + load_bias;
+    // All arithmetic on the attacker-controlled phdr fields goes through
+    // checked_add so a crafted ELF cannot wrap past USER_MAX or produce
+    // a negative page count
+    let vaddr = phdr.p_vaddr.checked_add(load_bias).ok_or(LoadError::MapFailed)?;
     let filesz = phdr.p_filesz;
     let memsz = phdr.p_memsz;
     let offset = phdr.p_offset;
 
     let page_start = vaddr & !PAGE_MASK;
-    let page_end = (vaddr + memsz + PAGE_MASK) & !PAGE_MASK;
+    let vaddr_end  = vaddr.checked_add(memsz).ok_or(LoadError::MapFailed)?;
+    let page_end   = vaddr_end
+        .checked_add(PAGE_MASK).ok_or(LoadError::MapFailed)? & !PAGE_MASK;
+    if page_end <= page_start { return Err(LoadError::MapFailed); }
     let num_pages = ((page_end - page_start) / PAGE_SIZE) as usize;
-    let seg_file_end = vaddr + filesz;
+    let seg_file_end = vaddr.checked_add(filesz).ok_or(LoadError::MapFailed)?;
 
     let mut flags = PageTableFlags::USER_ACCESSIBLE;
     if phdr.p_flags & PF_W != 0 {
@@ -466,8 +486,14 @@ fn apply_relro(info: &ElfInfo, load_bias: u64, aspace: &AddressSpace) {
             continue;
         }
 
-        let start = (ph.p_vaddr + load_bias) & !PAGE_MASK;
-        let end = (ph.p_vaddr + load_bias + ph.p_memsz + PAGE_MASK) & !PAGE_MASK;
+        // saturating - apply_relro is non-fatal; if a malicious phdr
+        // wraps we'd rather skip RELRO than panic the kernel
+        let raw_start = ph.p_vaddr.saturating_add(load_bias);
+        let raw_end   = raw_start
+            .saturating_add(ph.p_memsz)
+            .saturating_add(PAGE_MASK);
+        let start = raw_start & !PAGE_MASK;
+        let end   = raw_end   & !PAGE_MASK;
         let ro_flags = PageTableFlags::PRESENT
             | PageTableFlags::USER_ACCESSIBLE
             | PageTableFlags::NO_EXECUTE;
@@ -494,13 +520,29 @@ fn setup_tls(data: &[u8], info: &ElfInfo, aspace: &AddressSpace) -> Result<u64, 
         None => return Ok(0),
     };
 
-    let align = ph.p_align.max(8) as usize;
+    // Cap TLS to a sane size. 64 MB is the largest we ever
+    // want to map and prevents overflow on the rounding math below
+    const TLS_MAX_SIZE: usize = 64 * 1024 * 1024;
+    let raw_align = ph.p_align.max(8) as usize;
+    // Align must be a power of two for the bitmask rounding to work,
+    // and must not be absurdly large. Fall back to 8 if either fails
+    let align = if raw_align.is_power_of_two() && raw_align <= 4096 {
+        raw_align
+    } else {
+        8
+    };
     let filesz = ph.p_filesz as usize;
-    let memsz = ph.p_memsz as usize;
-    let tcb_off = (memsz + align - 1) & !(align - 1);
-    let block_size = tcb_off + 8;
-    let pages = (block_size + 4095) / 4096;
-    let map_size = pages * 4096;
+    let memsz  = ph.p_memsz  as usize;
+    if memsz > TLS_MAX_SIZE || filesz > memsz {
+        return Err(LoadError::MapFailed);
+    }
+    let tcb_off = match memsz.checked_add(align - 1) {
+        Some(v) => v & !(align - 1),
+        None    => return Err(LoadError::MapFailed),
+    };
+    let block_size = tcb_off.checked_add(8).ok_or(LoadError::MapFailed)?;
+    let pages = block_size.checked_add(4095).ok_or(LoadError::MapFailed)? / 4096;
+    let map_size = pages.checked_mul(4096).ok_or(LoadError::MapFailed)?;
 
     let phys = pmm::alloc_frames(pages).ok_or(LoadError::OutOfMemory)?;
     let flags = PageTableFlags::WRITABLE
@@ -513,11 +555,17 @@ fn setup_tls(data: &[u8], info: &ElfInfo, aspace: &AddressSpace) -> Result<u64, 
     }
 
     let hhdm = grub::hhdm();
+    let offset_us = ph.p_offset as usize;
+    let in_bounds = filesz == 0
+        || offset_us
+            .checked_add(filesz)
+            .map(|end| end <= data.len())
+            .unwrap_or(false);
     unsafe {
         core::ptr::write_bytes((phys + hhdm) as *mut u8, 0, map_size);
-        if filesz > 0 && ph.p_offset as usize + filesz <= data.len() {
+        if filesz > 0 && in_bounds {
             core::ptr::copy_nonoverlapping(
-                data.as_ptr().add(ph.p_offset as usize),
+                data.as_ptr().add(offset_us),
                 (phys + hhdm) as *mut u8,
                 filesz,
             );
@@ -543,22 +591,33 @@ fn setup_stack(
     interp_base: u64,
     exe_entry: u64,
     phdr_vaddr: u64,
-) -> u64 {
+) -> Option<u64> {
     let hhdm = grub::hhdm();
     let virt_base = USER_STACK_TOP - stack_size;
     let host_base = stack_phys + hhdm;
     let mut sp = USER_STACK_TOP;
 
+    // Closures share this sticky overflow flag. Any push that wouldn't
+    // fit refuses to write and sets overflow so the caller can reject
+    // the whole exec with ArgvTooLong; silently truncating yields
+    // attacker-controlled argv pointers, never a safe behaviour
+    let overflow = core::cell::Cell::new(false);
+
     let push_u64 = |sp: &mut u64, val: u64| {
+        if overflow.get() { return; }
+        if *sp < virt_base + 8 { overflow.set(true); return; }
         *sp -= 8;
         let off = *sp - virt_base;
         unsafe {
-            ((host_base + off) as *mut u64).write(val);
+            ((host_base + off) as *mut u64).write_unaligned(val);
         }
     };
 
     let push_bytes = |sp: &mut u64, bytes: &[u8]| -> u64 {
-        *sp -= bytes.len() as u64;
+        if overflow.get() { return *sp; }
+        let need = bytes.len() as u64;
+        if *sp < virt_base + need { overflow.set(true); return *sp; }
+        *sp -= need;
         let off = *sp - virt_base;
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -571,11 +630,14 @@ fn setup_stack(
     };
 
     let push_cstr = |sp: &mut u64, s: &str| -> u64 {
+        if overflow.get() { return *sp; }
+        let b = s.as_bytes();
+        let need = (b.len() as u64).saturating_add(1);
+        if *sp < virt_base + need { overflow.set(true); return *sp; }
         *sp -= 1;
         unsafe {
             ((host_base + (*sp - virt_base)) as *mut u8).write(0);
         }
-        let b = s.as_bytes();
         *sp -= b.len() as u64;
         let off = *sp - virt_base;
         unsafe {
@@ -608,7 +670,9 @@ fn setup_stack(
     };
 
     push_auxv(&mut sp, AT_NULL, 0);
-    push_auxv(&mut sp, AT_CLKTCK, 100);
+    // AT_CLKTCK is "clock ticks per second"; must match the LAPIC timer
+    // frequency announced in MikuOS_ABI.md §3.3 (250 Hz)
+    push_auxv(&mut sp, AT_CLKTCK, crate::apic::TIMER_HZ_DEFAULT as u64);
     push_auxv(&mut sp, AT_HWCAP, 0);
     push_auxv(&mut sp, AT_RANDOM, random_va);
     push_auxv(&mut sp, AT_EXECFN, execfn_va);
@@ -633,5 +697,5 @@ fn setup_stack(
     }
     push_u64(&mut sp, argc as u64);
 
-    sp
+    if overflow.get() { None } else { Some(sp) }
 }
