@@ -1066,6 +1066,7 @@ bits 12.. = номер swap слота
 | `mkfs.ext2 <drive>` | Форматирование ext2 |
 | `mkfs.ext3 <drive>` | Форматирование ext3 (с журналом) |
 | `mkfs.ext4 <drive>` | Форматирование ext4 (экстенты + журнал) |
+| `blkstat` | Показать все блочные устройства (ATA/AHCI/NVMe/virtio-blk) + BIO-очередь + статистика кэша |
 | `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run форматирование (только layout) |
 | `gpt <drive>` | Показать таблицу GPT |
 | `gpt.init <drive>` | Инициализировать пустой GPT |
@@ -1221,15 +1222,96 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 
 ---
 
-### ATA драйвер
+### Блочный уровень и драйверы хранилищ
+
+<details>
+<summary><b>Блочный уровень (block layer)</b></summary>
+
+#### Обзор
+
+Блочный уровень — единая точка маршрутизации между файловыми системами и драйверами хранилищ, по образцу Linux generic block layer. Конкретные драйверы регистрируются один раз за стабильным `BlockDevId`; уровни выше никогда не держат драйвер напрямую.
+
+| Параметр | Значение |
+|:--|:--|
+| **Device IDs** | 0-3: слоты legacy ATA; 4-7: PCI-устройства (AHCI, NVMe, virtio-blk) |
+| **Макс. устройств** | 8 |
+| **Учёт I/O** | BIO-очередь: счётчики submitted / completed / errors |
+| **Блокировки** | Per-device mutex слота; ATA-слоты делят bus lock; PCI-устройства полностью параллельны |
+
+#### API
+
+| Функция | Описание |
+|:--|:--|
+| `block::probe()` | Обход PCI-шины: регистрирует AHCI-порты, virtio-blk и NVMe в IDs 4-7 |
+| `block::read(dev, lba, count, buf)` | Кэшированное чтение; последовательные промахи запускают readahead |
+| `block::write(dev, lba, count, buf)` | Write-back: данные попадают в кэш, запись на диск — при flush/вытеснении |
+| `block::write_sync(dev, lba, count, buf)` | Write-through: запись завершается до возврата (журналы, GPT, swap) |
+| `block::flush(dev)` | Сброс грязных чанков (elevator-порядок) + flush volatile-кэша устройства |
+| `block::info(dev)` | Геометрия / идентичность устройства |
+| `block::cache_stats()` | `(hits, misses, readaheads, dirty)` |
+| `block::io_stats()` | `(submitted, completed, errors)` из BIO-очереди |
+| `block::dev_stats(dev)` | `(kind, sectors_read, sectors_written)` на устройство |
+
+#### Буферный кэш
+
+| Параметр | Значение |
+|:--|:--|
+| **Гранулярность** | 4 KiB чанки (8 секторов на чанк) |
+| **Объём** | 512 чанков × 4 KiB = **2 MiB** |
+| **Организация** | 8-way set-associative, 64 набора, per-set LRU |
+| **Политика** | Write-back; `write_sync` — write-through для упорядоченных записей |
+| **Readahead** | До 8 чанков (32 KiB) на последовательный промах |
+| **Грязный лимит** | Flush при 256 грязных чанках (high-water mark) |
+| **Когерентность** | Все дисковые обращения ядра идут через `crate::block`; второго пути нет |
+
+</details>
+
+<details>
+<summary><b>Драйверы хранилищ</b></summary>
+
+#### AHCI (SATA)
+
+| Параметр | Значение |
+|:--|:--|
+| **PCI-класс** | 01.06 (Mass Storage / SATA AHCI) |
+| **Регистры** | BAR5 (ABAR) MMIO, mapped uncached через HHDM |
+| **Макс. портов** | 4 SATA-диска за probe |
+| **Команды** | READ DMA EXT, WRITE DMA EXT, FLUSH CACHE EXT, IDENTIFY |
+| **Завершение** | Полинг PxCI |
+| **Буфер** | 64 KiB bounce buffer, одна PRD-запись |
+
+#### NVMe
+
+| Параметр | Значение |
+|:--|:--|
+| **Очереди** | 1 admin queue pair (глубина 16) + 1 I/O queue pair (глубина 64) |
+| **Передача** | До 128 секторов (64 KiB) на команду через PRP1 + PRP list page |
+| **Завершение** | Полинг CQ phase bit |
+| **Память** | Один page-aligned аллок: admin SQ/CQ, I/O SQ/CQ, PRP list, IDENTIFY, bounce |
+| **Опкоды** | NVM READ (0x02), NVM WRITE (0x01), NVM FLUSH (0x00) |
+
+#### virtio-blk (legacy/transitional)
+
+| Параметр | Значение |
+|:--|:--|
+| **Транспорт** | Legacy virtio-pci, port I/O (BAR0) |
+| **Кольцо** | Layout вычисляется runtime из размера очереди устройства |
+| **Макс. очередь** | 256 дескрипторов |
+| **Передача** | До 128 секторов (64 KiB) на запрос; большие — чанкуются block layer |
+| **Возможности** | FEATURE_BLK_FLUSH (bit 9) согласован |
+
+#### ATA (legacy PIO)
 
 | Параметр | Значение |
 |:--|:--|
 | **Режим** | PIO (программный I/O) |
 | **Операции** | Чтение/запись секторов (512 байт), до 255 секторов/команда |
-| **Количество дисков** | 4: Primary/Secondary x Master/Slave |
+| **Количество дисков** | 4: Primary/Secondary × Master/Slave (IDs 0-3) |
 | **Защита** | Flush кэша после записи, таймаут 50K итераций |
-| **Адресация** | LBA28 (до 128GB) |
+| **Адресация** | LBA28 (до 128 ГБ) + **LBA48** (READ/WRITE EXT, 48-бит адресация) |
+| **DMA** | Определение и отслеживание возможности bus-master DMA |
+
+</details>
 
 ---
 
@@ -1295,28 +1377,14 @@ cd src/lib/userspace
   <br>
   <sub>Автор и единственный разработчик Miku OS</sub>
   <br>
-  <sub>Ядро - VFS - MikuFS - ELF - ld-miku - libmiku - Оболочка - Сеть - TLS - Планировщик - PMM - VMM - Swap - mikuD - Сигналы - fork/exec - ACPI - APIC - SMP - Драйвер NVIDIA GPU</sub>
+  <sub>Ядро - VFS - MikuFS - ELF - ld-miku - libmiku - Оболочка - Сеть - TLS - Планировщик - PMM - VMM - Swap - mikuD - Сигналы - fork/exec - ACPI - APIC - SMP - Драйвер NVIDIA GPU - Блочный уровень - AHCI/NVMe/virtio-blk</sub>
 </div>
 
 ---
 
 ## От автора
 
-> Все начиналось с простой мысли: "А что если написать ОС самому?"
-> Каждый вечер я добавляю новую функцию, чиню новый баг, делаю новое открытие.
-> От первого символа на экране до полноценного TLS 1.3 стека, lock-free планировщика
-> и динамического линкера, все написано вручную.
-> Никаких готовых библиотек или оберток. Только Rust, документация и упорство :D
->
-> Момент, когда ELF загрузчик и динамическая линковка заработали, когда "hello from dynamic linking!"
-> появилось на экране, я не забуду никогда.
-> Когда libmiku прошла все 1617 тестов, стало ясно что на этой ОС можно запускать настоящие программы.
->
-> А потом - NVIDIA. Писать GPU-драйвер с нуля, читать PMC_BOOT_0,
-> запускать Falcon-движки, реализовывать DMA loopback через SEC2 DMEM -
-> это как открывать черный ящик голыми руками.
-> ACPI, APIC, SMP - теперь ОС понимает своё железо на уровне,
-> который большинство никогда не видит.
+Удачного использования :)
 
 <div align="center">
 

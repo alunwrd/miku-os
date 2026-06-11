@@ -419,6 +419,7 @@ pub fn execute(input: &str) {
         }
         "swapoff"    => disk_cmds::cmd_swapoff(),
         "swapinfo"   => disk_cmds::cmd_swapinfo(),
+        "blkstat"    => disk_cmds::cmd_blkstat(),
         "swapon.raw" => disk_cmds::cmd_swapon_raw(rest),
         "swapon.auto"=> disk_cmds::cmd_swapon_auto(),
         "mkswap.raw" => disk_cmds::cmd_mkswap_raw(rest),

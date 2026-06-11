@@ -1,33 +1,62 @@
 use super::structs::*;
 use super::FsError;
 use crate::ata::AtaDrive;
+use crate::vfs::types::BlockDevId;
 
+/// Filesystem-side view of a block device: a stable 'BlockDevId' plus the
+/// partition start offset. All I/O is routed through the block layer
+/// ('crate::block') rather than touching a driver directly
 pub struct DiskReader {
-    pub drive:     AtaDrive,
+    pub dev_id:    BlockDevId,
     pub start_lba: u32,
     pub io_count:  u32,
 }
 
 impl DiskReader {
     pub fn new(drive: AtaDrive) -> Self {
-        Self { drive, start_lba: 0, io_count: 0 }
+        let dev_id = crate::block::register_ata(drive);
+        Self { dev_id, start_lba: 0, io_count: 0 }
     }
 
     pub fn new_partitioned(drive: AtaDrive, start_lba: u32) -> Self {
-        Self { drive, start_lba, io_count: 0 }
+        let dev_id = crate::block::register_ata(drive);
+        Self { dev_id, start_lba, io_count: 0 }
+    }
+
+    /// Construct directly from an already-registered block device id
+    /// (virtio-blk and other non-ATA backends)
+    pub fn from_dev(dev_id: BlockDevId, start_lba: u32) -> Self {
+        Self { dev_id, start_lba, io_count: 0 }
     }
 
     pub fn reset_io(&mut self) { self.io_count = 0; }
 
     pub fn read_sector(&mut self, lba: u32, buf: &mut [u8; 512]) -> Result<(), FsError> {
         self.io_count += 1;
-        self.drive.read_sector(self.start_lba + lba, buf)
+        crate::block::read(self.dev_id, (self.start_lba + lba) as u64, 1, buf)
             .map_err(|_| FsError::IoError)
     }
 
     pub fn write_sector(&mut self, lba: u32, buf: &[u8; 512]) -> Result<(), FsError> {
         self.io_count += 1;
-        self.drive.write_sector(self.start_lba + lba, buf)
+        crate::block::write(self.dev_id, (self.start_lba + lba) as u64, 1, buf)
+            .map_err(|_| FsError::IoError)
+    }
+
+    /// Ordered write-through sector write (journal records and other data
+    /// whose on-disk ordering matters)
+    pub fn write_sector_sync(&mut self, lba: u32, buf: &[u8; 512]) -> Result<(), FsError> {
+        self.io_count += 1;
+        crate::block::write_sync(self.dev_id, (self.start_lba + lba) as u64, 1, buf)
+            .map_err(|_| FsError::IoError)
+    }
+
+    /// Ordered write-through block write (see 'write_sector_sync')
+    pub fn write_block_sync(
+        &mut self, lba: u32, buf: &[u8], sectors: u8,
+    ) -> Result<(), FsError> {
+        self.io_count += 1;
+        crate::block::write_sync(self.dev_id, (self.start_lba + lba) as u64, sectors as u32, buf)
             .map_err(|_| FsError::IoError)
     }
 
@@ -35,7 +64,7 @@ impl DiskReader {
         &mut self, lba: u32, buf: &mut [u8], sectors: u8,
     ) -> Result<(), FsError> {
         self.io_count += 1;
-        self.drive.read_sectors(self.start_lba + lba, buf, sectors)
+        crate::block::read(self.dev_id, (self.start_lba + lba) as u64, sectors as u32, buf)
             .map_err(|_| FsError::IoError)
     }
 
@@ -43,13 +72,13 @@ impl DiskReader {
         &mut self, lba: u32, buf: &[u8], sectors: u8,
     ) -> Result<(), FsError> {
         self.io_count += 1;
-        self.drive.write_sectors(self.start_lba + lba, buf, sectors)
+        crate::block::write(self.dev_id, (self.start_lba + lba) as u64, sectors as u32, buf)
             .map_err(|_| FsError::IoError)
     }
 
     pub fn flush_drive(&mut self) {
         self.io_count += 1;
-        let _ = self.drive.flush();
+        let _ = crate::block::flush(self.dev_id);
     }
 
     pub fn read_superblock(&mut self) -> Result<Superblock, FsError> {

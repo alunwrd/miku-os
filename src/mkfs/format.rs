@@ -1,4 +1,5 @@
-use crate::ata::{AtaDrive, AtaError};
+use crate::block::driver::BlkError;
+use crate::vfs::types::BlockDevId;
 use super::layout::{FsLayout, group_has_sb};
 use super::params::{FsType, MkfsParams};
 use crate::miku_extfs::structs::*;
@@ -6,14 +7,14 @@ use crate::miku_extfs::ext3::journal::{JBD_MAGIC, JBD_SUPERBLOCK_V2};
 
 #[derive(Debug)]
 pub enum MkfsError {
-    Io(AtaError),
+    Io(BlkError),
     DiskTooSmall,
     TooManyGroups,
     InvalidParams(&'static str),
 }
 
-impl From<AtaError> for MkfsError {
-    fn from(e: AtaError) -> Self { MkfsError::Io(e) }
+impl From<BlkError> for MkfsError {
+    fn from(e: BlkError) -> Self { MkfsError::Io(e) }
 }
 
 pub struct MkfsReport {
@@ -29,13 +30,14 @@ pub struct MkfsReport {
 }
 
 struct Writer {
-    drive:     AtaDrive,
+    dev:       BlockDevId,
     start_lba: u32,
 }
 
 impl Writer {
     fn write_sector(&mut self, lba: u32, buf: &[u8; 512]) -> Result<(), MkfsError> {
-        self.drive.write_sector(self.start_lba + lba, buf).map_err(MkfsError::Io)
+        crate::block::write(self.dev, (self.start_lba + lba) as u64, 1, buf)
+            .map_err(MkfsError::Io)
     }
 
     fn zero_sector(&mut self, lba: u32) -> Result<(), MkfsError> {
@@ -57,9 +59,13 @@ impl Writer {
         }
         let spb      = block_size / 512;
         let base_lba = block * spb;
-        self.drive
-            .write_sectors(self.start_lba + base_lba, &data[..block_size as usize], spb as u8)
-            .map_err(MkfsError::Io)
+        crate::block::write(
+            self.dev,
+            (self.start_lba + base_lba) as u64,
+            spb,
+            &data[..block_size as usize],
+        )
+        .map_err(MkfsError::Io)
     }
 
     fn zero_block(&mut self, block: u32, block_size: u32, total_blocks: u32)
@@ -76,32 +82,42 @@ impl Writer {
         static ZEROS: [u8; 255 * 512] = [0u8; 255 * 512];
         let mut done = 0u32;
         while done < count {
-            let n = (count - done).min(CHUNK) as u8;
-            self.drive
-                .write_sectors(self.start_lba + start_lba + done, &ZEROS[..n as usize * 512], n)
-                .map_err(MkfsError::Io)?;
-            done += n as u32;
+            let n = (count - done).min(CHUNK);
+            crate::block::write(
+                self.dev,
+                (self.start_lba + start_lba + done) as u64,
+                n,
+                &ZEROS[..n as usize * 512],
+            )
+            .map_err(MkfsError::Io)?;
+            done += n;
         }
         Ok(())
     }
 
     fn probe_sectors(&mut self) -> u32 {
+        // IDENTIFY-reported capacity, clamped to the u32 sector arithmetic the
+        // mkfs layout code works in.
+        if let Some(info) = crate::block::info(self.dev) {
+            if info.total_sectors > 0 {
+                return info.total_sectors.min(u32::MAX as u64) as u32;
+            }
+        }
+
+        // Fallback: binary-search the highest readable LBA.
         let mut buf = [0u8; 512];
-        match self.drive.read_sector(0, &mut buf) {
-            Err(crate::ata::AtaError::NoDevice)  => return 0,
-            Err(crate::ata::AtaError::Timeout)   => return 0,
-            Err(_) => return 0,
-            Ok(_)  => {}
+        if crate::block::read(self.dev, 0, 1, &mut buf).is_err() {
+            return 0;
         }
         let mut lo: u32 = 1;
         let mut hi: u32 = u32::MAX / 2;
-        while hi > lo && self.drive.read_sector(hi - 1, &mut buf).is_err() {
+        while hi > lo && crate::block::read(self.dev, (hi - 1) as u64, 1, &mut buf).is_err() {
             hi /= 2;
             if hi == 0 { return lo; }
         }
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.drive.read_sector(mid, &mut buf).is_ok() { lo = mid; }
+            if crate::block::read(self.dev, mid as u64, 1, &mut buf).is_ok() { lo = mid; }
             else { hi = mid; }
         }
         lo + 1
@@ -157,7 +173,7 @@ fn bitmap_mark_unused_tail(buf: &mut [u8], first_invalid: u32, block_size: u32) 
     }
 }
 
-pub fn mkfs(drive: AtaDrive, params: &MkfsParams) -> Result<MkfsReport, MkfsError> {
+pub fn mkfs(dev: BlockDevId, params: &MkfsParams) -> Result<MkfsReport, MkfsError> {
     if params.block_size != 1024 && params.block_size != 4096 {
         return Err(MkfsError::InvalidParams("block_size must be 1024 or 4096"));
     }
@@ -173,7 +189,7 @@ pub fn mkfs(drive: AtaDrive, params: &MkfsParams) -> Result<MkfsReport, MkfsErro
         return Err(MkfsError::InvalidParams("journal_blocks must be >= 16"));
     }
 
-    let mut w = Writer { drive, start_lba: params.start_lba };
+    let mut w = Writer { dev, start_lba: params.start_lba };
 
     let total_sectors = if params.total_sectors > 0 {
         params.total_sectors
@@ -191,7 +207,7 @@ pub fn mkfs(drive: AtaDrive, params: &MkfsParams) -> Result<MkfsReport, MkfsErro
     crate::serial_println!("[mkfs] step 1: zeroing old SB at LBA 2-3 (base={})", params.start_lba);
     w.zero_sector(2)?;
     w.zero_sector(3)?;
-    w.drive.flush().map_err(MkfsError::Io)?;
+    crate::block::flush(w.dev).map_err(MkfsError::Io)?;
 
     let lay = FsLayout::compute(params, total_sectors);
     if lay.group_count == 0 || lay.total_blocks < 64 {
@@ -491,7 +507,7 @@ pub fn mkfs(drive: AtaDrive, params: &MkfsParams) -> Result<MkfsReport, MkfsErro
         }
     }
 
-    w.drive.flush().map_err(MkfsError::Io)?;
+    crate::block::flush(w.dev).map_err(MkfsError::Io)?;
 
     crate::serial_println!(
         "[mkfs] done: {} blks {} ino {} grps jblks={} start_lba={}",
@@ -574,7 +590,7 @@ fn write_raw_inode(
     while rem > 0 {
         let chunk = (512 - cur_off).min(rem);
         let mut sec = [0u8; 512];
-        w.drive.read_sector(w.start_lba + cur_lba, &mut sec).map_err(MkfsError::Io)?;
+        crate::block::read(w.dev, (w.start_lba + cur_lba) as u64, 1, &mut sec).map_err(MkfsError::Io)?;
         sec[cur_off..cur_off + chunk].copy_from_slice(&raw[dpos..dpos + chunk]);
         w.write_sector(cur_lba, &sec)?;
         dpos    += chunk;

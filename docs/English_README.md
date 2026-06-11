@@ -980,15 +980,96 @@ The GSP-RM image (gsp_t.bin) is NOT included - requires NVIDIA open-kernel-modul
 
 ---
 
-### ATA driver
+### Block layer and storage drivers
+
+<details>
+<summary><b>Block layer</b></summary>
+
+#### Overview
+
+The block layer is the single routing point between filesystems and storage drivers, modelled on Linux's generic block layer. Concrete drivers are registered once behind a stable `BlockDevId`; nothing above this layer holds a driver directly.
+
+| Parameter | Value |
+|:--|:--|
+| **Device IDs** | 0-3: legacy ATA slots; 4-7: PCI block devices (AHCI, NVMe, virtio-blk) |
+| **Max devices** | 8 |
+| **I/O accounting** | BIO queue with submitted / completed / error counters |
+| **Locking** | Per-device slot mutex; ATA slots share a bus lock; PCI devices are fully parallel |
+
+#### API
+
+| Function | Description |
+|:--|:--|
+| `block::probe()` | PCI bus walk: registers AHCI ports, virtio-blk and NVMe controllers into IDs 4-7 |
+| `block::read(dev, lba, count, buf)` | Cached read; sequential misses trigger read-ahead |
+| `block::write(dev, lba, count, buf)` | Write-back: lands in cache, written to disk on flush/eviction |
+| `block::write_sync(dev, lba, count, buf)` | Write-through: device write completes before return (journals, GPT, swap) |
+| `block::flush(dev)` | Drain dirty cache (elevator-ordered) + flush device write cache |
+| `block::info(dev)` | Geometry / identity for a device |
+| `block::cache_stats()` | `(hits, misses, readaheads, dirty)` |
+| `block::io_stats()` | `(submitted, completed, errors)` from the BIO queue |
+| `block::dev_stats(dev)` | `(kind, sectors_read, sectors_written)` per device |
+
+#### Buffer cache
+
+| Parameter | Value |
+|:--|:--|
+| **Granularity** | 4 KiB chunks (8 sectors per chunk) |
+| **Capacity** | 512 chunks × 4 KiB = **2 MiB** |
+| **Organization** | 8-way set-associative, 64 sets, per-set LRU |
+| **Policy** | Write-back; `write_sync` is write-through for ordered writes |
+| **Read-ahead** | Up to 8 chunks (32 KiB) per sequential miss |
+| **Dirty limit** | Flush triggered at 256 dirty chunks (high-water mark) |
+| **Coherence** | All kernel disk accesses go through `crate::block`; no second path |
+
+</details>
+
+<details>
+<summary><b>Storage drivers</b></summary>
+
+#### AHCI (SATA)
+
+| Parameter | Value |
+|:--|:--|
+| **PCI class** | 01.06 (Mass Storage / SATA AHCI) |
+| **Registers** | BAR5 (ABAR) MMIO, mapped uncached through HHDM |
+| **Max ports** | 4 SATA disks per probe |
+| **Commands** | READ DMA EXT, WRITE DMA EXT, FLUSH CACHE EXT, IDENTIFY |
+| **Completion** | Polled PxCI |
+| **Buffer** | 64 KiB bounce buffer, single PRD entry |
+
+#### NVMe
+
+| Parameter | Value |
+|:--|:--|
+| **Queues** | 1 admin queue pair (depth 16) + 1 I/O queue pair (depth 64) |
+| **Transfer** | Up to 128 sectors (64 KiB) per command via PRP1 + PRP list page |
+| **Completion** | Polled CQ phase bit |
+| **Memory** | One page-aligned allocation: admin SQ/CQ, I/O SQ/CQ, PRP list, IDENTIFY buffer, bounce |
+| **Opcodes** | NVM READ (0x02), NVM WRITE (0x01), NVM FLUSH (0x00) |
+
+#### virtio-blk (legacy/transitional)
+
+| Parameter | Value |
+|:--|:--|
+| **Transport** | Legacy virtio-pci, port I/O (BAR0) |
+| **Ring** | Layout computed at runtime from device-reported queue size |
+| **Max queue** | 256 descriptors |
+| **Transfer** | Up to 128 sectors (64 KiB) per request; larger transfers chunked by block layer |
+| **Features** | FEATURE_BLK_FLUSH (bit 9) negotiated |
+
+#### ATA (legacy PIO)
 
 | Parameter | Value |
 |:--|:--|
 | **Mode** | PIO (Programmed I/O) |
 | **Operations** | Sector read/write (512 bytes), up to 255 sectors/command |
-| **Disks** | 4: Primary/Secondary x Master/Slave |
+| **Disks** | 4: Primary/Secondary × Master/Slave (IDs 0-3) |
 | **Protection** | Cache flush after write, 50K iteration timeout |
-| **Addressing** | LBA28 (up to 128GB) |
+| **Addressing** | LBA28 (up to 128 GB) + **LBA48** (READ/WRITE EXT, 48-bit addressing) |
+| **DMA** | Bus-master DMA capability detection and state tracking |
+
+</details>
 
 ---
 
@@ -1182,6 +1263,7 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
 | `mkfs.ext2 <drive>` | Format ext2 |
 | `mkfs.ext3 <drive>` | Format ext3 (with journal) |
 | `mkfs.ext4 <drive>` | Format ext4 (extents + journal) |
+| `blkstat` | Show all block devices (ATA/AHCI/NVMe/virtio-blk) + BIO queue + cache stats |
 | `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run format (layout only) |
 | `gpt <drive>` | Show GPT partition table |
 | `gpt.init <drive>` | Initialize empty GPT |
@@ -1232,28 +1314,14 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
   <br>
   <sub>Author and sole developer of Miku OS</sub>
   <br>
-  <sub>Kernel - VFS - MikuFS - ELF - ld-miku - libmiku - Shell - Network - TLS - Scheduler - PMM - VMM - Swap - mikuD - Signals - fork/exec - ACPI - APIC - SMP - NVIDIA GPU Driver</sub>
+  <sub>Kernel - VFS - MikuFS - ELF - ld-miku - libmiku - Shell - Network - TLS - Scheduler - PMM - VMM - Swap - mikuD - Signals - fork/exec - ACPI - APIC - SMP - NVIDIA GPU Driver - Block Layer - AHCI/NVMe/virtio-blk</sub>
 </div>
 
 ---
 
 ## From the Author
 
-> It all started with a simple thought: "What if I wrote an OS myself?"
-> Every night there's something new: a feature, a bug, a discovery.
-> Everything you see here was written by hand, from the first character on screen
-> to a full TLS 1.3 stack, a dynamic linker, and a lock-free scheduler.
-> No pre-made libraries. Just Rust and persistence :D
->
-> The moment the ELF loader and dynamic linking worked, when "hello from dynamic linking!"
-> appeared on screen, I will never forget.
-> When libmiku passed all 1617 tests, it became clear that real programs can run on this OS.
->
-> And then - NVIDIA. Writing a GPU driver from scratch, reading PMC_BOOT_0,
-> bringing up Falcon engines, implementing DMA loopback through SEC2 DMEM -
-> it felt like opening a black box with bare hands.
-> ACPI, APIC, SMP - the OS now understands its own hardware at a level
-> most people never see.
+Enjoy using it :)
 
 <div align="center">
 

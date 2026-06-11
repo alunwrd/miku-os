@@ -1,24 +1,23 @@
 use crate::ata::AtaDrive;
 use crate::mkfs::{mkfs, FsType, MkfsError, MkfsParams};
 use crate::mkfs::layout::FsLayout;
+use crate::vfs::types::BlockDevId;
 use crate::{cprintln, print_error, print_success, print_warn, println};
 
-fn drive_from_index(i: usize) -> Option<AtaDrive> {
-    Some(match i {
-        0 => AtaDrive::primary(),
-        1 => AtaDrive::primary_slave(),
-        2 => AtaDrive::secondary(),
-        3 => AtaDrive::secondary_slave(),
-        _ => return None,
-    })
+fn dev_from_index(i: usize) -> Option<BlockDevId> {
+    match i {
+        0..=3 => Some(crate::block::register_ata(AtaDrive::from_idx(i))),
+        4..=7 => {
+            crate::block::probe();
+            Some(i as BlockDevId)
+        }
+        _ => None,
+    }
 }
 
 fn parse_drive(s: &str) -> Option<usize> {
-    match s {
-        "0" => Some(0),
-        "1" => Some(1),
-        "2" => Some(2),
-        "3" => Some(3),
+    match s.parse::<usize>() {
+        Ok(n) if n <= 7 => Some(n),
         _ => None,
     }
 }
@@ -43,12 +42,12 @@ pub fn cmd_mkfs_dry(drive_str: &str, type_str: &str) {
 
     let params = MkfsParams::new(fs_type, drive_idx);
 
-    let mut drive = match drive_from_index(drive_idx) {
+    let dev = match dev_from_index(drive_idx) {
         Some(d) => d,
         None => { print_error!("  invalid drive index"); return; }
     };
 
-    let total_sectors = probe_sectors(&mut drive);
+    let total_sectors = probe_sectors(dev);
     if total_sectors < 2048 {
         print_error!("  drive {} appears empty or too small", drive_idx);
         return;
@@ -109,7 +108,7 @@ fn do_mkfs(args: &str, fs_type: FsType) {
         }
     };
 
-    let drive = match drive_from_index(drive_idx) {
+    let dev = match dev_from_index(drive_idx) {
         Some(d) => d,
         None => { print_error!("  invalid drive index"); return; }
     };
@@ -119,12 +118,8 @@ fn do_mkfs(args: &str, fs_type: FsType) {
     let second_val: u32 = second_str.parse().unwrap_or(0);
 
     if second_val >= 1 && second_val <= 128 {
-        let part_num    = second_val as usize;
-        let mut probe   = match drive_from_index(drive_idx) {
-            Some(d) => d,
-            None    => { print_error!("  invalid drive"); return; }
-        };
-        match crate::gpt::gpt_read(&mut probe) {
+        let part_num = second_val as usize;
+        match crate::gpt::gpt_read(dev) {
             Ok(tbl) => {
                 let entry = &tbl.entries[part_num - 1];
                 if !entry.is_used() {
@@ -163,7 +158,7 @@ fn do_mkfs(args: &str, fs_type: FsType) {
     println!();
     cprintln!(57, 197, 187, "  mkfs.{} on drive {}...", fs_type.name(), drive_idx);
 
-    match mkfs(drive, &params) {
+    match mkfs(dev, &params) {
         Ok(report) => {
             println!();
             print_success!("  {} filesystem created successfully", report.fs_type);
@@ -202,21 +197,6 @@ fn do_mkfs(args: &str, fs_type: FsType) {
     }
 }
 
-fn probe_sectors(drive: &mut AtaDrive) -> u32 {
-    let mut buf = [0u8; 512];
-    let mut lo: u32 = 2048;
-    let mut hi: u32 = u32::MAX / 2;
-
-    while hi > lo && drive.read_sector(hi - 1, &mut buf).is_err() {
-        hi /= 2;
-    }
-    while lo + 1 < hi {
-        let mid = lo + (hi - lo) / 2;
-        if drive.read_sector(mid, &mut buf).is_ok() {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    lo + 1
+fn probe_sectors(dev: BlockDevId) -> u32 {
+    crate::gpt::gpt_probe_sectors(dev).min(u32::MAX as u64) as u32
 }

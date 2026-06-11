@@ -40,7 +40,7 @@ pub use lifecycle::{
     add_user_process, find_zombie_child, get_ppid, has_children, init_ap_idle,
     init_main_thread, kill, kill_with_code, process_exists, reap_zombie,
     set_affinity, set_parent, set_priority, spawn, spawn_child_of, spawn_named,
-    spawn_named_child, spawn_named_child_of, update_process_cr3,
+    spawn_named_child, spawn_named_child_of, started, update_process_cr3,
 };
 
 pub use proc_index::proc_index_raw;

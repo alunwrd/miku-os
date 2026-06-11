@@ -179,6 +179,7 @@ impl MikuFS {
     }
 
     pub fn flush_all_dirty_metadata(&mut self) -> Result<(), FsError> {
+        let had_dirty = self.superblock_dirty || self.groups_dirty.iter().any(|&d| d);
         if self.superblock_dirty {
             self.do_write_superblock()?;
         }
@@ -186,6 +187,11 @@ impl MikuFS {
             if self.groups_dirty[group] {
                 self.do_write_group_desc(group)?;
             }
+        }
+        // Metadata went through the write-back cache; drain it so callers
+        // (unmount, reformat) leave the disk state durable
+        if had_dirty {
+            self.reader.flush_drive();
         }
         Ok(())
     }
@@ -265,34 +271,32 @@ impl MikuFS {
         if !self.is_valid_block(block_num) {
             return Err(FsError::InvalidInode);
         }
+        // The FS cache is consulted only because it may hold a dirty block
+        // newer than what is on disk (write-back staging for the journal).
+        // Clean read caching is the block layer's job now - populating this
+        // cache on read misses would just duplicate the buffer cache
         if let Some(ref mut c) = self.block_cache {
             if c.get(block_num, buf) {
                 return Ok(());
             }
         }
-        // flush dirty victim before put() evicts it
-        self.flush_evict_victim()?;
         let spb = self.sectors_per_block() as u8;
         let base_lba = self.block_to_lba(block_num);
         let bs = self.block_size as usize;
         self.reader.read_block(base_lba, &mut buf[..bs], spb)?;
-        if let Some(ref mut c) = self.block_cache {
-            if buf.len() >= bs {
-                c.put(block_num, &buf[..bs]);
-            }
-        }
         Ok(())
     }
 
-    /// Write block to disk without touching the block cache.
-    /// Used for journal blocks to avoid polluting/evicting FS data.
+    /// Ordered journal write: goes through the block layer's write-through
+    /// path so descriptor/data/commit records land on disk in issue order -
+    /// the WAL guarantee write-back caching must not break
     pub fn write_block_direct_nocache(&mut self, block_num: u32, data: &[u8]) -> Result<(), FsError> {
         let spb = self.sectors_per_block() as u8;
         let base_lba = self.block_to_lba(block_num);
         let bs = self.block_size as usize;
         let len = data.len().min(bs);
         if len == bs {
-            self.reader.write_block(base_lba, &data[..bs], spb)?;
+            self.reader.write_block_sync(base_lba, &data[..bs], spb)?;
         } else {
             for s in 0..spb as u32 {
                 let offset = (s * 512) as usize;
@@ -300,7 +304,7 @@ impl MikuFS {
                 let mut sector = [0u8; 512];
                 let end = (offset + 512).min(len);
                 sector[..end - offset].copy_from_slice(&data[offset..end]);
-                self.reader.write_sector(base_lba + s, &sector)?;
+                self.reader.write_sector_sync(base_lba + s, &sector)?;
             }
         }
         Ok(())
@@ -325,14 +329,10 @@ impl MikuFS {
                 self.reader.write_sector(base_lba + s, &sector)?;
             }
         }
-        // flush dirty victim before put() evicts it
-        self.flush_evict_victim()?;
+        // Disk now holds the newest content (and the block-layer cache was
+        // updated by the write-through); any staged copy here is stale
         if let Some(ref mut c) = self.block_cache {
-            if len >= bs {
-                c.put(block_num, &data[..bs]);
-            } else {
-                c.invalidate(block_num);
-            }
+            c.invalidate(block_num);
         }
         Ok(())
     }

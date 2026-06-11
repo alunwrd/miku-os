@@ -1,6 +1,6 @@
 [package]
 name = "miku-os-builder"
-version = "0.2.0"
+version = "0.2.3-rc"
 edition = "2021"
 
 [dependencies]

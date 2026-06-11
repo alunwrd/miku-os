@@ -1,4 +1,5 @@
-use crate::ata::{AtaDrive, AtaError};
+use crate::block::driver::BlkError;
+use crate::vfs::types::BlockDevId;
 use spin::Mutex;
 
 pub const GPT_SIGNATURE: u64     = 0x5452415020494645;
@@ -108,7 +109,7 @@ impl GptEntry {
 pub struct GptTable {
     pub header:        GptHeader,
     pub entries:       [GptEntry; GPT_MAX_ENTRIES],
-    pub total_sectors: u32,
+    pub total_sectors: u64,
 }
 
 impl GptTable {
@@ -134,7 +135,7 @@ impl GptTable {
     }
 
     pub fn last_usable_lba(&self) -> u64 {
-        self.total_sectors as u64 - 34
+        self.total_sectors - 34
     }
 }
 
@@ -179,7 +180,7 @@ fn guid_pseudo(seed: u32) -> [u8; 16] {
     g
 }
 
-fn write_protective_mbr(drive: &mut AtaDrive, total_sectors: u32) -> Result<(), AtaError> {
+fn write_protective_mbr(dev: BlockDevId, total_sectors: u64) -> Result<(), BlkError> {
     let mut mbr = [0u8; 512];
     mbr[446] = 0x00;
     mbr[447] = 0x00;
@@ -190,11 +191,13 @@ fn write_protective_mbr(drive: &mut AtaDrive, total_sectors: u32) -> Result<(), 
     mbr[452] = 0xFF;
     mbr[453] = 0xFF;
     mbr[454..458].copy_from_slice(&1u32.to_le_bytes());
-    let size = total_sectors.saturating_sub(1);
+    // The protective-MBR size field is 32-bit by spec; disks past 2 TB are
+    // represented as 0xFFFFFFFF and the real size lives in the GPT header
+    let size = (total_sectors.saturating_sub(1)).min(u32::MAX as u64) as u32;
     mbr[458..462].copy_from_slice(&size.to_le_bytes());
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
-    drive.write_sector(0, &mbr)
+    crate::block::write_sync(dev, 0, 1, &mbr)
 }
 
 fn gpt_header_to_buf(h: &GptHeader) -> [u8; 512] {
@@ -261,50 +264,50 @@ fn header_crc(h: &GptHeader) -> u32 {
     crc32(&buf[0..GPT_HEADER_SIZE as usize])
 }
 
-fn write_entries(drive: &mut AtaDrive, entries: &[GptEntry; GPT_MAX_ENTRIES], base_lba: u32)
-    -> Result<(), AtaError>
+fn write_entries(dev: BlockDevId, entries: &[GptEntry; GPT_MAX_ENTRIES], base_lba: u64)
+    -> Result<(), BlkError>
 {
     let per_sec = 512 / GPT_ENTRY_SIZE;
     let mut buf = [0u8; 512];
-    for chunk in 0..32u32 {
+    for chunk in 0..32u64 {
         for j in 0..per_sec {
             let idx = chunk as usize * per_sec + j;
             let eb = entry_to_bytes(&entries[idx]);
             buf[j * GPT_ENTRY_SIZE..(j + 1) * GPT_ENTRY_SIZE].copy_from_slice(&eb);
         }
-        drive.write_sector(base_lba + chunk, &buf)?;
+        crate::block::write_sync(dev, base_lba + chunk, 1, &buf)?;
     }
     Ok(())
 }
 
-fn write_full_table(drive: &mut AtaDrive, tbl: &mut GptTable) -> Result<(), AtaError> {
+fn write_full_table(dev: BlockDevId, tbl: &mut GptTable) -> Result<(), BlkError> {
     tbl.header.partition_entry_array_crc32 = entries_crc(&tbl.entries);
     tbl.header.header_crc32 = 0;
     tbl.header.header_crc32 = header_crc(&tbl.header);
 
     let hbuf = gpt_header_to_buf(&tbl.header);
-    drive.write_sector(GPT_HEADER_LBA, &hbuf)?;
-    write_entries(drive, &tbl.entries, GPT_ENTRIES_LBA)?;
+    crate::block::write_sync(dev, GPT_HEADER_LBA as u64, 1, &hbuf)?;
+    write_entries(dev, &tbl.entries, GPT_ENTRIES_LBA as u64)?;
 
     let mut backup = tbl.header;
-    backup.my_lba            = tbl.total_sectors as u64 - 1;
+    backup.my_lba            = tbl.total_sectors - 1;
     backup.alternate_lba     = GPT_HEADER_LBA as u64;
-    backup.partition_entry_lba = tbl.total_sectors as u64 - 33;
+    backup.partition_entry_lba = tbl.total_sectors - 33;
     backup.header_crc32 = 0;
     backup.header_crc32 = header_crc(&backup);
 
     let bbuf = gpt_header_to_buf(&backup);
-    drive.write_sector(tbl.total_sectors - 1, &bbuf)?;
-    write_entries(drive, &tbl.entries, tbl.total_sectors - 33)?;
+    crate::block::write_sync(dev, tbl.total_sectors - 1, 1, &bbuf)?;
+    write_entries(dev, &tbl.entries, tbl.total_sectors - 33)?;
 
     Ok(())
 }
 
-pub fn gpt_init(mut drive: AtaDrive, total_sectors: u32) -> Result<(), AtaError> {
-    write_protective_mbr(&mut drive, total_sectors)?;
+pub fn gpt_init(dev: BlockDevId, total_sectors: u64) -> Result<(), BlkError> {
+    write_protective_mbr(dev, total_sectors)?;
 
-    let disk_guid = guid_pseudo(total_sectors ^ 0xDEAD_BEEF);
-    let last_usable = total_sectors as u64 - 34;
+    let disk_guid = guid_pseudo(total_sectors as u32 ^ 0xDEAD_BEEF);
+    let last_usable = total_sectors - 34;
     let entries = [GptEntry::empty(); GPT_MAX_ENTRIES];
 
     let mut header = GptHeader {
@@ -314,7 +317,7 @@ pub fn gpt_init(mut drive: AtaDrive, total_sectors: u32) -> Result<(), AtaError>
         header_crc32:                 0,
         reserved:                     0,
         my_lba:                       GPT_HEADER_LBA as u64,
-        alternate_lba:                total_sectors as u64 - 1,
+        alternate_lba:                total_sectors - 1,
         first_usable_lba:             GPT_FIRST_USABLE,
         last_usable_lba:              last_usable,
         disk_guid,
@@ -326,7 +329,7 @@ pub fn gpt_init(mut drive: AtaDrive, total_sectors: u32) -> Result<(), AtaError>
     header.header_crc32 = header_crc(&header);
 
     let mut tbl = GptTable { header, entries, total_sectors };
-    write_full_table(&mut drive, &mut tbl)?;
+    write_full_table(dev, &mut tbl)?;
 
     let mut cache = GPT_CACHE.lock();
     cache.header  = tbl.header;
@@ -337,9 +340,9 @@ pub fn gpt_init(mut drive: AtaDrive, total_sectors: u32) -> Result<(), AtaError>
     Ok(())
 }
 
-pub fn gpt_read(drive: &mut AtaDrive) -> Result<GptTable, GptReadError> {
+pub fn gpt_read(dev: BlockDevId) -> Result<GptTable, GptReadError> {
     let mut buf = [0u8; 512];
-    drive.read_sector(GPT_HEADER_LBA, &mut buf).map_err(GptReadError::Io)?;
+    crate::block::read(dev, GPT_HEADER_LBA as u64, 1, &mut buf).map_err(GptReadError::Io)?;
 
     let sig = u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0;8]));
     if sig != GPT_SIGNATURE { return Err(GptReadError::NotGpt); }
@@ -369,8 +372,9 @@ pub fn gpt_read(drive: &mut AtaDrive) -> Result<GptTable, GptReadError> {
 
     let mut entries = [GptEntry::empty(); GPT_MAX_ENTRIES];
     let per_sec = 512 / GPT_ENTRY_SIZE;
-    for chunk in 0..32u32 {
-        drive.read_sector(GPT_ENTRIES_LBA + chunk, &mut buf).map_err(GptReadError::Io)?;
+    for chunk in 0..32u64 {
+        crate::block::read(dev, GPT_ENTRIES_LBA as u64 + chunk, 1, &mut buf)
+            .map_err(GptReadError::Io)?;
         for j in 0..per_sec {
             let idx = chunk as usize * per_sec + j;
             if idx >= GPT_MAX_ENTRIES { break; }
@@ -378,29 +382,24 @@ pub fn gpt_read(drive: &mut AtaDrive) -> Result<GptTable, GptReadError> {
         }
     }
 
-    // Compute total sectors with overflow + LBA28 range check. If the
-    // disk genuinely exceeds u32 sectors (>2 TB) we must refuse rather
-    // than silently truncate; downstream sector arithmetic would index
-    // the wrong physical region
-    let total_u64 = match header.alternate_lba.checked_add(1) {
+    // Full 64-bit LBA addressing via the block layer (LBA48 in the ATA
+    // driver), so >2 TB disks no longer need to be rejected - only guard
+    // against a corrupt header overflowing the arithmetic
+    let total_sectors = match header.alternate_lba.checked_add(1) {
         Some(v) => v,
         None    => return Err(GptReadError::InvalidFormat),
     };
-    if total_u64 > u32::MAX as u64 {
-        return Err(GptReadError::DiskTooLarge);
-    }
-    let total_sectors = total_u64 as u32;
     Ok(GptTable { header, entries, total_sectors })
 }
 
 pub fn gpt_add_partition(
-    mut drive:    AtaDrive,
+    dev:          BlockDevId,
     type_guid:    [u8; 16],
     size_sectors: u64,
     name:         &str,
     seed:         u32,
 ) -> Result<usize, GptWriteError> {
-    let mut tbl = gpt_read(&mut drive).map_err(|_| GptWriteError::ReadFailed)?;
+    let mut tbl = gpt_read(dev).map_err(|_| GptWriteError::ReadFailed)?;
 
     let slot  = tbl.first_free_slot().ok_or(GptWriteError::NoFreeSlot)?;
     let start = tbl.next_free_lba();
@@ -421,7 +420,7 @@ pub fn gpt_add_partition(
     entry.set_name(name);
     tbl.entries[slot] = entry;
 
-    write_full_table(&mut drive, &mut tbl).map_err(GptWriteError::Io)?;
+    write_full_table(dev, &mut tbl).map_err(GptWriteError::Io)?;
 
     {
         let mut cache = GPT_CACHE.lock();
@@ -434,14 +433,14 @@ pub fn gpt_add_partition(
     Ok(slot)
 }
 
-pub fn gpt_del_partition(mut drive: AtaDrive, index: usize) -> Result<(), GptWriteError> {
+pub fn gpt_del_partition(dev: BlockDevId, index: usize) -> Result<(), GptWriteError> {
     if index >= GPT_MAX_ENTRIES { return Err(GptWriteError::InvalidIndex); }
 
-    let mut tbl = gpt_read(&mut drive).map_err(|_| GptWriteError::ReadFailed)?;
+    let mut tbl = gpt_read(dev).map_err(|_| GptWriteError::ReadFailed)?;
     if !tbl.entries[index].is_used() { return Err(GptWriteError::InvalidIndex); }
 
     tbl.entries[index] = GptEntry::empty();
-    write_full_table(&mut drive, &mut tbl).map_err(GptWriteError::Io)?;
+    write_full_table(dev, &mut tbl).map_err(GptWriteError::Io)?;
 
     {
         let mut cache = GPT_CACHE.lock();
@@ -454,32 +453,38 @@ pub fn gpt_del_partition(mut drive: AtaDrive, index: usize) -> Result<(), GptWri
     Ok(())
 }
 
-pub fn gpt_probe_sectors(drive: &mut AtaDrive) -> u32 {
+pub fn gpt_probe_sectors(dev: BlockDevId) -> u64 {
+    // IDENTIFY DEVICE reports the exact capacity; trust it when present
+    if let Some(info) = crate::block::info(dev) {
+        if info.total_sectors > 0 {
+            return info.total_sectors;
+        }
+    }
+
+    // Fallback for devices that fail IDENTIFY: binary-search the highest
+    // readable LBA
     let mut buf = [0u8; 512];
-    if drive.read_sector(0, &mut buf).is_err() { return 0; }
-    let mut lo: u32 = 2048;
-    let mut hi: u32 = u32::MAX / 2;
-    while hi > lo && drive.read_sector(hi - 1, &mut buf).is_err() { hi /= 2; }
+    if crate::block::read(dev, 0, 1, &mut buf).is_err() { return 0; }
+    let mut lo: u64 = 2048;
+    let mut hi: u64 = (u32::MAX / 2) as u64;
+    while hi > lo && crate::block::read(dev, hi - 1, 1, &mut buf).is_err() { hi /= 2; }
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
-        if drive.read_sector(mid, &mut buf).is_ok() { lo = mid; } else { hi = mid; }
+        if crate::block::read(dev, mid, 1, &mut buf).is_ok() { lo = mid; } else { hi = mid; }
     }
     lo + 1
 }
 
 #[derive(Debug)]
 pub enum GptReadError {
-    Io(AtaError),
+    Io(BlkError),
     NotGpt,
     InvalidFormat,
-    /// Disk exceeds the LBA28 addressing window this driver supports.
-    /// Fail loudly so a >2 TB disk isn't silently presented as 2 TB
-    DiskTooLarge,
 }
 
 #[derive(Debug)]
 pub enum GptWriteError {
-    Io(AtaError),
+    Io(BlkError),
     ReadFailed,
     NoFreeSlot,
     NotEnoughSpace,

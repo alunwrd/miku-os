@@ -1054,13 +1054,26 @@ immutableフラグにより unlink / write / rename は拒否されます。
 | `history` | コマンド履歴 |
 | `help` | コマンド一覧 |
 
-#### mkfsコマンド
+#### mkfs / ディスク / swap コマンド
 
 | コマンド | 説明 |
 |:--|:--|
+| `blkstat` | 全ブロックデバイス (ATA/AHCI/NVMe/virtio-blk) + BIO キュー + キャッシュ統計 |
 | `mkfs.ext2 <drive>` | ext2フォーマット |
 | `mkfs.ext3 <drive>` | ext3フォーマット (ジャーナル付き) |
 | `mkfs.ext4 <drive>` | ext4フォーマット (エクステント + ジャーナル) |
+| `mkfs.dry <drive> <ext2\|ext3\|ext4>` | ドライランフォーマット (レイアウトのみ) |
+| `gpt <drive>` | GPT パーティションテーブル表示 |
+| `gpt.init <drive>` | 空の GPT 初期化 |
+| `gpt.add <drive> <spec>` | パーティション追加 |
+| `gpt.del <drive> <partition>` | パーティション削除 |
+| `mkswap <drive> <partition>` | パーティション上に swap 作成 |
+| `swapon <drive> <partition>` | swap 有効化 |
+| `swapon.raw <drive> <start> <size>` | 生座標での swap 有効化 |
+| `swapon.auto` | swap パーティションの自動検出・有効化 |
+| `swapoff` | swap 無効化 |
+| `swapinfo` | swap 使用状況 |
+| `mkswap.raw <drive> <start> <size>` | GPT なしの生 swap 作成 |
 
 ---
 
@@ -1180,15 +1193,96 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 
 ---
 
-### ATAドライバ
+### ブロック層とストレージドライバー
+
+<details>
+<summary><b>ブロック層 (block layer)</b></summary>
+
+#### 概要
+
+ブロック層はファイルシステムとストレージドライバーの間にある単一のルーティングポイントです。Linux の generic block layer をモデルにしています。具体的なドライバーは安定した `BlockDevId` の背後に一度だけ登録され、この層より上は直接ドライバーを保持しません。
 
 | パラメータ | 値 |
 |:--|:--|
-| **モード** | PIO (プログラムI/O) |
-| **操作** | セクターの読み書き (512バイト)、最大255セクター/コマンド |
-| **ディスク数** | 4台: Primary/Secondary x Master/Slave |
-| **保護** | 書き込み後のキャッシュフラッシュ、タイムアウト 50Kイテレーション |
-| **アドレス指定** | LBA28 (最大128GB) |
+| **デバイスID** | 0-3: legacy ATA スロット; 4-7: PCI ブロックデバイス (AHCI、NVMe、virtio-blk) |
+| **最大デバイス数** | 8 |
+| **I/O 計測** | BIO キュー: submitted / completed / errors カウンター |
+| **ロック** | デバイスごとのスロット mutex; ATA スロットはバスロック共有; PCI デバイスは完全並列 |
+
+#### API
+
+| 関数 | 説明 |
+|:--|:--|
+| `block::probe()` | PCI バス探索: AHCI ポート、virtio-blk、NVMe を ID 4-7 に登録 |
+| `block::read(dev, lba, count, buf)` | キャッシュ読み込み; シーケンシャルミスでリードアヘッド起動 |
+| `block::write(dev, lba, count, buf)` | ライトバック: キャッシュに記録、フラッシュ/追い出し時にディスクへ |
+| `block::write_sync(dev, lba, count, buf)` | ライトスルー: 戻る前にデバイス書き込み完了 (ジャーナル、GPT、swap) |
+| `block::flush(dev)` | ダーティチャンクのドレイン (エレベーター順) + デバイスライトキャッシュフラッシュ |
+| `block::info(dev)` | デバイスのジオメトリ / 識別情報 |
+| `block::cache_stats()` | `(hits, misses, readaheads, dirty)` |
+| `block::io_stats()` | BIO キューの `(submitted, completed, errors)` |
+| `block::dev_stats(dev)` | デバイスごとの `(kind, sectors_read, sectors_written)` |
+
+#### バッファキャッシュ
+
+| パラメータ | 値 |
+|:--|:--|
+| **粒度** | 4 KiB チャンク (8 セクター/チャンク) |
+| **容量** | 512 チャンク × 4 KiB = **2 MiB** |
+| **構成** | 8-way セット連想、64 セット、セットごと LRU |
+| **ポリシー** | ライトバック; `write_sync` は順序付き書き込みのライトスルー |
+| **リードアヘッド** | シーケンシャルミスごとに最大 8 チャンク (32 KiB) |
+| **ダーティ上限** | 256 ダーティチャンクでフラッシュ (ハイウォーターマーク) |
+| **コヒーレンス** | カーネルの全ディスクアクセスは `crate::block` 経由; 第二のパスは存在しない |
+
+</details>
+
+<details>
+<summary><b>ストレージドライバー</b></summary>
+
+#### AHCI (SATA)
+
+| パラメータ | 値 |
+|:--|:--|
+| **PCI クラス** | 01.06 (Mass Storage / SATA AHCI) |
+| **レジスタ** | BAR5 (ABAR) MMIO、HHDM 経由でアンキャッシュマッピング |
+| **最大ポート数** | probe 1回あたり SATA ディスク 4 台 |
+| **コマンド** | READ DMA EXT、WRITE DMA EXT、FLUSH CACHE EXT、IDENTIFY |
+| **完了** | PxCI ポーリング |
+| **バッファ** | 64 KiB バウンスバッファ、単一 PRD エントリ |
+
+#### NVMe
+
+| パラメータ | 値 |
+|:--|:--|
+| **キュー** | アドミンキューペア (深さ16) + I/O キューペア (深さ64) |
+| **転送** | PRP1 + PRP リストページで 1 コマンドあたり最大 128 セクター (64 KiB) |
+| **完了** | CQ フェーズビット ポーリング |
+| **メモリ** | ページアライン単一アロケーション: admin SQ/CQ、I/O SQ/CQ、PRP リスト、IDENTIFY、バウンス |
+| **オペコード** | NVM READ (0x02)、NVM WRITE (0x01)、NVM FLUSH (0x00) |
+
+#### virtio-blk (レガシー/トランジショナル)
+
+| パラメータ | 値 |
+|:--|:--|
+| **トランスポート** | レガシー virtio-pci、ポート I/O (BAR0) |
+| **リング** | レイアウトはデバイス報告のキューサイズから実行時計算 |
+| **最大キュー** | 256 デスクリプター |
+| **転送** | リクエストあたり最大 128 セクター (64 KiB); 大きい転送はブロック層でチャンク化 |
+| **機能** | FEATURE_BLK_FLUSH (bit 9) ネゴシエーション |
+
+#### ATA (レガシー PIO)
+
+| パラメータ | 値 |
+|:--|:--|
+| **モード** | PIO (プログラム I/O) |
+| **操作** | セクターの読み書き (512 バイト)、最大 255 セクター/コマンド |
+| **ディスク数** | 4 台: Primary/Secondary × Master/Slave (ID 0-3) |
+| **保護** | 書き込み後のキャッシュフラッシュ、タイムアウト 50K イテレーション |
+| **アドレス指定** | LBA28 (最大 128 GB) + **LBA48** (READ/WRITE EXT、48 ビットアドレス) |
+| **DMA** | バスマスター DMA 対応検出と状態追跡 |
+
+</details>
 
 ---
 
@@ -1254,28 +1348,14 @@ userspace プログラムの開発に関する完全なドキュメントは [Mi
   <br>
   <sub>Miku OSの作者および唯一の開発者</sub>
   <br>
-  <sub>カーネル - VFS - MikuFS - ELF - ld-miku - libmiku - シェル - ネットワーク - TLS - スケジューラ - PMM - VMM - Swap - mikuD - シグナル - fork/exec - ACPI - APIC - SMP - NVIDIA GPU ドライバー</sub>
+  <sub>カーネル - VFS - MikuFS - ELF - ld-miku - libmiku - シェル - ネットワーク - TLS - スケジューラ - PMM - VMM - Swap - mikuD - シグナル - fork/exec - ACPI - APIC - SMP - NVIDIA GPU ドライバー - ブロック層 - AHCI/NVMe/virtio-blk</sub>
 </div>
 
 ---
 
 ## 作者より
 
-> すべては「自分でOSを書いてみたらどうなるだろう?」というシンプルな思いから始まりました。
-> 毎晩、新しい機能を追加し、新しいバグを直し、新しい発見をしています。
-> 画面への最初の文字表示から、本格的なTLS 1.3スタック、ロックフリースケジューラ、
-> そしてダイナミックリンカーまで、すべて手作業で書きました。
-> 既製のライブラリやラッパーは一切なし。Rustとドキュメントと根気だけです :D
->
-> ELFローダーとダイナミックリンクが動いた瞬間、「hello from dynamic linking!」が
-> 画面に表示された時の感動は忘れられません。
-> libmikuが1617テスト全て通った瞬間、このOSで本当のプログラムが動くことを実感しました。
->
-> そして - NVIDIA。GPUドライバーをゼロから書く、PMC_BOOT_0を読む、
-> Falconエンジンを起動させる、SEC2 DMEM経由でDMAループバックを実装する -
-> まるで素手でブラックボックスを開けるような感覚でした。
-> ACPI、APIC、SMP - このOSは今、ほとんどの人が見ることのないレベルで
-> 自分のハードウェアを理解しています。
+ご利用をお楽しみください :)
 
 <div align="center">
 

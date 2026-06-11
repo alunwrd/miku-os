@@ -14,6 +14,7 @@ extern crate alloc;
 use core::panic::PanicInfo;
 mod allocator;
 mod ata;
+mod block;
 pub mod boot;
 mod boot_entry;
 mod color;
@@ -82,7 +83,7 @@ unsafe extern "C" fn kernel_main_grub(mb2_phys: u64) -> ! {
 }
 
 fn kernel_main() -> ! {
-    serial_println!("[kern] MikuOS starting (Release v0.2.2-rc)");
+    serial_println!("[kern] MikuOS starting (Release v0.2.3-rc)");
     gdt::init();
     unsafe {
         let cr0: u64;
@@ -141,6 +142,7 @@ fn kernel_main() -> ! {
     crate::solib::preload("libmiku.so", crate::ldso::LIBMIKU_BYTES.to_vec());
     crate::solib::ldconfig();
     boot_step!("Shared library cache",      Ok(()));
+    boot_step!("Block device probe",        { block::probe(); Ok::<(), &'static str>(()) });
     boot_step!("Network subsystem",         net::init());
     boot_step!("Firmware store",            fwload::init());
     boot_step!("NVIDIA GPU probe",          nvidia::init());

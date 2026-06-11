@@ -18,7 +18,7 @@ const EMPTY_FS: MikuFS = MikuFS {
     group_count:      0,
     groups:           [GroupDesc { data: [0; 64] }; 32],
     reader: DiskReader {
-        drive:     AtaDrive::EMPTY,
+        dev_id:    crate::vfs::types::INVALID_U8,
         start_lba: 0,
         io_count:  0,
     },
@@ -359,12 +359,15 @@ fn parse_u16(s: &str) -> Option<u16> {
     Some(result)
 }
 
-fn make_ata_drive(idx: usize) -> AtaDrive {
-    match idx {
-        0 => AtaDrive::primary(),
-        1 => AtaDrive::primary_slave(),
-        2 => AtaDrive::secondary(),
-        _ => AtaDrive::secondary_slave(),
+/// Resolve a mount "drive index" to a block-layer device id. Indices 0-3 are
+/// the legacy ATA slots; 4-7 address PCI block devices (virtio-blk) that the
+/// boot-time probe registered.
+fn dev_for_idx(idx: usize) -> crate::vfs::types::BlockDevId {
+    if idx < 4 {
+        crate::block::register_ata(AtaDrive::from_idx(idx))
+    } else {
+        crate::block::probe();
+        idx as crate::vfs::types::BlockDevId
     }
 }
 
@@ -399,8 +402,7 @@ struct ExtProbe {
 }
 
 fn probe_drive(drive_index: usize, start_lba: u32) -> Option<ExtProbe> {
-    let drive = make_ata_drive(drive_index);
-    let mut reader = DiskReader::new_partitioned(drive, start_lba);
+    let mut reader = DiskReader::from_dev(dev_for_idx(drive_index), start_lba);
     let mut sector = [0u8; 512];
     if reader.read_sector(2, &mut sector).is_err() {
         return None;
@@ -441,7 +443,7 @@ pub fn cmd_ext2_mount(args: &str) {
         let mut candidates: alloc::vec::Vec<ExtProbe> = alloc::vec::Vec::new();
         let mut already_mounted: Option<usize> = None;
 
-        for i in 0..4usize {
+        for i in 0..crate::vfs::types::MAX_BLOCK_DEVICES {
             if STATE.lock().is_already_mounted(i, 0) {
                 already_mounted = Some(i);
                 continue;
@@ -484,8 +486,8 @@ pub fn cmd_ext2_mount(args: &str) {
     }
 
     let drive_idx = match drive_str.parse::<usize>() {
-        Ok(n) if n <= 3 => n,
-        _ => { print_error!("  usage: ext2mount [drive 0-3] [partition]"); return; }
+        Ok(n) if n <= 7 => n,
+        _ => { print_error!("  usage: ext2mount [drive 0-7] [partition]"); return; }
     };
 
     let start_lba: u32 = if !part_str.is_empty() {
@@ -493,8 +495,8 @@ pub fn cmd_ext2_mount(args: &str) {
             Ok(n) if n >= 1 => n,
             _ => { print_error!("  invalid partition number"); return; }
         };
-        let mut drive = make_ata_drive(drive_idx);
-        match crate::gpt::gpt_read(&mut drive) {
+        let dev = dev_for_idx(drive_idx);
+        match crate::gpt::gpt_read(dev) {
             Ok(tbl) => {
                 let entry = &tbl.entries[part_num - 1];
                 if !entry.is_used() {
@@ -541,9 +543,8 @@ fn try_mount(drive_index: usize, start_lba: u32) -> bool {
         }
     };
 
-    let drive = make_ata_drive(drive_index);
     state.ready[slot] = false;
-    state.slots[slot].reader = DiskReader::new_partitioned(drive, start_lba);
+    state.slots[slot].reader = DiskReader::from_dev(dev_for_idx(drive_index), start_lba);
     state.slots[slot].block_cache = None;
     state.slots[slot].journal_inode_cached = None;
 

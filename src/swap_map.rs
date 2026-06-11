@@ -244,8 +244,7 @@ pub fn evict_one() -> Option<u64> {
 
     let (phys, cr3, virt, pte_flags) = SWAP_MAP.lock().pick_victim_and_pin()?;
 
-    let mut drive = crate::ata::AtaDrive::from_idx(swap::swap_drive_idx());
-    let slot = match swap::swap_out_internal(phys, &mut drive) {
+    let slot = match swap::swap_out_internal(phys) {
         Ok(s) => s,
         Err(e) => {
             SWAP_MAP.lock().set_pinned(phys, false);
@@ -276,8 +275,7 @@ pub fn try_swapin(cr3: u64, page_addr: u64, slot: u32, raw_swap_pte: u64) -> boo
         }
     };
 
-    let mut drive = crate::ata::AtaDrive::from_idx(swap::swap_drive_idx());
-    match swap::swap_in_internal(slot, phys, &mut drive) {
+    match swap::swap_in_internal(slot, phys) {
         Ok(()) => {}
         Err(e) => {
             crate::pmm::free_frame(phys);

@@ -5,7 +5,7 @@ resolver = "2"
 [package]
 name        = "miku-os-release"
 license     = "MIT"
-version     = "0.2.2-rc"
+version     = "0.2.3-rc"
 edition     = "2021"
 authors     = ["alunwrd"]
 description = "Experimental OS in Rust"

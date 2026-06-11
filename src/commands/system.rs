@@ -24,7 +24,7 @@ pub fn cmd_info() {
     let used_ram_kb   = pmm_used * 4 + heap_used / 1024;
     let free_ram_kb   = usable_ram_kb.saturating_sub(used_ram_kb);
 
-    cprintln!(57, 197, 187,  "  MikuOS v0.2.2-rc");
+    cprintln!(57, 197, 187,  "  MikuOS v0.2.3-rc");
     cprintln!(230, 240, 240, "  VNodes: {}/{}", vn, crate::vfs::MAX_VNODES);
     cprintln!(230, 240, 240, "  Mounts: {}", mn);
     cprintln!(230, 240, 240, "  Heap:   {} / {} KB", heap_used / 1024, heap_total / 1024);
@@ -363,14 +363,6 @@ pub fn cmd_swaptest() {
     let n = 256usize;
     cprintln!(57, 197, 187, "  swaptest: testing {} pages of swap I/O...", n);
 
-    let drive_idx = swap::swap_drive_idx();
-    let mut drive = match drive_idx {
-        0 => crate::ata::AtaDrive::primary(),
-        1 => crate::ata::AtaDrive::primary_slave(),
-        2 => crate::ata::AtaDrive::secondary(),
-        _ => crate::ata::AtaDrive::secondary_slave(),
-    };
-
     let mut frames: alloc::vec::Vec<(u64, u32, u8)> = alloc::vec::Vec::new();
 
     cprintln!(128, 222, 217, "  Phase 1: allocating and swapping out {} pages...", n);
@@ -383,7 +375,7 @@ pub fn cmd_swaptest() {
         let pattern = ((i & 0xFF) as u8) ^ 0xA5;
         unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, pattern, 4096); }
 
-        match swap::swap_out_internal(phys, &mut drive) {
+        match swap::swap_out_internal(phys) {
             Ok(slot) => {
                 unsafe { core::ptr::write_bytes((phys + hhdm) as *mut u8, 0xDE, 4096); }
                 frames.push((phys, slot, pattern));
@@ -404,7 +396,7 @@ pub fn cmd_swaptest() {
     let mut fail = 0usize;
 
     for &(phys, slot, pattern) in frames.iter() {
-        match swap::swap_in_internal(slot, phys, &mut drive) {
+        match swap::swap_in_internal(slot, phys) {
             Ok(()) => {
                 let mut ok = true;
                 unsafe {

@@ -87,6 +87,15 @@ pub fn add_user_process(p: Box<Process>) -> u64 {
 
 // idle thread bringup
 
+/// True once 'init_main_thread' has run; drivers consult this before yielding
+/// out of an I/O wait loop (pre-scheduler boot code must spin instead)
+static SCHED_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn started() -> bool {
+    SCHED_STARTED.load(Ordering::Acquire)
+}
+
 // BSP idle thread registration - must run after percpu is initialised
 pub fn init_main_thread() {
     let tick = crate::interrupts::get_tick();
@@ -95,6 +104,7 @@ pub fn init_main_thread() {
     let bsp  = percpu::get(0);
     bsp.current_pid.store(0, Ordering::Relaxed);
     bsp.idle_pid   .store(0, Ordering::Relaxed);
+    SCHED_STARTED.store(true, Ordering::Release);
     crate::serial_println!("[sched] bsp idle ptr={:p}", raw);
 }
 

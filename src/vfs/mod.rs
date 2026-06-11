@@ -1,6 +1,5 @@
 pub mod address_space;
 pub mod bio;
-pub mod block_dev;
 pub mod cas;
 pub mod children;
 pub mod core;
