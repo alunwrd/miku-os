@@ -25,7 +25,8 @@
 
 **Miku OS** is an operating system developed from scratch in a `no_std` environment.
 It does not use any standard library (`libc`), maintaining full control over hardware and memory architecture.
-ELF dynamic linking, shared libraries, userspace processes, an init daemon (mikuD), and process management (fork/exec/wait) are implemented from scratch.
+ELF dynamic linking, shared libraries, userspace processes, an init daemon (mikuD), process management (fork/exec/wait),
+and a Linux-style storage stack (block layer, write-back buffer cache, ext2/3/4, AHCI/NVMe/virtio-blk drivers) are implemented from scratch.
 
 > All code is written in Rust. Assembly is only used for the bootloader, syscall handler, and context switching.
 
@@ -54,6 +55,7 @@ ELF dynamic linking, shared libraries, userspace processes, an init daemon (miku
 | **USB** | USB legacy handoff (EHCI/xHCI BIOS release) |
 | **Splash** | Boot splash screen via framebuffer |
 | **fwload** | On-demand firmware loader from `/lib/firmware` (Linux `request_firmware` model) |
+| **Storage** | Block layer + write-back buffer cache + ATA DMA / AHCI / NVMe / virtio-blk drivers |
 
 ---
 
@@ -806,7 +808,7 @@ The immutable flag prevents unlink / write / rename.
 | **Notify events** | inotify-like subsystem (up to 16 events) |
 | **Version store** | 16 file snapshots |
 | **CAS store** | Content-addressed deduplication (up to 16 objects) |
-| **Block I/O queue** | 8 async requests |
+| **Block I/O queue** | Live bio accounting on every disk request (see Storage Stack) |
 
 </details>
 
@@ -841,7 +843,8 @@ The immutable flag prevents unlink / write / rename.
 - Create and delete files, directories, symbolic links
 - Bitmap allocator for blocks and inodes (with group priority)
 - Recursive deletion
-- Delayed writes (dirty cache + pdflush)
+- Delayed writes: FS-level dirty staging (journal WAL ordering) + pdflush,
+  on top of the block layer's write-back buffer cache
 
 #### Ext3 Journal (JBD2)
 
@@ -998,13 +1001,17 @@ The immutable flag prevents unlink / write / rename.
 
 #### mkfs / Disk / Swap Commands
 
+Drive indices 0-3 address the legacy ATA slots, 4-7 the PCI-probed devices
+(AHCI / NVMe / virtio-blk) - every command below works on all of them.
+
 | Command | Description |
 |:--|:--|
+| `blkstat` | Block layer overview: devices, per-device I/O counters, bio queue, buffer cache hit rate / dirty count |
 | `mkfs.ext2 <drive>` | Format ext2 |
 | `mkfs.ext3 <drive>` | Format ext3 (with journal) |
 | `mkfs.ext4 <drive>` | Format ext4 (extents + journal) |
 | `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run format (layout only) |
-| `gpt <drive>` | Show GPT partition table |
+| `gpt <drive>` | Show GPT partition table (64-bit LBA, >2 TB disks supported) |
 | `gpt.init <drive>` | Initialize empty GPT |
 | `gpt.add <drive> <partition spec>` | Add partition |
 | `gpt.del <drive> <partition>` | Delete partition |
@@ -1042,15 +1049,66 @@ The immutable flag prevents unlink / write / rename.
 
 ---
 
-### ATA Driver
+### Storage Stack
+
+<details>
+<summary><b>Expand</b></summary>
+
+#### Overview
+
+A full Linux-style storage pipeline. Filesystems never touch a device driver
+directly - every sector goes through the block layer:
+
+```
+ext2/3/4 (journal WAL, dirty staging)
+   |
+  VFS
+   |
+buffer cache (write-back + barriers, readahead, bdflush daemon)
+   |
+block layer (device registry, per-device locks, bio accounting)
+   |
+ATA PIO/DMA | AHCI | virtio-blk | NVMe
+```
+
+#### Block Layer (`src/block/`)
+
+| Component | Description |
+|:--|:--|
+| **Device registry** | 8 devices behind stable `BlockDevId`: 0-3 legacy ATA slots, 4-7 PCI-probed (AHCI/NVMe/virtio) |
+| **`BlockDriver` trait** | `read_blocks` / `write_blocks` / `flush` / `info`, 64-bit LBA |
+| **Per-device locks** | I/O to distinct devices runs in parallel; legacy ATA slots share a bus lock (master/slave share ports) |
+| **Bio queue** | Live request accounting: submitted / completed / errors |
+| **PCI probe** | One boot-time bus walk registers AHCI ports, NVMe namespaces, virtio-blk devices |
+| **io_relax** | I/O wait loops yield to the scheduler instead of burning CPU |
+
+#### Buffer Cache
 
 | Parameter | Value |
 |:--|:--|
-| **Mode** | PIO (Programmed I/O) |
-| **Operations** | Sector read/write (512 bytes), up to 255 sectors/command |
-| **Disks** | 4: Primary/Secondary x Master/Slave |
-| **Protection** | Cache flush after write, 50K iteration timeout |
-| **Addressing** | LBA28 (up to 128GB) |
+| **Size** | 2 MiB: 512 x 4 KiB chunks, 8-way set-associative, per-set LRU |
+| **Reads** | Read-around (whole 4 KiB chunks); sequential misses pull a 32 KiB readahead window in one command |
+| **Writes** | Write-back: data lands in RAM, the call returns; sub-chunk writes do read-modify-write |
+| **Barriers** | `write_sync` path for ordered data (ext3 journal records, GPT tables, swap headers); `flush` drains dirty chunks in ascending-LBA order (elevator sweep), then flushes the device cache |
+| **bdflush** | Background mikuD service: sweeps dirty chunks to disk every 2 s |
+| **Backpressure** | Writers drain at >50% dirty; dirty evictions write out before reuse |
+| **Coherence** | By construction - the block layer is the only path to the disk |
+
+#### Drivers
+
+| Driver | Details |
+|:--|:--|
+| **ATA (IDE)** | PIO + bus-master DMA (PRDT, 64 KiB bounce, IRQ14/15 completion flags), LBA28/LBA48, IDENTIFY, automatic PIO fallback |
+| **AHCI (SATA)** | PCI 01.06, MMIO ABAR, port bring-up per spec (ST/FRE stop, command list / received FIS / command table), H2D FIS commands, polled PxCI |
+| **NVMe** | PCI 01.08, controller reset + admin queue pair, IDENTIFY controller/namespace, I/O queue pair (qd 64), PRP1 + PRP list, phase-bit completion |
+| **virtio-blk** | Legacy virtio-pci transport, ring layout computed from the device queue size, 3-descriptor requests, `VIRTIO_BLK_F_FLUSH` |
+
+All four share a 64 KiB bounce buffer model (128 sectors per command) and are
+exercised by the same test suite: `swaptest` byte-verifies 256 pages through
+the full stack, `blkstat` shows iostat-style per-device counters and cache
+hit rates.
+
+</details>
 
 ---
 
@@ -1262,28 +1320,14 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
   <br>
   <sub>Author and sole developer of Miku OS</sub>
   <br>
-  <sub>Kernel - VFS - MikuFS - ELF - ld-miku - libmiku - Shell - Network - TLS - Scheduler - PMM - VMM - Swap - mikuD - Signals - fork/exec - ACPI - APIC - SMP - NVIDIA GPU Driver</sub>
+  <sub>Kernel - VFS - MikuFS - ELF - ld-miku - libmiku - Shell - Network - TLS - Scheduler - PMM - VMM - Swap - mikuD - Signals - fork/exec - ACPI - APIC - SMP - NVIDIA GPU Driver - Block Layer - AHCI - NVMe - virtio-blk</sub>
 </div>
 
 ---
 
 ## From the Author
 
-> It all started with a simple thought: "What if I wrote an OS myself?"
-> Every night I add a new feature, fix a new bug, make a new discovery.
-> From the first character on screen to a full TLS 1.3 stack, a lock-free scheduler,
-> and a dynamic linker, everything was written by hand.
-> No pre-made libraries or wrappers. Just Rust, documentation, and persistence :D
->
-> The moment the ELF loader and dynamic linking worked, when "hello from dynamic linking!"
-> appeared on screen, I will never forget.
-> When libmiku passed all 1617 tests, it became clear that real programs can run on this OS.
->
-> And then - NVIDIA. Writing a GPU driver from scratch, reading PMC_BOOT_0,
-> bringing up Falcon engines, implementing DMA loopback through SEC2 DMEM -
-> it felt like opening a black box with bare hands.
-> ACPI, APIC, SMP - the OS now understands its own hardware at a level
-> most people never see.
+> Enjoy using it :)
 
 <div align="center">
 

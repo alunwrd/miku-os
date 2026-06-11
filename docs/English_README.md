@@ -1020,6 +1020,7 @@ The block layer is the single routing point between filesystems and storage driv
 | **Policy** | Write-back; `write_sync` is write-through for ordered writes |
 | **Read-ahead** | Up to 8 chunks (32 KiB) per sequential miss |
 | **Dirty limit** | Flush triggered at 256 dirty chunks (high-water mark) |
+| **bdflush** | Background mikuD service: sweeps dirty chunks to disk every 2 s (ascending-LBA elevator pass) |
 | **Coherence** | All kernel disk accesses go through `crate::block`; no second path |
 
 </details>

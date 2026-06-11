@@ -83,7 +83,7 @@ unsafe extern "C" fn kernel_main_grub(mb2_phys: u64) -> ! {
 }
 
 fn kernel_main() -> ! {
-    serial_println!("[kern] MikuOS starting (Release v0.2.3-rc)");
+    serial_println!("[kern] MikuOS starting (Release v0.2.4-rc)");
     gdt::init();
     unsafe {
         let cr0: u64;
@@ -257,6 +257,19 @@ fn kernel_main() -> ! {
         svc.description = "DHCP auto-configuration";
         svc.entry = Some(net::netd_thread);
         svc.restart = mikud::RestartPolicy::OnFailure;
+        svc.target = mikud::Target::MultiUser;
+        svc.priority = 1;
+        svc.restart_delay_ticks = mikud::service::DEFAULT_RESTART_DELAY;
+        mikud::register_service_ext(svc);
+    }
+    // bdflush: background writeback for the block-layer cache (the
+    // flusher-thread half of write-back caching)
+    {
+        let mut svc = mikud::Service::empty();
+        svc.name = "bdflush";
+        svc.description = "block cache writeback daemon";
+        svc.entry = Some(block::writeback_thread);
+        svc.restart = mikud::RestartPolicy::Always;
         svc.target = mikud::Target::MultiUser;
         svc.priority = 1;
         svc.restart_delay_ticks = mikud::service::DEFAULT_RESTART_DELAY;

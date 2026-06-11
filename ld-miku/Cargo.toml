@@ -1,6 +1,6 @@
 [package]
 name    = "ld-miku"
-version = "0.2.3-rc"
+version = "0.2.4-rc"
 edition = "2021"
 
 [profile.release]

@@ -395,10 +395,11 @@ pub fn write_sync(dev_id: BlockDevId, lba: u64, count: u32, buf: &[u8]) -> Resul
 }
 
 /// Write out every dirty chunk of 'dev_id' in ascending LBA order - a
-/// single elevator sweep across the disk
-fn flush_dirty_only(dev_id: BlockDevId) -> Result<(), BlkError> {
+/// single elevator sweep across the disk. Returns how many chunks went out
+fn flush_dirty_only(dev_id: BlockDevId) -> Result<usize, BlkError> {
     let mut tmp = [0u8; cache::CHUNK_BYTES];
     let mut after = 0u64;
+    let mut flushed = 0usize;
     loop {
         let chunk = match CACHE.lock().as_mut().and_then(|c| {
             c.pop_dirty_sorted(dev_id, after, &mut tmp)
@@ -411,8 +412,37 @@ fn flush_dirty_only(dev_id: BlockDevId) -> Result<(), BlkError> {
             drv.write_blocks(lba, cache::CHUNK_SECTORS as u32, &tmp)
         })?;
         after = chunk + 1;
+        flushed += 1;
     }
-    Ok(())
+    Ok(flushed)
+}
+
+/// Background writeback daemon - MikuOS's flusher thread. Wakes every
+/// couple of seconds and sweeps each device's dirty chunks out to disk, so
+/// write-back data never lingers in RAM indefinitely even when nobody
+/// calls 'sync'. Registered with mikuD as the 'bdflush' service
+pub fn writeback_thread() -> ! {
+    // 500 ticks @ 250 Hz = 2 s between sweeps
+    const INTERVAL_TICKS: u64 = 500;
+    crate::serial_println!("[bdflush] thread started");
+    loop {
+        crate::scheduler::sleep(INTERVAL_TICKS);
+        if CACHE.lock().as_ref().map_or(0, |c| c.dirty_count()) == 0 {
+            continue;
+        }
+        let mut total = 0usize;
+        for dev in 0..MAX_BLOCK_DEVICES as u8 {
+            match flush_dirty_only(dev) {
+                Ok(n) => total += n,
+                Err(e) => {
+                    crate::serial_println!("[bdflush] dev {}: writeback failed: {:?}", dev, e);
+                }
+            }
+        }
+        if total > 0 {
+            crate::serial_println!("[bdflush] wrote back {} chunks", total);
+        }
+    }
 }
 
 /// Flush threshold: at half the cache dirty, writers start draining
