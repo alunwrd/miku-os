@@ -83,7 +83,7 @@ unsafe extern "C" fn kernel_main_grub(mb2_phys: u64) -> ! {
 }
 
 fn kernel_main() -> ! {
-    serial_println!("[kern] MikuOS starting (Release v0.2.4-rc)");
+    serial_println!("[kern] MikuOS starting (Release v0.2.5-rc)");
     gdt::init();
     unsafe {
         let cr0: u64;

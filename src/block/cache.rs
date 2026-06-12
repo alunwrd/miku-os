@@ -47,6 +47,8 @@ pub struct BufferCache {
     tick:    u64,
     /// Last chunk touched per device, for sequential-access detection
     last_chunk: [u64; crate::vfs::types::MAX_BLOCK_DEVICES],
+    /// Consecutive sequential chunks per device (readahead ramp-up)
+    streak:     [u32; crate::vfs::types::MAX_BLOCK_DEVICES],
     pub hits:   u64,
     pub misses: u64,
     pub readaheads: u64,
@@ -63,6 +65,7 @@ impl BufferCache {
             entries: vec![Entry::empty(); ENTRIES],
             tick:    0,
             last_chunk: [u64::MAX; crate::vfs::types::MAX_BLOCK_DEVICES],
+            streak:     [0u32; crate::vfs::types::MAX_BLOCK_DEVICES],
             hits:    0,
             misses:  0,
             readaheads: 0,
@@ -71,11 +74,17 @@ impl BufferCache {
 
     /// Record an access to 'chunk' and report whether it directly follows
     /// the previous access on this device - the readahead trigger
-    pub fn advance(&mut self, dev: BlockDevId, chunk: u64) -> bool {
+    /// Returns the current sequential-streak length for this device
+    /// (0 = random access), which sizes the readahead window
+    pub fn advance(&mut self, dev: BlockDevId, chunk: u64) -> u32 {
         let slot = dev as usize % self.last_chunk.len();
-        let seq = self.last_chunk[slot] == chunk.wrapping_sub(1);
+        if self.last_chunk[slot] == chunk.wrapping_sub(1) {
+            self.streak[slot] = self.streak[slot].saturating_add(1);
+        } else if self.last_chunk[slot] != chunk {
+            self.streak[slot] = 0;
+        }
         self.last_chunk[slot] = chunk;
-        seq
+        self.streak[slot]
     }
 
     #[inline]

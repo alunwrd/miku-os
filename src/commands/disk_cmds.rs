@@ -43,9 +43,8 @@ pub fn cmd_blkstat() {
             }
             any = true;
             let mb = info.total_sectors * info.sector_size as u64 / (1024 * 1024);
-            let (kind, rd, wr) = crate::block::dev_stats(id)
-                .unwrap_or((crate::block::DevKind::Ata, 0, 0));
-            let kind_str = match kind {
+            let Some(st) = crate::block::dev_stats(id) else { continue };
+            let kind_str = match st.kind {
                 crate::block::DevKind::Ata       => "ata",
                 crate::block::DevKind::VirtioBlk => "virtio",
                 crate::block::DevKind::Ahci      => "ahci",
@@ -57,9 +56,17 @@ pub fn cmd_blkstat() {
                 info.lba48, info.read_only
             );
             println!(
-                "        io: read {} KB, written {} KB",
-                rd * 512 / 1024, wr * 512 / 1024
+                "        io: read {} KB, written {} KB, avg latency {} us",
+                st.sectors_read * 512 / 1024,
+                st.sectors_written * 512 / 1024,
+                st.avg_io_us
             );
+            if st.io_errors > 0 || st.retries > 0 {
+                print_warn!(
+                    "        errors: {} failed, {} retries",
+                    st.io_errors, st.retries
+                );
+            }
         }
     }
     if !any {
