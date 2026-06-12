@@ -5,6 +5,8 @@ use crate::vfs::types::*;
 pub enum BioDirection {
     Read = 0,
     Write = 1,
+    /// TRIM/deallocate - carries no data, only a sector range
+    Discard = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

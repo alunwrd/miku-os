@@ -57,6 +57,10 @@ const ATA_READ_DMA_EXT:    u8 = 0x25;
 const ATA_WRITE_DMA_EXT:   u8 = 0x35;
 const ATA_FLUSH_CACHE_EXT: u8 = 0xEA;
 const ATA_IDENTIFY:        u8 = 0xEC;
+const ATA_DSM:             u8 = 0x06; // DATA SET MANAGEMENT (TRIM)
+
+/// DSM FEATURES bit 0: the range payload is a TRIM request
+const DSM_FEATURE_TRIM: u16 = 0x0001;
 
 pub const MAX_XFER_SECTORS: u32 = 128;
 const BOUNCE_SIZE: usize = MAX_XFER_SECTORS as usize * 512;
@@ -78,6 +82,8 @@ pub struct AhciPort {
     capacity:  u64,
     model:     [u8; 40],
     model_len: u8,
+    /// Drive supports DATA SET MANAGEMENT / TRIM (IDENTIFY word 169 bit 0)
+    has_trim:  bool,
 }
 
 #[inline]
@@ -225,10 +231,11 @@ impl AhciPort {
             capacity:  0,
             model:     [0u8; 40],
             model_len: 0,
+            has_trim:  false,
         };
 
         // IDENTIFY DEVICE fills capacity + model
-        if p.issue(ATA_IDENTIFY, 0, 0, 512, false).is_err() {
+        if p.issue(ATA_IDENTIFY, 0, 0, 512, false, 0).is_err() {
             crate::serial_println!("[ahci] port {}: IDENTIFY failed", port_no);
             return None;
         }
@@ -248,19 +255,21 @@ impl AhciPort {
         }
         while n > 0 && (p.model[n - 1] == b' ' || p.model[n - 1] == 0) { n -= 1; }
         p.model_len = n as u8;
+        p.has_trim = w(169) & 1 != 0;
 
         crate::serial_println!(
-            "[ahci] port {}: '{}' {} sectors ({} MB)",
+            "[ahci] port {}: '{}' {} sectors ({} MB) trim={}",
             port_no,
             core::str::from_utf8(&p.model[..n]).unwrap_or("?"),
             p.capacity,
-            p.capacity * 512 / (1024 * 1024)
+            p.capacity * 512 / (1024 * 1024),
+            p.has_trim
         );
         Some(p)
     }
 
     /// Build and issue one command in slot 0, polling PxCI to completion
-    fn issue(&mut self, cmd: u8, lba: u64, count: u16, bytes: usize, write: bool)
+    fn issue(&mut self, cmd: u8, lba: u64, count: u16, bytes: usize, write: bool, features: u16)
         -> Result<(), BlkError>
     {
         let pm = self.port_mmio;
@@ -279,6 +288,8 @@ impl AhciPort {
         cfis[0] = FIS_TYPE_H2D;
         cfis[1] = 0x80; // C: command register update
         cfis[2] = cmd;
+        cfis[3] = features as u8;
+        cfis[11] = (features >> 8) as u8;
         cfis[4] = lba as u8;
         cfis[5] = (lba >> 8) as u8;
         cfis[6] = (lba >> 16) as u8;
@@ -351,7 +362,7 @@ impl BlockDriver for AhciPort {
         while done < count {
             let chunk = (count - done).min(MAX_XFER_SECTORS);
             let bytes = chunk as usize * 512;
-            self.issue(ATA_READ_DMA_EXT, lba + done as u64, chunk as u16, bytes, false)?;
+            self.issue(ATA_READ_DMA_EXT, lba + done as u64, chunk as u16, bytes, false, 0)?;
             let off = done as usize * 512;
             buf[off..off + bytes].copy_from_slice(&self.mem.bounce[..bytes]);
             done += chunk;
@@ -369,14 +380,38 @@ impl BlockDriver for AhciPort {
             let bytes = chunk as usize * 512;
             let off = done as usize * 512;
             self.mem.bounce[..bytes].copy_from_slice(&buf[off..off + bytes]);
-            self.issue(ATA_WRITE_DMA_EXT, lba + done as u64, chunk as u16, bytes, true)?;
+            self.issue(ATA_WRITE_DMA_EXT, lba + done as u64, chunk as u16, bytes, true, 0)?;
             done += chunk;
         }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), BlkError> {
-        self.issue(ATA_FLUSH_CACHE_EXT, 0, 0, 0, false)
+        self.issue(ATA_FLUSH_CACHE_EXT, 0, 0, 0, false, 0)
+    }
+
+    /// DATA SET MANAGEMENT / TRIM. The payload is 512-byte blocks of 8-byte
+    /// range entries - 48-bit LBA in the low bits, a 16-bit sector count in
+    /// the top - so one block describes up to 64 ranges; long discards loop
+    fn discard(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
+        if !self.has_trim {
+            return Err(BlkError::Unsupported);
+        }
+        let mut done = 0u32;
+        while done < count {
+            self.mem.bounce[..512].fill(0);
+            let mut used = 0usize;
+            while used < 64 && done < count {
+                let n = (count - done).min(0xFFFF);
+                let entry = ((lba + done as u64) & 0xFFFF_FFFF_FFFF) | ((n as u64) << 48);
+                self.mem.bounce[used * 8..used * 8 + 8].copy_from_slice(&entry.to_le_bytes());
+                used += 1;
+                done += n;
+            }
+            // LBA is reserved for DSM; count = number of 512-byte range blocks
+            self.issue(ATA_DSM, 0, 1, 512, true, DSM_FEATURE_TRIM)?;
+        }
+        Ok(())
     }
 
     fn info(&mut self) -> BlockDevInfo {
@@ -385,6 +420,7 @@ impl BlockDriver for AhciPort {
         out.lba48 = true;
         out.model = self.model;
         out.model_len = self.model_len;
+        out.discard = self.has_trim;
         out
     }
 }

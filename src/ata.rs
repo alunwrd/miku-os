@@ -37,13 +37,15 @@ pub struct AtaDrive {
     role:      AtaRole,
     /// Bus-master DMA capability cache: 0 = unknown, 1 = usable, 2 = PIO only
     dma_state: u8,
+    /// TRIM capability cache, same encoding (needs DMA + IDENTIFY word 169 bit 0)
+    trim_state: u8,
 }
 
 impl AtaDrive {
-    pub const EMPTY: Self = Self { base_port: 0, role: AtaRole::Master, dma_state: 0 };
+    pub const EMPTY: Self = Self { base_port: 0, role: AtaRole::Master, dma_state: 0, trim_state: 0 };
 
     pub const fn new(base_port: u16, role: AtaRole) -> Self {
-        Self { base_port, role, dma_state: 0 }
+        Self { base_port, role, dma_state: 0, trim_state: 0 }
     }
 
     pub fn primary()         -> Self { Self::new(0x1F0, AtaRole::Master) }
@@ -407,6 +409,7 @@ const CMD_READ_DMA:      u8 = 0xC8;
 const CMD_WRITE_DMA:     u8 = 0xCA;
 const CMD_READ_DMA_EXT:  u8 = 0x25;
 const CMD_WRITE_DMA_EXT: u8 = 0x35;
+const CMD_DSM:           u8 = 0x06; // DATA SET MANAGEMENT (TRIM)
 
 const BM_CMD_START: u8 = 0x01;
 const BM_CMD_READ:  u8 = 0x08; // direction: device -> memory
@@ -628,6 +631,119 @@ impl AtaDrive {
         Ok(())
     }
 
+    /// Program the task file for DATA SET MANAGEMENT / TRIM: FEATURES bit 0
+    /// selects TRIM, COUNT is the number of 512-byte range blocks (always 1
+    /// here). 48-bit registers take high byte first, like 'prepare_dma_taskfile'
+    unsafe fn prepare_dsm_taskfile(&mut self) -> Result<(), AtaError> {
+        let bp = self.base_port;
+        if Port::<u8>::new(bp + 7).read() == 0xFF {
+            return Err(AtaError::NoDevice);
+        }
+
+        Port::<u8>::new(self.control_port()).write(0x00);
+        self.wait_not_busy()?;
+
+        let dev = if self.role == AtaRole::Slave { 1u8 << 4 } else { 0 };
+        Port::<u8>::new(bp + 6).write(0x40 | dev);
+        self.delay_400ns();
+
+        // High bytes
+        Port::<u8>::new(bp + 1).write(0x00); // FEATURES(15:8)
+        Port::<u8>::new(bp + 2).write(0x00); // COUNT(15:8)
+        Port::<u8>::new(bp + 3).write(0);
+        Port::<u8>::new(bp + 4).write(0);
+        Port::<u8>::new(bp + 5).write(0);
+        // Low bytes
+        Port::<u8>::new(bp + 1).write(0x01); // FEATURES(7:0) = TRIM
+        Port::<u8>::new(bp + 2).write(0x01); // COUNT(7:0) = 1 range block
+        Port::<u8>::new(bp + 3).write(0);
+        Port::<u8>::new(bp + 4).write(0);
+        Port::<u8>::new(bp + 5).write(0);
+
+        Port::<u8>::new(bp + 7).write(CMD_DSM);
+        self.delay_400ns();
+        Ok(())
+    }
+
+    /// One DATA SET MANAGEMENT / TRIM command carrying a single 512-byte
+    /// block of range entries, moved by the bus-master engine (TRIM data is
+    /// a DMA-out transfer, so there is no PIO fallback)
+    fn dma_dsm_trim(&mut self, block: &[u8; 512]) -> Result<(), AtaError> {
+        let mut guard = bm_channel(self.base_port).lock();
+        let ch = guard.as_mut().ok_or(AtaError::NoDevice)?;
+        let bm = ch.bm_base;
+
+        ch.mem.bounce[..512].copy_from_slice(block);
+
+        let bounce_phys = crate::net::virt_to_phys(ch.mem.bounce.as_ptr() as u64);
+        let prdt_phys   = crate::net::virt_to_phys(ch.mem.prdt.as_ptr() as u64);
+        if bounce_phys + 512 > u32::MAX as u64 || prdt_phys > u32::MAX as u64 {
+            return Err(AtaError::DeviceFault);
+        }
+        ch.mem.prdt[0..4].copy_from_slice(&(bounce_phys as u32).to_le_bytes());
+        ch.mem.prdt[4..6].copy_from_slice(&512u16.to_le_bytes());
+        ch.mem.prdt[6..8].copy_from_slice(&0x8000u16.to_le_bytes()); // EOT
+
+        unsafe {
+            Port::<u8>::new(bm).write(0);
+            Port::<u32>::new(bm + 4).write(prdt_phys as u32);
+            Port::<u8>::new(bm + 2).write(BM_ST_ERROR | BM_ST_IRQ);
+
+            irq_flag(self.base_port).store(false, core::sync::atomic::Ordering::Release);
+
+            self.prepare_dsm_taskfile()?;
+
+            // Memory -> device, like a write
+            Port::<u8>::new(bm).write(BM_CMD_START);
+
+            let mut status_port = Port::<u8>::new(bm + 2);
+            let mut spins = 0u64;
+            let ok = loop {
+                let st = status_port.read();
+                if st & BM_ST_ERROR != 0 {
+                    break false;
+                }
+                let done = irq_flag(self.base_port).load(core::sync::atomic::Ordering::Acquire)
+                    || st & BM_ST_IRQ != 0
+                    || st & BM_ST_ACTIVE == 0;
+                if done {
+                    break true;
+                }
+                crate::block::io_relax(spins);
+                spins += 1;
+                if spins > 200_000_000 {
+                    break false;
+                }
+            };
+
+            Port::<u8>::new(bm).write(0);
+            Port::<u8>::new(bm + 2).write(BM_ST_ERROR | BM_ST_IRQ);
+
+            if !ok {
+                return Err(AtaError::Timeout);
+            }
+
+            let status = self.wait_not_busy()?;
+            Self::check_status(status)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve (once) whether this drive accepts TRIM: our path moves the
+    /// range payload via bus-master DMA, and IDENTIFY word 169 bit 0 must
+    /// advertise DATA SET MANAGEMENT
+    fn trim_capable(&mut self) -> bool {
+        if self.trim_state == 0 {
+            let chan = bm_channel(self.base_port).lock().is_some();
+            let drive = match self.identify() {
+                Ok(w) => w[169] & 1 != 0,
+                Err(_) => false,
+            };
+            self.trim_state = if chan && drive { 1 } else { 2 };
+        }
+        self.trim_state == 1
+    }
+
     /// Resolve (once) whether this drive can use bus-master DMA: the
     /// controller must expose a BM block and IDENTIFY word 49 bit 8 must be
     /// set.
@@ -788,6 +904,28 @@ impl BlockDriver for AtaDrive {
         AtaDrive::flush(self).map_err(Into::into)
     }
 
+    /// TRIM via DATA SET MANAGEMENT: 8-byte range entries (48-bit LBA +
+    /// 16-bit count), 64 per 512-byte block, one block per DMA command
+    fn discard(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
+        if !self.trim_capable() {
+            return Err(BlkError::Unsupported);
+        }
+        let mut done = 0u32;
+        while done < count {
+            let mut block = [0u8; 512];
+            let mut used = 0usize;
+            while used < 64 && done < count {
+                let n = (count - done).min(0xFFFF);
+                let entry = ((lba + done as u64) & 0xFFFF_FFFF_FFFF) | ((n as u64) << 48);
+                block[used * 8..used * 8 + 8].copy_from_slice(&entry.to_le_bytes());
+                used += 1;
+                done += n;
+            }
+            self.dma_dsm_trim(&block)?;
+        }
+        Ok(())
+    }
+
     fn health(&mut self) -> Option<HealthInfo> {
         let ok = self.smart_status()?;
         let mut h = HealthInfo::unknown_ok();
@@ -799,6 +937,8 @@ impl BlockDriver for AtaDrive {
         let mut out = BlockDevInfo::unknown();
         if let Ok(words) = self.identify() {
             out.lba48 = words[83] & (1 << 10) != 0;
+            out.discard = words[169] & 1 != 0
+                && bm_channel(self.base_port).lock().is_some();
             let lba28 = (words[60] as u64) | ((words[61] as u64) << 16);
             let lba48 = (words[100] as u64)
                 | ((words[101] as u64) << 16)

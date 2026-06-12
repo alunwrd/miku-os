@@ -41,7 +41,7 @@ pub fn proc_read(name: &str, buf: &mut [u8], vnode_used: usize) -> VfsResult<usi
     let mut tmp = [0u8; 192];
     let len = match name {
         "version" => {
-            let s = b"MikuOS v0.2.6-rc (x86_64)\nbuilt with love <3\n";
+            let s = b"MikuOS v0.2.7-rc (x86_64)\nbuilt with love <3\n";
             let l = s.len().min(192);
             tmp[..l].copy_from_slice(&s[..l]);
             l
@@ -188,7 +188,7 @@ pub const PROC_ENTRIES: &[&str] = &[
 ];
 
 /// Linux /proc/diskstats analogue, one line per active block device:
-/// name kind ios sectors_read sectors_written errors retries avg_latency_us
+/// name kind ios sectors_read sectors_written sectors_discarded errors retries avg_latency_us
 fn format_diskstats(buf: &mut [u8; 1024]) -> usize {
     use core::fmt::Write;
 
@@ -221,9 +221,9 @@ fn format_diskstats(buf: &mut [u8; 1024]) -> usize {
         };
         let _ = writeln!(
             w,
-            "blk{} {} {} {} {} {} {} {}",
+            "blk{} {} {} {} {} {} {} {} {}",
             id, kind, st.ios, st.sectors_read, st.sectors_written,
-            st.io_errors, st.retries, st.avg_io_us
+            st.sectors_discarded, st.io_errors, st.retries, st.avg_io_us
         );
     }
     w.pos

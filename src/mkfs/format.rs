@@ -204,6 +204,25 @@ pub fn mkfs(dev: BlockDevId, params: &MkfsParams) -> Result<MkfsReport, MkfsErro
         return Err(MkfsError::DiskTooSmall);
     }
 
+    // Like mkfs.ext4: tell the device the whole target region is dead before
+    // laying out the new filesystem, so SSDs / thin images can unmap it.
+    // Best-effort - a device without discard just formats as before
+    if crate::block::info(dev).map_or(false, |i| i.discard) {
+        crate::serial_println!(
+            "[mkfs] step 0: discarding {} sectors at LBA {}",
+            total_sectors, params.start_lba
+        );
+        let mut done = 0u64;
+        while done < total_sectors as u64 {
+            let n = (total_sectors as u64 - done).min(u32::MAX as u64) as u32;
+            if crate::block::discard(dev, params.start_lba as u64 + done, n).is_err() {
+                crate::serial_println!("[mkfs] discard failed - continuing without");
+                break;
+            }
+            done += n as u64;
+        }
+    }
+
     crate::serial_println!("[mkfs] step 1: zeroing old SB at LBA 2-3 (base={})", params.start_lba);
     w.zero_sector(2)?;
     w.zero_sector(3)?;

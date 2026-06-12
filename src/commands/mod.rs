@@ -420,6 +420,11 @@ pub fn execute(input: &str) {
         "swapoff"    => disk_cmds::cmd_swapoff(),
         "swapinfo"   => disk_cmds::cmd_swapinfo(),
         "blkstat"    => disk_cmds::cmd_blkstat(),
+        "blkdiscard" => {
+            if a1.is_empty() { println!("Usage: blkdiscard <drive 0-7> [lba count]"); }
+            else { disk_cmds::cmd_blkdiscard(rest); }
+        }
+        "fstrim"     => disk_cmds::cmd_fstrim(),
         "smart"      => disk_cmds::cmd_smart(a1),
         "swapon.raw" => disk_cmds::cmd_swapon_raw(rest),
         "swapon.auto"=> disk_cmds::cmd_swapon_auto(),

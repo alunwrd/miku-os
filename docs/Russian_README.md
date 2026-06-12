@@ -1067,6 +1067,8 @@ bits 12.. = номер swap слота
 | `mkfs.ext3 <drive>` | Форматирование ext3 (с журналом) |
 | `mkfs.ext4 <drive>` | Форматирование ext4 (экстенты + журнал) |
 | `blkstat` | Показать все блочные устройства (ATA/AHCI/NVMe/virtio-blk) + дерево GPT-разделов + BIO-очередь + статистика кэша |
+| `blkdiscard <drive> [lba count]` | Discard/TRIM диапазона секторов (без диапазона - весь диск); аналог blkdiscard(8) |
+| `fstrim` | Discard всех свободных блоков активной смонтированной ext-ФС по битмапам групп; аналог fstrim(8) |
 | `smart <drive>` | SMART / NVMe отчёт здоровья: статус, температура, износ, часы работы, объём R/W |
 | `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run форматирование (только layout) |
 | `gpt <drive>` | Показать таблицу GPT |
@@ -1250,10 +1252,12 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | `block::write(dev, lba, count, buf)` | Write-back: данные попадают в кэш, запись на диск - при flush/вытеснении |
 | `block::write_sync(dev, lba, count, buf)` | Write-through: запись завершается до возврата (журналы, GPT, swap) |
 | `block::flush(dev)` | Сброс грязных чанков (elevator-порядок) + flush volatile-кэша устройства |
-| `block::info(dev)` | Геометрия / идентичность устройства |
-| `block::cache_stats()` | `(hits, misses, readaheads, dirty)` |
+| `block::discard(dev, lba, count)` | Discard/TRIM диапазона секторов; полностью покрытые чанки кэша сбрасываются (включая грязные) до команды устройству |
+| `MikuFS::trim_free_blocks(minlen)` | FITRIM: обход битмапов групп смонтированной ФС, discard серий свободных блоков (команда `fstrim`); mkfs.* предварительно discard-ит всю область |
+| `block::info(dev)` | Геометрия / идентичность устройства (включая флаг `discard`) |
+| `block::cache_stats()` | `(hits, misses, readaheads, write_merges, dirty)` |
 | `block::io_stats()` | `(submitted, completed, errors)` из BIO-очереди |
-| `block::dev_stats(dev)` | `(kind, sectors_read, sectors_written, ios, avg_io_us)` на устройство |
+| `block::dev_stats(dev)` | `(kind, sectors_read, sectors_written, sectors_discarded, ios, avg_io_us)` на устройство |
 | `block::health(dev)` | SMART / NVMe снимок здоровья; `None` если бэкенд не поддерживает |
 
 #### Буферный кэш
@@ -1266,6 +1270,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **Политика** | Write-back; `write_sync` - write-through для упорядоченных записей |
 | **Readahead** | Адаптивный: 32 KiB на свежий последовательный поток, до 64 KiB (16 чанков) на устойчивый |
 | **Грязный лимит** | Flush при 256 грязных чанках (high-water mark) |
+| **Слияние записей** | Смежные грязные чанки объединяются в одну команду драйвера до 64 KiB при writeback |
 | **bdflush** | Фоновый сервис mikuD: каждые 2 с сбрасывает грязные чанки на диск (элеваторная развёртка по LBA) |
 | **Когерентность** | Все дисковые обращения ядра идут через `crate::block`; второго пути нет |
 
@@ -1281,9 +1286,10 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **PCI-класс** | 01.06 (Mass Storage / SATA AHCI) |
 | **Регистры** | BAR5 (ABAR) MMIO, mapped uncached через HHDM |
 | **Макс. портов** | 4 SATA-диска за probe |
-| **Команды** | READ DMA EXT, WRITE DMA EXT, FLUSH CACHE EXT, IDENTIFY |
+| **Команды** | READ DMA EXT, WRITE DMA EXT, FLUSH CACHE EXT, IDENTIFY, DATA SET MANAGEMENT (TRIM) |
 | **Завершение** | Полинг PxCI |
 | **Буфер** | 64 KiB bounce buffer, одна PRD-запись |
+| **TRIM** | Поддержка по слову 169 IDENTIFY; 8-байтные диапазоны, 64 на 512-байтный блок |
 
 #### NVMe
 
@@ -1293,7 +1299,8 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **Передача** | До 128 секторов (64 KiB) на команду через PRP1 + PRP list page |
 | **Завершение** | Полинг CQ phase bit |
 | **Память** | Один page-aligned аллок: admin SQ/CQ, I/O SQ/CQ, PRP list, IDENTIFY, bounce |
-| **Опкоды** | NVM READ (0x02), NVM WRITE (0x01), NVM FLUSH (0x00) |
+| **Опкоды** | NVM READ (0x02), NVM WRITE (0x01), NVM FLUSH (0x00), NVM DSM (0x09, deallocate = discard) |
+| **Discard** | Dataset Management с атрибутом deallocate; поддержка по биту 2 ONCS |
 | **Здоровье** | Get Log Page (LID 0x02) - SMART/Health Information (512 байт): температура, износ, POH, объём R/W |
 
 #### virtio-blk (legacy/transitional)
@@ -1304,7 +1311,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **Кольцо** | Layout вычисляется runtime из размера очереди устройства |
 | **Макс. очередь** | 256 дескрипторов |
 | **Передача** | До 128 секторов (64 KiB) на запрос; большие - чанкуются block layer |
-| **Возможности** | FEATURE_BLK_FLUSH (bit 9) согласован |
+| **Возможности** | FLUSH (bit 9) и DISCARD (bit 13) согласованы; discard ограничен `max_discard_sectors` из конфига |
 
 #### ATA (legacy PIO)
 
@@ -1316,6 +1323,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **Защита** | Flush кэша после записи, таймаут 50K итераций |
 | **Адресация** | LBA28 (до 128 ГБ) + **LBA48** (READ/WRITE EXT, 48-бит адресация) |
 | **DMA** | Определение и отслеживание возможности bus-master DMA |
+| **TRIM** | DATA SET MANAGEMENT через bus-master DMA; поддержка по слову 169 IDENTIFY |
 | **Здоровье** | SMART RETURN STATUS (cmd 0xB0/feature 0xDA): подпись LBA mid/high - здоровый или отказывающий |
 
 </details>

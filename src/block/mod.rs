@@ -40,9 +40,10 @@ struct DeviceSlot {
     driver: Box<dyn BlockDriver>,
     info:   BlockDevInfo,
     kind:   DevKind,
-    /// Bytes read / written, for 'iostat'-style reporting
-    sectors_read:    u64,
-    sectors_written: u64,
+    /// Bytes read / written / discarded, for 'iostat'-style reporting
+    sectors_read:      u64,
+    sectors_written:   u64,
+    sectors_discarded: u64,
     /// Failed requests (after retries) and retry attempts that recovered
     io_errors: u64,
     retries:   u64,
@@ -109,6 +110,7 @@ pub fn register_ata(drive: AtaDrive) -> BlockDevId {
             kind: DevKind::Ata,
             sectors_read: 0,
             sectors_written: 0,
+            sectors_discarded: 0,
             io_errors: 0,
             retries: 0,
             total_io_us: 0,
@@ -154,6 +156,7 @@ fn register_dynamic(mut boxed: Box<dyn BlockDriver>, kind: DevKind, label: &str)
         kind,
         sectors_read: 0,
         sectors_written: 0,
+        sectors_discarded: 0,
         io_errors: 0,
         retries: 0,
         total_io_us: 0,
@@ -416,24 +419,29 @@ pub fn write_sync(dev_id: BlockDevId, lba: u64, count: u32, buf: &[u8]) -> Resul
 }
 
 /// Write out every dirty chunk of 'dev_id' in ascending LBA order - a
-/// single elevator sweep across the disk. Returns how many chunks went out
+/// single elevator sweep across the disk. Adjacent dirty chunks coalesce
+/// into one driver command of up to 64 KiB (the block layer's request
+/// merging). Returns how many chunks went out
 fn flush_dirty_only(dev_id: BlockDevId) -> Result<usize, BlkError> {
-    let mut tmp = [0u8; cache::CHUNK_BYTES];
+    /// Merge window: 16 chunks = 64 KiB = one full driver transfer
+    const MERGE_CHUNKS: usize = 16;
+    let mut tmp = [0u8; MERGE_CHUNKS * cache::CHUNK_BYTES];
     let mut after = 0u64;
     let mut flushed = 0usize;
     loop {
-        let chunk = match CACHE.lock().as_mut().and_then(|c| {
-            c.pop_dirty_sorted(dev_id, after, &mut tmp)
+        let (chunk, n) = match CACHE.lock().as_mut().and_then(|c| {
+            c.pop_dirty_run(dev_id, after, &mut tmp, MERGE_CHUNKS)
         }) {
-            Some(c) => c,
+            Some(run) => run,
             None => break,
         };
         let lba = chunk * cache::CHUNK_SECTORS;
-        dispatch(dev_id, BioDirection::Write, lba, cache::CHUNK_SECTORS as u32, |drv| {
-            drv.write_blocks(lba, cache::CHUNK_SECTORS as u32, &tmp)
+        let sectors = (n as u64 * cache::CHUNK_SECTORS) as u32;
+        dispatch(dev_id, BioDirection::Write, lba, sectors, |drv| {
+            drv.write_blocks(lba, sectors, &tmp[..n * cache::CHUNK_BYTES])
         })?;
-        after = chunk + 1;
-        flushed += 1;
+        after = chunk + n as u64;
+        flushed += n;
     }
     Ok(flushed)
 }
@@ -473,11 +481,11 @@ fn driver_read(dev_id: BlockDevId, lba: u64, count: u32, buf: &mut [u8]) -> Resu
     dispatch(dev_id, BioDirection::Read, lba, count, |drv| drv.read_blocks(lba, count, buf))
 }
 
-/// '(hits, misses, readaheads, dirty)' from the shared buffer cache
-pub fn cache_stats() -> (u64, u64, u64, u64) {
+/// '(hits, misses, readaheads, write_merges, dirty)' from the shared buffer cache
+pub fn cache_stats() -> (u64, u64, u64, u64, u64) {
     match CACHE.lock().as_ref() {
-        Some(c) => (c.hits, c.misses, c.readaheads, c.dirty_count() as u64),
-        None => (0, 0, 0, 0),
+        Some(c) => (c.hits, c.misses, c.readaheads, c.write_merges, c.dirty_count() as u64),
+        None => (0, 0, 0, 0, 0),
     }
 }
 
@@ -486,26 +494,28 @@ pub fn dev_stats(dev_id: BlockDevId) -> Option<DevStats> {
     let slot = slot_ref(dev_id)?;
     let guard = slot.lock();
     Some(DevStats {
-        kind:            guard.kind,
-        sectors_read:    guard.sectors_read,
-        sectors_written: guard.sectors_written,
-        io_errors:       guard.io_errors,
-        retries:         guard.retries,
-        avg_io_us:       if guard.io_count > 0 { guard.total_io_us / guard.io_count } else { 0 },
-        ios:             guard.io_count,
+        kind:              guard.kind,
+        sectors_read:      guard.sectors_read,
+        sectors_written:   guard.sectors_written,
+        sectors_discarded: guard.sectors_discarded,
+        io_errors:         guard.io_errors,
+        retries:           guard.retries,
+        avg_io_us:         if guard.io_count > 0 { guard.total_io_us / guard.io_count } else { 0 },
+        ios:               guard.io_count,
     })
 }
 
 /// Snapshot of a device's accounting counters for 'blkstat'
 #[derive(Clone, Copy)]
 pub struct DevStats {
-    pub kind:            DevKind,
-    pub sectors_read:    u64,
-    pub sectors_written: u64,
-    pub io_errors:       u64,
-    pub retries:         u64,
-    pub avg_io_us:       u64,
-    pub ios:             u64,
+    pub kind:              DevKind,
+    pub sectors_read:      u64,
+    pub sectors_written:   u64,
+    pub sectors_discarded: u64,
+    pub io_errors:         u64,
+    pub retries:           u64,
+    pub avg_io_us:         u64,
+    pub ios:               u64,
 }
 
 /// SMART-style health report from the device (NVMe health log, ATA SMART).
@@ -519,6 +529,30 @@ pub fn health(dev_id: BlockDevId) -> Option<driver::HealthInfo> {
     } else {
         guard.driver.health()
     }
+}
+
+/// Tell the device a sector range no longer holds useful data (TRIM /
+/// NVMe deallocate / virtio discard). The range's contents become
+/// indeterminate. Cache chunks fully inside the range are dropped first -
+/// dirty ones included, their data is dead by definition - so writeback
+/// can't re-materialize discarded sectors; partially-covered edge chunks
+/// stay resident, since their out-of-range sectors are still live
+pub fn discard(dev_id: BlockDevId, lba: u64, count: u32) -> Result<(), BlkError> {
+    let Some(inf) = info(dev_id) else { return Err(BlkError::NoDevice) };
+    if !inf.discard {
+        return Err(BlkError::Unsupported);
+    }
+    // Clamp to the device: discarding past the end is a no-op, not an error
+    let end = (lba + count as u64).min(inf.total_sectors);
+    if lba >= end {
+        return Ok(());
+    }
+    let count = (end - lba) as u32;
+
+    if let Some(c) = CACHE.lock().as_mut() {
+        c.invalidate_covered(dev_id, lba, count);
+    }
+    dispatch(dev_id, BioDirection::Discard, lba, count, |drv| drv.discard(lba, count))
 }
 
 /// Flush barrier: drain the device's dirty chunks (elevator-ordered), then
@@ -603,7 +637,10 @@ where
         Ok(()) => match dir {
             BioDirection::Read => guard.sectors_read += count as u64,
             BioDirection::Write => guard.sectors_written += count as u64,
+            BioDirection::Discard => guard.sectors_discarded += count as u64,
         },
+        // Unsupported is a capability answer, not an I/O failure
+        Err(BlkError::Unsupported) => {}
         Err(_) => guard.io_errors += 1,
     }
     drop(guard);

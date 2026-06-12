@@ -1059,6 +1059,8 @@ immutableフラグにより unlink / write / rename は拒否されます。
 | コマンド | 説明 |
 |:--|:--|
 | `blkstat` | 全ブロックデバイス (ATA/AHCI/NVMe/virtio-blk) + GPT パーティションツリー + BIO キュー + キャッシュ統計 |
+| `blkdiscard <drive> [lba count]` | セクター範囲の discard/TRIM (範囲省略でディスク全体); blkdiscard(8) 相当 |
+| `fstrim` | アクティブなマウント済み ext FS の全フリーブロックをグループビットマップ走査で discard; fstrim(8) 相当 |
 | `smart <drive>` | SMART / NVMe ヘルスレポート: ステータス・温度・消耗度・電源投入時間・読み書き量 |
 | `mkfs.ext2 <drive>` | ext2フォーマット |
 | `mkfs.ext3 <drive>` | ext3フォーマット (ジャーナル付き) |
@@ -1221,10 +1223,12 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 | `block::write(dev, lba, count, buf)` | ライトバック: キャッシュに記録、フラッシュ/追い出し時にディスクへ |
 | `block::write_sync(dev, lba, count, buf)` | ライトスルー: 戻る前にデバイス書き込み完了 (ジャーナル、GPT、swap) |
 | `block::flush(dev)` | ダーティチャンクのドレイン (エレベーター順) + デバイスライトキャッシュフラッシュ |
-| `block::info(dev)` | デバイスのジオメトリ / 識別情報 |
-| `block::cache_stats()` | `(hits, misses, readaheads, dirty)` |
+| `block::discard(dev, lba, count)` | セクター範囲の discard/TRIM; 完全に覆われたキャッシュチャンク (ダーティ含む) はデバイスコマンド前に破棄 |
+| `MikuFS::trim_free_blocks(minlen)` | FITRIM: マウント済み FS のグループビットマップを走査しフリーブロック連を discard (`fstrim` コマンド); `mkfs.*` はフォーマット前に対象領域全体を discard |
+| `block::info(dev)` | デバイスのジオメトリ / 識別情報 (`discard` 対応フラグ含む) |
+| `block::cache_stats()` | `(hits, misses, readaheads, write_merges, dirty)` |
 | `block::io_stats()` | BIO キューの `(submitted, completed, errors)` |
-| `block::dev_stats(dev)` | デバイスごとの `(kind, sectors_read, sectors_written, ios, avg_io_us)` |
+| `block::dev_stats(dev)` | デバイスごとの `(kind, sectors_read, sectors_written, sectors_discarded, ios, avg_io_us)` |
 | `block::health(dev)` | SMART / NVMe ヘルススナップショット; バックエンドが対応しない場合は `None` |
 
 #### バッファキャッシュ
@@ -1237,6 +1241,7 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 | **ポリシー** | ライトバック; `write_sync` は順序付き書き込みのライトスルー |
 | **リードアヘッド** | 適応型: 新規シーケンシャルストリームは 32 KiB、持続時は最大 64 KiB (16 チャンク) |
 | **ダーティ上限** | 256 ダーティチャンクでフラッシュ (ハイウォーターマーク) |
+| **書き込みマージ** | 隣接ダーティチャンクをライトバック時に最大 64 KiB の単一ドライバーコマンドへ結合 |
 | **bdflush** | mikuD バックグラウンドサービス: 2 秒ごとにダーティチャンクをディスクへ掃き出し (LBA 昇順エレベーター) |
 | **コヒーレンス** | カーネルの全ディスクアクセスは `crate::block` 経由; 第二のパスは存在しない |
 
@@ -1252,9 +1257,10 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 | **PCI クラス** | 01.06 (Mass Storage / SATA AHCI) |
 | **レジスタ** | BAR5 (ABAR) MMIO、HHDM 経由でアンキャッシュマッピング |
 | **最大ポート数** | probe 1回あたり SATA ディスク 4 台 |
-| **コマンド** | READ DMA EXT、WRITE DMA EXT、FLUSH CACHE EXT、IDENTIFY |
+| **コマンド** | READ DMA EXT、WRITE DMA EXT、FLUSH CACHE EXT、IDENTIFY、DATA SET MANAGEMENT (TRIM) |
 | **完了** | PxCI ポーリング |
 | **バッファ** | 64 KiB バウンスバッファ、単一 PRD エントリ |
+| **TRIM** | IDENTIFY ワード 169 で対応判定; 8 バイトレンジエントリを 512 バイトブロックに 64 個 |
 
 #### NVMe
 
@@ -1264,7 +1270,8 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 | **転送** | PRP1 + PRP リストページで 1 コマンドあたり最大 128 セクター (64 KiB) |
 | **完了** | CQ フェーズビット ポーリング |
 | **メモリ** | ページアライン単一アロケーション: admin SQ/CQ、I/O SQ/CQ、PRP リスト、IDENTIFY、バウンス |
-| **オペコード** | NVM READ (0x02)、NVM WRITE (0x01)、NVM FLUSH (0x00) |
+| **オペコード** | NVM READ (0x02)、NVM WRITE (0x01)、NVM FLUSH (0x00)、NVM DSM (0x09、deallocate = discard) |
+| **Discard** | deallocate 属性付き Dataset Management; ONCS ビット 2 で対応判定 |
 | **ヘルス** | Get Log Page (LID 0x02) - SMART/Health Information (512 バイト): 温度・消耗度・POH・読み書き量 |
 
 #### virtio-blk (レガシー/トランジショナル)
@@ -1275,7 +1282,7 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 | **リング** | レイアウトはデバイス報告のキューサイズから実行時計算 |
 | **最大キュー** | 256 デスクリプター |
 | **転送** | リクエストあたり最大 128 セクター (64 KiB); 大きい転送はブロック層でチャンク化 |
-| **機能** | FEATURE_BLK_FLUSH (bit 9) ネゴシエーション |
+| **機能** | FLUSH (bit 9) と DISCARD (bit 13) をネゴシエーション; discard はコンフィグの `max_discard_sectors` で制限 |
 
 #### ATA (レガシー PIO)
 
@@ -1287,6 +1294,7 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 | **保護** | 書き込み後のキャッシュフラッシュ、タイムアウト 50K イテレーション |
 | **アドレス指定** | LBA28 (最大 128 GB) + **LBA48** (READ/WRITE EXT、48 ビットアドレス) |
 | **DMA** | バスマスター DMA 対応検出と状態追跡 |
+| **TRIM** | DATA SET MANAGEMENT、レンジペイロードはバスマスター DMA 経由; IDENTIFY ワード 169 で対応判定 |
 | **ヘルス** | SMART RETURN STATUS (cmd 0xB0/feature 0xDA): LBA mid/high シグネチャで健康/故障を判定 |
 
 </details>

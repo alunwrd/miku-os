@@ -1007,6 +1007,8 @@ Drive indices 0-3 address the legacy ATA slots, 4-7 the PCI-probed devices
 | Command | Description |
 |:--|:--|
 | `blkstat` | Block layer overview: devices, per-device I/O counters, bio queue, buffer cache hit rate / dirty count |
+| `blkdiscard <drive> [lba count]` | Discard/TRIM a sector range (whole device when no range given) |
+| `fstrim` | Discard all free blocks of the active mounted ext filesystem (fstrim(8) analogue) |
 | `mkfs.ext2 <drive>` | Format ext2 |
 | `mkfs.ext3 <drive>` | Format ext3 (with journal) |
 | `mkfs.ext4 <drive>` | Format ext4 (extents + journal) |
@@ -1076,7 +1078,9 @@ ATA PIO/DMA | AHCI | virtio-blk | NVMe
 | Component | Description |
 |:--|:--|
 | **Device registry** | 8 devices behind stable `BlockDevId`: 0-3 legacy ATA slots, 4-7 PCI-probed (AHCI/NVMe/virtio) |
-| **`BlockDriver` trait** | `read_blocks` / `write_blocks` / `flush` / `info`, 64-bit LBA |
+| **`BlockDriver` trait** | `read_blocks` / `write_blocks` / `flush` / `discard` / `info`, 64-bit LBA |
+| **Discard/TRIM** | `block::discard()` across all four backends (ATA/AHCI DSM TRIM, NVMe DSM deallocate, virtio-blk discard); fully covered cache chunks dropped before the device command |
+| **fstrim** | Filesystem-aware trim: walks ext block-group bitmaps and discards free-block runs; `mkfs.*` pre-discards the target region like real mkfs.ext4 |
 | **Per-device locks** | I/O to distinct devices runs in parallel; legacy ATA slots share a bus lock (master/slave share ports) |
 | **Bio queue** | Live request accounting: submitted / completed / errors |
 | **Retries** | Transient errors (timeout / device fault) get up to 2 transparent re-issues; per-device error and retry counters |
@@ -1093,6 +1097,7 @@ ATA PIO/DMA | AHCI | virtio-blk | NVMe
 | **Writes** | Write-back: data lands in RAM, the call returns; sub-chunk writes do read-modify-write |
 | **Barriers** | `write_sync` path for ordered data (ext3 journal records, GPT tables, swap headers); `flush` drains dirty chunks in ascending-LBA order (elevator sweep), then flushes the device cache |
 | **bdflush** | Background mikuD service: sweeps dirty chunks to disk every 2 s |
+| **Write merging** | Adjacent dirty chunks coalesce into one driver command of up to 64 KiB during writeback |
 | **Backpressure** | Writers drain at >50% dirty; dirty evictions write out before reuse |
 | **Coherence** | By construction - the block layer is the only path to the disk |
 
@@ -1100,10 +1105,10 @@ ATA PIO/DMA | AHCI | virtio-blk | NVMe
 
 | Driver | Details |
 |:--|:--|
-| **ATA (IDE)** | PIO + bus-master DMA (PRDT, 64 KiB bounce, IRQ14/15 completion flags), LBA28/LBA48, IDENTIFY, automatic PIO fallback |
-| **AHCI (SATA)** | PCI 01.06, MMIO ABAR, port bring-up per spec (ST/FRE stop, command list / received FIS / command table), H2D FIS commands, polled PxCI |
-| **NVMe** | PCI 01.08, controller reset + admin queue pair, IDENTIFY controller/namespace, I/O queue pair (qd 64), PRP1 + PRP list, phase-bit completion |
-| **virtio-blk** | Legacy virtio-pci transport, ring layout computed from the device queue size, 3-descriptor requests, `VIRTIO_BLK_F_FLUSH` |
+| **ATA (IDE)** | PIO + bus-master DMA (PRDT, 64 KiB bounce, IRQ14/15 completion flags), LBA28/LBA48, IDENTIFY, automatic PIO fallback, TRIM via DMA |
+| **AHCI (SATA)** | PCI 01.06, MMIO ABAR, port bring-up per spec (ST/FRE stop, command list / received FIS / command table), H2D FIS commands, polled PxCI, TRIM |
+| **NVMe** | PCI 01.08, controller reset + admin queue pair, IDENTIFY controller/namespace, I/O queue pair (qd 64), PRP1 + PRP list, phase-bit completion, DSM deallocate |
+| **virtio-blk** | Legacy virtio-pci transport, ring layout computed from the device queue size, 3-descriptor requests, `VIRTIO_BLK_F_FLUSH` + `VIRTIO_BLK_F_DISCARD` |
 
 All four share a 64 KiB bounce buffer model (128 sectors per command) and are
 exercised by the same test suite: `swaptest` byte-verifies 256 pages through

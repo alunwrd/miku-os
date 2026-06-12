@@ -34,15 +34,17 @@ const STATUS_DRIVER:      u8 = 0x02;
 const STATUS_DRIVER_OK:   u8 = 0x04;
 const STATUS_FAILED:      u8 = 0x80;
 
-const FEATURE_BLK_FLUSH: u32 = 1 << 9;
+const FEATURE_BLK_FLUSH:   u32 = 1 << 9;
+const FEATURE_BLK_DISCARD: u32 = 1 << 13;
 
 const VRING_DESC_F_NEXT:  u16 = 0x0001;
 const VRING_DESC_F_WRITE: u16 = 0x0002;
 
 // Request types (virtio-blk header 'type_' field)
-const VIRTIO_BLK_T_IN:    u32 = 0; // device -> driver (read)
-const VIRTIO_BLK_T_OUT:   u32 = 1; // driver -> device (write)
-const VIRTIO_BLK_T_FLUSH: u32 = 4;
+const VIRTIO_BLK_T_IN:      u32 = 0; // device -> driver (read)
+const VIRTIO_BLK_T_OUT:     u32 = 1; // driver -> device (write)
+const VIRTIO_BLK_T_FLUSH:   u32 = 4;
+const VIRTIO_BLK_T_DISCARD: u32 = 11; // payload: discard segments, no data
 
 // Request status byte written by the device
 const VIRTIO_BLK_S_OK: u8 = 0;
@@ -88,6 +90,10 @@ pub struct VirtioBlk {
     last_used: u16,
     capacity:  u64,
     has_flush: bool,
+    /// VIRTIO_BLK_F_DISCARD negotiated; 'max_discard' is the per-request
+    /// sector cap from device config (0 = device stated no limit)
+    has_discard: bool,
+    max_discard: u32,
 }
 
 macro_rules! ior16 { ($base:expr, $off:expr) => { unsafe { Port::<u16>::new($base + $off).read() } } }
@@ -151,8 +157,10 @@ impl VirtioBlk {
         iow8!(io_base, REG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
         let dev_features = ior32!(io_base, REG_DEVICE_FEATURES);
-        let has_flush = dev_features & FEATURE_BLK_FLUSH != 0;
-        iow32!(io_base, REG_GUEST_FEATURES, dev_features & FEATURE_BLK_FLUSH);
+        let has_flush   = dev_features & FEATURE_BLK_FLUSH != 0;
+        let has_discard = dev_features & FEATURE_BLK_DISCARD != 0;
+        iow32!(io_base, REG_GUEST_FEATURES,
+            dev_features & (FEATURE_BLK_FLUSH | FEATURE_BLK_DISCARD));
 
         // Queue 0 is the only virtio-blk request queue
         iow16!(io_base, REG_QUEUE_SELECT, 0);
@@ -181,6 +189,8 @@ impl VirtioBlk {
             last_used: 0,
             capacity:  0,
             has_flush,
+            has_discard,
+            max_discard: 0,
         };
 
         let ring_phys = crate::net::virt_to_phys(drv.ring.0.as_ptr() as u64);
@@ -194,9 +204,15 @@ impl VirtioBlk {
         let cap_hi = ior32!(io_base, REG_CONFIG_CAPACITY + 4) as u64;
         drv.capacity = cap_lo | (cap_hi << 32);
 
+        // max_discard_sectors lives at offset 36 of the blk config block
+        if has_discard {
+            drv.max_discard = ior32!(io_base, REG_CONFIG_CAPACITY + 36);
+        }
+
         crate::serial_println!(
-            "[virtio-blk] io=0x{:04X} queue={} capacity={} sectors ({} MB) flush={}",
-            io_base, queue_num, drv.capacity, drv.capacity * 512 / (1024 * 1024), has_flush
+            "[virtio-blk] io=0x{:04X} queue={} capacity={} sectors ({} MB) flush={} discard={}",
+            io_base, queue_num, drv.capacity, drv.capacity * 512 / (1024 * 1024),
+            has_flush, has_discard
         );
         Some(drv)
     }
@@ -322,6 +338,26 @@ impl BlockDriver for VirtioBlk {
         }
     }
 
+    /// Discard: one 16-byte segment (sector, num_sectors, flags) per request
+    /// in the data descriptor, capped at the device's max_discard_sectors
+    fn discard(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
+        if !self.has_discard {
+            return Err(BlkError::Unsupported);
+        }
+        let cap = if self.max_discard == 0 { u32::MAX } else { self.max_discard };
+        let mut done = 0u32;
+        while done < count {
+            let n = (count - done).min(cap);
+            let seg_lba = lba + done as u64;
+            self.dma.data[0..8].copy_from_slice(&seg_lba.to_le_bytes());
+            self.dma.data[8..12].copy_from_slice(&n.to_le_bytes());
+            self.dma.data[12..16].copy_from_slice(&0u32.to_le_bytes());
+            self.request(VIRTIO_BLK_T_DISCARD, 0, 16)?;
+            done += n;
+        }
+        Ok(())
+    }
+
     fn info(&mut self) -> BlockDevInfo {
         let mut out = BlockDevInfo::unknown();
         out.total_sectors = self.capacity;
@@ -329,6 +365,7 @@ impl BlockDriver for VirtioBlk {
         let model = b"virtio-blk";
         out.model[..model.len()].copy_from_slice(model);
         out.model_len = model.len() as u8;
+        out.discard = self.has_discard;
         out
     }
 }

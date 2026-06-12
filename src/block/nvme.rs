@@ -41,6 +41,7 @@ const ADM_GET_LOG_PAGE: u8 = 0x02;
 const NVM_WRITE: u8 = 0x01;
 const NVM_READ:  u8 = 0x02;
 const NVM_FLUSH: u8 = 0x00;
+const NVM_DSM:   u8 = 0x09; // Dataset Management (deallocate = discard)
 
 const ADMIN_QD: usize = 16; // admin queue depth
 const IO_QD:    usize = 64; // I/O queue depth
@@ -85,6 +86,8 @@ pub struct Nvme {
     capacity:  u64,   // in 512-byte sectors
     model:     [u8; 40],
     model_len: u8,
+    /// Controller supports Dataset Management (ONCS bit 2) - the discard path
+    has_dsm:   bool,
 }
 
 #[inline]
@@ -184,6 +187,7 @@ impl Nvme {
             capacity:  0,
             model:     [0u8; 40],
             model_len: 0,
+            has_dsm:   false,
         };
 
         // Reset: clear EN, wait for RDY to drop
@@ -221,6 +225,10 @@ impl Nvme {
         }
         while n > 0 && (drv.model[n - 1] == b' ' || drv.model[n - 1] == 0) { n -= 1; }
         drv.model_len = n as u8;
+
+        // Optional NVM command support (ONCS, bytes 520-521): bit 2 = DSM
+        let oncs = u16::from_le_bytes([drv.mem.ident[520], drv.mem.ident[521]]);
+        drv.has_dsm = oncs & (1 << 2) != 0;
 
         // IDENTIFY namespace 1 (CNS=0): size + LBA format
         if drv.admin_cmd(ADM_IDENTIFY, drv.nsid, ident_phys, 0, 0).is_err() {
@@ -262,9 +270,10 @@ impl Nvme {
         }
 
         crate::serial_println!(
-            "[nvme] '{}' ns{} {} sectors ({} MB) qd={}",
+            "[nvme] '{}' ns{} {} sectors ({} MB) qd={} dsm={}",
             core::str::from_utf8(&drv.model[..drv.model_len as usize]).unwrap_or("?"),
-            drv.nsid, drv.capacity, drv.capacity * 512 / (1024 * 1024), drv.io.depth
+            drv.nsid, drv.capacity, drv.capacity * 512 / (1024 * 1024), drv.io.depth,
+            drv.has_dsm
         );
         Some(drv)
     }
@@ -449,7 +458,32 @@ impl BlockDriver for Nvme {
         out.lba48 = true;
         out.model = self.model;
         out.model_len = self.model_len;
+        out.discard = self.has_dsm;
         out
+    }
+
+    /// Dataset Management with the deallocate attribute - NVMe's discard.
+    /// A range descriptor is 16 bytes (context attributes, length in LBAs,
+    /// starting LBA) and the whole request fits one descriptor, since
+    /// 'count' is itself a u32 length in LBAs
+    fn discard(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
+        if !self.has_dsm {
+            return Err(BlkError::Unsupported);
+        }
+        // The ident page doubles as scratch for admin-sized payloads
+        // (health() does the same); a DSM range list reads only 16 bytes
+        self.mem.ident[..4].fill(0);
+        self.mem.ident[4..8].copy_from_slice(&count.to_le_bytes());
+        self.mem.ident[8..16].copy_from_slice(&lba.to_le_bytes());
+        let prp1 = crate::net::virt_to_phys(self.mem.ident.as_ptr() as u64);
+
+        let mut e = [0u8; 64];
+        e[0] = NVM_DSM;
+        e[4..8].copy_from_slice(&self.nsid.to_le_bytes());
+        e[24..32].copy_from_slice(&prp1.to_le_bytes());
+        // cdw10 = number of ranges - 1 = 0; cdw11 bit 2 (AD) = deallocate
+        e[44..48].copy_from_slice(&(1u32 << 2).to_le_bytes());
+        self.submit(1, &e)
     }
 
     /// SMART / Health Information log page (LID 0x02, 512 bytes)

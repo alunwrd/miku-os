@@ -24,7 +24,7 @@ pub fn cmd_info() {
     let used_ram_kb   = pmm_used * 4 + heap_used / 1024;
     let free_ram_kb   = usable_ram_kb.saturating_sub(used_ram_kb);
 
-    cprintln!(57, 197, 187,  "  MikuOS v0.2.6-rc");
+    cprintln!(57, 197, 187,  "  MikuOS v0.2.7-rc");
     cprintln!(230, 240, 240, "  VNodes: {}/{}", vn, crate::vfs::MAX_VNODES);
     cprintln!(230, 240, 240, "  Mounts: {}", mn);
     cprintln!(230, 240, 240, "  Heap:   {} / {} KB", heap_used / 1024, heap_total / 1024);

@@ -51,14 +51,15 @@ pub fn cmd_blkstat() {
                 crate::block::DevKind::Nvme      => "nvme",
             };
             println!(
-                "  blk{} [{}]: '{}' {} sectors ({} MB) lba48={} ro={}",
+                "  blk{} [{}]: '{}' {} sectors ({} MB) lba48={} ro={} discard={}",
                 id, kind_str, info.model_str(), info.total_sectors, mb,
-                info.lba48, info.read_only
+                info.lba48, info.read_only, info.discard
             );
             println!(
-                "        io: read {} KB, written {} KB, avg latency {} us",
+                "        io: read {} KB, written {} KB, discarded {} KB, avg latency {} us",
                 st.sectors_read * 512 / 1024,
                 st.sectors_written * 512 / 1024,
+                st.sectors_discarded * 512 / 1024,
                 st.avg_io_us
             );
             if st.io_errors > 0 || st.retries > 0 {
@@ -90,12 +91,99 @@ pub fn cmd_blkstat() {
     let (sub, done, err) = crate::block::io_stats();
     println!("  bio queue: submitted={} completed={} errors={}", sub, done, err);
 
-    let (hits, misses, ra, dirty) = crate::block::cache_stats();
+    let (hits, misses, ra, merges, dirty) = crate::block::cache_stats();
     let total = hits + misses;
     let pct = if total > 0 { hits * 100 / total } else { 0 };
     println!(
-        "  buffer cache: hits={} misses={} ({}% hit rate), readaheads={}, dirty={}",
-        hits, misses, pct, ra, dirty
+        "  buffer cache: hits={} misses={} ({}% hit rate), readaheads={}, write merges={}, dirty={}",
+        hits, misses, pct, ra, merges, dirty
+    );
+}
+
+/// fstrim(8) analogue: discard every free block of the active mounted ext
+/// filesystem, walking the group bitmaps, so the device can unmap the space
+pub fn cmd_fstrim() {
+    enum Outcome {
+        Unsupported(crate::vfs::types::BlockDevId),
+        Failed(crate::vfs::types::BlockDevId, crate::miku_extfs::FsError),
+        Done(crate::vfs::types::BlockDevId, crate::miku_extfs::trim::TrimReport),
+    }
+
+    let res = crate::commands::ext2_cmds::with_ext2_pub(|fs| {
+        let dev = fs.reader.dev_id;
+        if !crate::block::info(dev).map_or(false, |i| i.discard) {
+            return Outcome::Unsupported(dev);
+        }
+        match fs.trim_free_blocks(1) {
+            Ok(r)  => Outcome::Done(dev, r),
+            Err(e) => Outcome::Failed(dev, e),
+        }
+    });
+
+    match res {
+        None => print_error!("  fstrim: no mounted ext filesystem (use ext2/3/4mount first)"),
+        Some(Outcome::Unsupported(dev)) => {
+            print_warn!("  fstrim: blk{} does not support discard/TRIM", dev);
+        }
+        Some(Outcome::Failed(dev, e)) => {
+            print_error!("  fstrim: blk{}: {:?}", dev, e);
+        }
+        Some(Outcome::Done(dev, r)) => {
+            print_success!(
+                "  blk{}: {} MB ({} blocks) trimmed",
+                dev, r.trimmed_bytes / (1024 * 1024), r.trimmed_blocks
+            );
+        }
+    }
+}
+
+/// Discard (TRIM) a sector range, or the whole device when no range is
+/// given - MikuOS's blkdiscard(8)
+pub fn cmd_blkdiscard(args: &str) {
+    let mut it = args.split_whitespace();
+    let Some(idx) = it.next().and_then(parse_drive) else {
+        print_error!("  usage: blkdiscard <drive 0-7> [lba count]");
+        return;
+    };
+    let dev = blk_dev(idx);
+    let Some(info) = crate::block::info(dev) else {
+        print_error!("  no device blk{}", idx);
+        return;
+    };
+    if !info.discard {
+        print_warn!("  blk{}: device does not support discard/TRIM", idx);
+        return;
+    }
+
+    let (lba, sectors) = match (it.next(), it.next()) {
+        (Some(l), Some(c)) => {
+            let (Ok(l), Ok(c)) = (l.parse::<u64>(), c.parse::<u64>()) else {
+                print_error!("  usage: blkdiscard <drive 0-7> [lba count]");
+                return;
+            };
+            (l, c)
+        }
+        (None, _) => (0, info.total_sectors),
+        _ => {
+            print_error!("  usage: blkdiscard <drive 0-7> [lba count]");
+            return;
+        }
+    };
+
+    let mut done = 0u64;
+    while done < sectors {
+        let n = (sectors - done).min(u32::MAX as u64) as u32;
+        match crate::block::discard(dev, lba + done, n) {
+            Ok(()) => done += n as u64,
+            Err(e) => {
+                print_error!("  blk{}: discard failed at lba {}: {:?}", idx, lba + done, e);
+                return;
+            }
+        }
+    }
+    print_success!(
+        "  blk{}: discarded {} sectors ({} MB) at lba {}",
+        idx, sectors, sectors * 512 / (1024 * 1024), lba
     );
 }
 

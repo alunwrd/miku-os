@@ -52,6 +52,9 @@ pub struct BufferCache {
     pub hits:   u64,
     pub misses: u64,
     pub readaheads: u64,
+    /// Dirty chunks that left the cache merged into a neighbour's write
+    /// command instead of as their own (writeback request merging)
+    pub write_merges: u64,
 }
 
 impl BufferCache {
@@ -69,6 +72,7 @@ impl BufferCache {
             hits:    0,
             misses:  0,
             readaheads: 0,
+            write_merges: 0,
         }
     }
 
@@ -230,16 +234,28 @@ impl BufferCache {
         false
     }
 
-    /// Pop the lowest-numbered dirty chunk for 'dev' at or after
-    /// 'after_chunk', copying it into 'out' and marking it clean. Repeated
+    /// Look up the cache slot holding a dirty copy of (dev, chunk)
+    fn find_dirty(&self, dev: BlockDevId, chunk: u64) -> Option<usize> {
+        let base = Self::set_base(dev, chunk);
+        (base..base + WAYS).find(|&i| {
+            let e = self.entries[i];
+            e.valid && e.dirty && e.dev == dev && e.chunk == chunk
+        })
+    }
+
+    /// Pop an ascending run of contiguous dirty chunks for 'dev', starting
+    /// at the lowest dirty chunk at or after 'after_chunk': up to 'max'
+    /// chunks are copied back-to-back into 'out' and marked clean. Repeated
     /// calls walk the device's dirty set in ascending LBA order - the
-    /// elevator sweep used by 'flush'
-    pub fn pop_dirty_sorted(
+    /// elevator sweep used by 'flush' - and contiguous chunks merge into
+    /// one driver command (writeback request merging)
+    pub fn pop_dirty_run(
         &mut self,
         dev: BlockDevId,
         after_chunk: u64,
         out: &mut [u8],
-    ) -> Option<u64> {
+        max: usize,
+    ) -> Option<(u64, usize)> {
         let mut best: Option<(usize, u64)> = None;
         for i in 0..ENTRIES {
             let e = self.entries[i];
@@ -249,16 +265,64 @@ impl BufferCache {
                 }
             }
         }
-        let (slot, chunk) = best?;
+        let (slot, first) = best?;
         let off = slot * CHUNK_BYTES;
         out[..CHUNK_BYTES].copy_from_slice(&self.data[off..off + CHUNK_BYTES]);
         self.entries[slot].dirty = false;
-        Some(chunk)
+
+        let mut n = 1usize;
+        while n < max {
+            let Some(slot) = self.find_dirty(dev, first + n as u64) else { break };
+            let src = slot * CHUNK_BYTES;
+            let dst = n * CHUNK_BYTES;
+            out[dst..dst + CHUNK_BYTES].copy_from_slice(&self.data[src..src + CHUNK_BYTES]);
+            self.entries[slot].dirty = false;
+            self.write_merges += 1;
+            n += 1;
+        }
+        Some((first, n))
     }
 
     /// Number of dirty chunks (all devices)
     pub fn dirty_count(&self) -> usize {
         self.entries.iter().filter(|e| e.valid && e.dirty).count()
+    }
+
+    /// Drop every cached chunk lying fully inside a discarded sector range -
+    /// dirty ones included, since their content is dead by definition (this
+    /// is what keeps writeback from re-materializing discarded sectors).
+    /// Edge chunks only partially covered stay resident: their out-of-range
+    /// sectors are still live data
+    pub fn invalidate_covered(&mut self, dev: BlockDevId, lba: u64, count: u32) {
+        let end = lba + count as u64;
+        // First chunk fully inside the range, and one past the last
+        let first     = (lba + CHUNK_SECTORS - 1) / CHUNK_SECTORS;
+        let last_excl = end / CHUNK_SECTORS;
+        if first >= last_excl {
+            return;
+        }
+        if last_excl - first >= ENTRIES as u64 {
+            // Range spans more chunks than the cache holds (e.g. a whole-
+            // device discard) - one scan over the entries is cheaper than
+            // a per-chunk set lookup
+            for e in self.entries.iter_mut() {
+                if e.valid && e.dev == dev && e.chunk >= first && e.chunk < last_excl {
+                    e.valid = false;
+                    e.dirty = false;
+                }
+            }
+            return;
+        }
+        for chunk in first..last_excl {
+            let base = Self::set_base(dev, chunk);
+            for i in base..base + WAYS {
+                let e = self.entries[i];
+                if e.valid && e.dev == dev && e.chunk == chunk {
+                    self.entries[i].valid = false;
+                    self.entries[i].dirty = false;
+                }
+            }
+        }
     }
 
     /// Drop any cached chunks overlapping the range - used after a failed

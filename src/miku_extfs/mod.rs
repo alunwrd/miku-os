@@ -5,6 +5,7 @@ pub mod ext3;
 pub mod ext4;
 pub mod reader;
 pub mod structs;
+pub mod trim;
 pub mod xattr;
 
 use ext3::journal::TxnTag;

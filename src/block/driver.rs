@@ -16,6 +16,9 @@ pub enum BlkError {
     DeviceFault,
     Timeout,
     ReadOnly,
+    /// Operation not implemented by this device (e.g. discard on a
+    /// drive without TRIM)
+    Unsupported,
 }
 
 /// Geometry / identity reported by a device (filled from ATA IDENTIFY etc.)
@@ -27,6 +30,9 @@ pub struct BlockDevInfo {
     pub model_len:     u8,
     pub lba48:         bool,
     pub read_only:     bool,
+    /// Device accepts discard/TRIM (NVMe DSM deallocate, ATA TRIM,
+    /// virtio-blk discard)
+    pub discard:       bool,
 }
 
 impl BlockDevInfo {
@@ -38,6 +44,7 @@ impl BlockDevInfo {
             model_len:     0,
             lba48:         false,
             read_only:     false,
+            discard:       false,
         }
     }
 
@@ -86,5 +93,11 @@ pub trait BlockDriver: Send {
     /// SMART-style health report; None when the backend has no health source
     fn health(&mut self) -> Option<HealthInfo> {
         None
+    }
+    /// Tell the device the sector range no longer holds useful data
+    /// (TRIM / deallocate). Contents of the range become indeterminate;
+    /// the device may unmap it. Advisory - failure must not corrupt data
+    fn discard(&mut self, _lba: u64, _count: u32) -> Result<(), BlkError> {
+        Err(BlkError::Unsupported)
     }
 }

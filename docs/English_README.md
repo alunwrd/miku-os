@@ -1007,10 +1007,12 @@ The block layer is the single routing point between filesystems and storage driv
 | `block::write(dev, lba, count, buf)` | Write-back: lands in cache, written to disk on flush/eviction |
 | `block::write_sync(dev, lba, count, buf)` | Write-through: device write completes before return (journals, GPT, swap) |
 | `block::flush(dev)` | Drain dirty cache (elevator-ordered) + flush device write cache |
-| `block::info(dev)` | Geometry / identity for a device |
-| `block::cache_stats()` | `(hits, misses, readaheads, dirty)` |
+| `block::discard(dev, lba, count)` | Discard/TRIM a sector range; fully covered cache chunks (dirty included) are dropped before the device command |
+| `MikuFS::trim_free_blocks(minlen)` | FITRIM: walks the mounted fs's group bitmaps and discards free-block runs (the `fstrim` command); `mkfs.*` pre-discards the whole target region |
+| `block::info(dev)` | Geometry / identity for a device (includes the `discard` capability flag) |
+| `block::cache_stats()` | `(hits, misses, readaheads, write_merges, dirty)` |
 | `block::io_stats()` | `(submitted, completed, errors)` from the BIO queue |
-| `block::dev_stats(dev)` | `(kind, sectors_read, sectors_written, ios, avg_io_us)` per device |
+| `block::dev_stats(dev)` | `(kind, sectors_read, sectors_written, sectors_discarded, ios, avg_io_us)` per device |
 | `block::health(dev)` | SMART / NVMe health snapshot; `None` if the backend has no health source |
 
 #### Buffer cache
@@ -1023,6 +1025,7 @@ The block layer is the single routing point between filesystems and storage driv
 | **Policy** | Write-back; `write_sync` is write-through for ordered writes |
 | **Read-ahead** | Adaptive: 32 KiB for a fresh sequential stream, ramping to 64 KiB (16 chunks) when sustained |
 | **Dirty limit** | Flush triggered at 256 dirty chunks (high-water mark) |
+| **Write merging** | Adjacent dirty chunks coalesce into one driver command of up to 64 KiB during writeback |
 | **bdflush** | Background mikuD service: sweeps dirty chunks to disk every 2 s (ascending-LBA elevator pass) |
 | **Coherence** | All kernel disk accesses go through `crate::block`; no second path |
 
@@ -1038,9 +1041,10 @@ The block layer is the single routing point between filesystems and storage driv
 | **PCI class** | 01.06 (Mass Storage / SATA AHCI) |
 | **Registers** | BAR5 (ABAR) MMIO, mapped uncached through HHDM |
 | **Max ports** | 4 SATA disks per probe |
-| **Commands** | READ DMA EXT, WRITE DMA EXT, FLUSH CACHE EXT, IDENTIFY |
+| **Commands** | READ DMA EXT, WRITE DMA EXT, FLUSH CACHE EXT, IDENTIFY, DATA SET MANAGEMENT (TRIM) |
 | **Completion** | Polled PxCI |
 | **Buffer** | 64 KiB bounce buffer, single PRD entry |
+| **TRIM** | Capability from IDENTIFY word 169; 8-byte range entries, 64 per 512-byte block |
 
 #### NVMe
 
@@ -1050,7 +1054,8 @@ The block layer is the single routing point between filesystems and storage driv
 | **Transfer** | Up to 128 sectors (64 KiB) per command via PRP1 + PRP list page |
 | **Completion** | Polled CQ phase bit |
 | **Memory** | One page-aligned allocation: admin SQ/CQ, I/O SQ/CQ, PRP list, IDENTIFY buffer, bounce |
-| **Opcodes** | NVM READ (0x02), NVM WRITE (0x01), NVM FLUSH (0x00) |
+| **Opcodes** | NVM READ (0x02), NVM WRITE (0x01), NVM FLUSH (0x00), NVM DSM (0x09, deallocate = discard) |
+| **Discard** | Dataset Management with the deallocate attribute; capability from ONCS bit 2 |
 | **Health** | Get Log Page (LID 0x02) - SMART / Health Information (512 bytes): temp, wear, POH, lifetime R/W |
 
 #### virtio-blk (legacy/transitional)
@@ -1061,7 +1066,7 @@ The block layer is the single routing point between filesystems and storage driv
 | **Ring** | Layout computed at runtime from device-reported queue size |
 | **Max queue** | 256 descriptors |
 | **Transfer** | Up to 128 sectors (64 KiB) per request; larger transfers chunked by block layer |
-| **Features** | FEATURE_BLK_FLUSH (bit 9) negotiated |
+| **Features** | FLUSH (bit 9) and DISCARD (bit 13) negotiated; discards capped at the device's `max_discard_sectors` |
 
 #### ATA (legacy PIO)
 
@@ -1073,6 +1078,7 @@ The block layer is the single routing point between filesystems and storage driv
 | **Protection** | Cache flush after write, 50K iteration timeout |
 | **Addressing** | LBA28 (up to 128 GB) + **LBA48** (READ/WRITE EXT, 48-bit addressing) |
 | **DMA** | Bus-master DMA capability detection and state tracking |
+| **TRIM** | DATA SET MANAGEMENT, range payload via bus-master DMA; capability from IDENTIFY word 169 |
 | **Health** | SMART RETURN STATUS (cmd 0xB0/feature 0xDA): LBA mid/high signature reports healthy vs. failing |
 
 </details>
@@ -1270,6 +1276,8 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
 | `mkfs.ext3 <drive>` | Format ext3 (with journal) |
 | `mkfs.ext4 <drive>` | Format ext4 (extents + journal) |
 | `blkstat` | Show all block devices (ATA/AHCI/NVMe/virtio-blk) + GPT partition tree + BIO queue + cache stats |
+| `blkdiscard <drive> [lba count]` | Discard/TRIM a sector range (whole device when no range given); blkdiscard(8) analogue |
+| `fstrim` | Discard all free blocks of the active mounted ext filesystem by walking the group bitmaps; fstrim(8) analogue |
 | `smart <drive>` | SMART / NVMe health report: status, temperature, wear, power-on hours, lifetime R/W |
 | `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run format (layout only) |
 | `gpt <drive>` | Show GPT partition table |
