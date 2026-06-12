@@ -1079,6 +1079,8 @@ ATA PIO/DMA | AHCI | virtio-blk | NVMe
 | **`BlockDriver` trait** | `read_blocks` / `write_blocks` / `flush` / `info`, 64-bit LBA |
 | **Per-device locks** | I/O to distinct devices runs in parallel; legacy ATA slots share a bus lock (master/slave share ports) |
 | **Bio queue** | Live request accounting: submitted / completed / errors |
+| **Retries** | Transient errors (timeout / device fault) get up to 2 transparent re-issues; per-device error and retry counters |
+| **Latency** | Per-request TSC timing; `blkstat` reports average I/O latency per device (iostat `await`) |
 | **PCI probe** | One boot-time bus walk registers AHCI ports, NVMe namespaces, virtio-blk devices |
 | **io_relax** | I/O wait loops yield to the scheduler instead of burning CPU |
 
@@ -1087,7 +1089,7 @@ ATA PIO/DMA | AHCI | virtio-blk | NVMe
 | Parameter | Value |
 |:--|:--|
 | **Size** | 2 MiB: 512 x 4 KiB chunks, 8-way set-associative, per-set LRU |
-| **Reads** | Read-around (whole 4 KiB chunks); sequential misses pull a 32 KiB readahead window in one command |
+| **Reads** | Read-around (whole 4 KiB chunks); adaptive readahead: sequential misses pull 32 KiB, sustained streams ramp to 64 KiB per command |
 | **Writes** | Write-back: data lands in RAM, the call returns; sub-chunk writes do read-modify-write |
 | **Barriers** | `write_sync` path for ordered data (ext3 journal records, GPT tables, swap headers); `flush` drains dirty chunks in ascending-LBA order (elevator sweep), then flushes the device cache |
 | **bdflush** | Background mikuD service: sweeps dirty chunks to disk every 2 s |

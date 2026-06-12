@@ -43,6 +43,12 @@ struct DeviceSlot {
     /// Bytes read / written, for 'iostat'-style reporting
     sectors_read:    u64,
     sectors_written: u64,
+    /// Failed requests (after retries) and retry attempts that recovered
+    io_errors: u64,
+    retries:   u64,
+    /// Accumulated device time for average-latency reporting ('await')
+    total_io_us: u64,
+    io_count:    u64,
 }
 
 type SlotRef = Arc<Mutex<DeviceSlot>>;
@@ -103,6 +109,10 @@ pub fn register_ata(drive: AtaDrive) -> BlockDevId {
             kind: DevKind::Ata,
             sectors_read: 0,
             sectors_written: 0,
+            io_errors: 0,
+            retries: 0,
+            total_io_us: 0,
+            io_count: 0,
         })));
     }
     id as BlockDevId
@@ -144,6 +154,10 @@ fn register_dynamic(mut boxed: Box<dyn BlockDriver>, kind: DevKind, label: &str)
         kind,
         sectors_read: 0,
         sectors_written: 0,
+        io_errors: 0,
+        retries: 0,
+        total_io_us: 0,
+        io_count: 0,
     })));
     drop(reg);
 
@@ -240,9 +254,9 @@ pub fn read(dev_id: BlockDevId, lba: u64, count: u32, buf: &mut [u8]) -> Result<
         let len     = ((e - s) * 512) as usize;
         let in_off  = ((s - chunk_start) * 512) as usize;
 
-        let (hit, sequential) = match CACHE.lock().as_mut() {
+        let (hit, streak) = match CACHE.lock().as_mut() {
             Some(c) => (c.get(dev_id, chunk, &mut tmp), c.advance(dev_id, chunk)),
-            None => (false, false),
+            None => (false, 0),
         };
         if hit {
             buf[buf_off..buf_off + len].copy_from_slice(&tmp[in_off..in_off + len]);
@@ -253,13 +267,17 @@ pub fn read(dev_id: BlockDevId, lba: u64, count: u32, buf: &mut [u8]) -> Result<
             // Sequential misses pull a readahead window in one driver
             // command; random misses fetch just their own chunk
             let avail = (total - chunk_start) / cache::CHUNK_SECTORS;
-            let n = if sequential {
-                (RA_CHUNKS as u64).min(avail).max(1) as usize
-            } else {
-                1
+            // Adaptive window: a fresh sequential stream gets 32 KiB; a
+            // sustained one (4+ chunks in a row) ramps to 64 KiB - the
+            // same ramp-up idea as Linux readahead
+            let want = match streak {
+                0 => 1,
+                1..=3 => RA_CHUNKS,
+                _ => RA_MAX_CHUNKS,
             };
+            let n = (want as u64).min(avail).max(1) as usize;
 
-            let mut window = [0u8; RA_CHUNKS * cache::CHUNK_BYTES];
+            let mut window = [0u8; RA_MAX_CHUNKS * cache::CHUNK_BYTES];
             let sectors = (n as u64 * cache::CHUNK_SECTORS) as u32;
             driver_read(dev_id, chunk_start, sectors, &mut window[..n * cache::CHUNK_BYTES])?;
 
@@ -295,6 +313,9 @@ pub fn read(dev_id: BlockDevId, lba: u64, count: u32, buf: &mut [u8]) -> Result<
 
 /// Readahead window: up to 8 chunks (32 KiB) fetched per sequential miss
 const RA_CHUNKS: usize = 8;
+
+/// Ramped-up readahead window for sustained sequential streams (64 KiB)
+const RA_MAX_CHUNKS: usize = 16;
 
 /// Write 'count' 512-byte sectors starting at 'lba' from 'buf' - write-back:
 /// the data lands in the buffer cache and the call returns; the device write
@@ -461,10 +482,28 @@ pub fn cache_stats() -> (u64, u64, u64, u64) {
 }
 
 /// Per-device '(kind, sectors_read, sectors_written)' counters
-pub fn dev_stats(dev_id: BlockDevId) -> Option<(DevKind, u64, u64)> {
+pub fn dev_stats(dev_id: BlockDevId) -> Option<DevStats> {
     let slot = slot_ref(dev_id)?;
     let guard = slot.lock();
-    Some((guard.kind, guard.sectors_read, guard.sectors_written))
+    Some(DevStats {
+        kind:            guard.kind,
+        sectors_read:    guard.sectors_read,
+        sectors_written: guard.sectors_written,
+        io_errors:       guard.io_errors,
+        retries:         guard.retries,
+        avg_io_us:       if guard.io_count > 0 { guard.total_io_us / guard.io_count } else { 0 },
+    })
+}
+
+/// Snapshot of a device's accounting counters for 'blkstat'
+#[derive(Clone, Copy)]
+pub struct DevStats {
+    pub kind:            DevKind,
+    pub sectors_read:    u64,
+    pub sectors_written: u64,
+    pub io_errors:       u64,
+    pub retries:         u64,
+    pub avg_io_us:       u64,
 }
 
 /// Flush barrier: drain the device's dirty chunks (elevator-ordered), then
@@ -492,11 +531,15 @@ fn dispatch<F>(
     dir: BioDirection,
     lba: u64,
     count: u32,
-    run: F,
+    mut run: F,
 ) -> Result<(), BlkError>
 where
-    F: FnOnce(&mut Box<dyn BlockDriver>) -> Result<(), BlkError>,
+    F: FnMut(&mut Box<dyn BlockDriver>) -> Result<(), BlkError>,
 {
+    /// Transient errors get this many extra attempts before giving up.
+    /// Sector reads/writes are idempotent, so blind re-issue is safe.
+    const MAX_RETRIES: u32 = 2;
+
     let Some(slot) = slot_ref(dev_id) else { return Err(BlkError::NoDevice) };
 
     // Enqueue for accounting / future scheduling. Buffer travels with the
@@ -508,18 +551,45 @@ where
         .ok();
 
     let mut guard = slot.lock();
-    let result = if guard.kind == DevKind::Ata {
-        let _bus = ATA_BUS.lock();
-        run(&mut guard.driver)
-    } else {
-        run(&mut guard.driver)
+    let sw = crate::timing::Stopwatch::start();
+
+    let mut attempt = 0u32;
+    let result = loop {
+        let r = if guard.kind == DevKind::Ata {
+            let _bus = ATA_BUS.lock();
+            run(&mut guard.driver)
+        } else {
+            run(&mut guard.driver)
+        };
+        match r {
+            Ok(()) => break Ok(()),
+            Err(e @ (BlkError::Timeout | BlkError::DeviceFault))
+                if attempt < MAX_RETRIES =>
+            {
+                attempt += 1;
+                guard.retries += 1;
+                crate::serial_println!(
+                    "[block] dev {} {:?} lba={} count={}: {:?} - retry {}/{}",
+                    dev_id, dir, lba, count, e, attempt, MAX_RETRIES
+                );
+            }
+            Err(e) => break Err(e),
+        }
     };
 
-    if result.is_ok() {
-        match dir {
+    // Latency accounting once the TSC is calibrated (early-boot I/O would
+    // otherwise record garbage).
+    if crate::timing::tsc_khz() > 0 {
+        guard.total_io_us += sw.elapsed_us();
+        guard.io_count += 1;
+    }
+
+    match result {
+        Ok(()) => match dir {
             BioDirection::Read => guard.sectors_read += count as u64,
             BioDirection::Write => guard.sectors_written += count as u64,
-        }
+        },
+        Err(_) => guard.io_errors += 1,
     }
     drop(guard);
 

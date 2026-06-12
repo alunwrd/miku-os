@@ -995,6 +995,8 @@ The block layer is the single routing point between filesystems and storage driv
 | **Max devices** | 8 |
 | **I/O accounting** | BIO queue with submitted / completed / error counters |
 | **Locking** | Per-device slot mutex; ATA slots share a bus lock; PCI devices are fully parallel |
+| **Retries** | Transient errors (timeout/fault) get up to 2 transparent re-issues; per-device error/retry counters |
+| **Latency** | Per-request TSC timing; `blkstat` shows average I/O latency (iostat `await`) |
 
 #### API
 
@@ -1018,7 +1020,7 @@ The block layer is the single routing point between filesystems and storage driv
 | **Capacity** | 512 chunks × 4 KiB = **2 MiB** |
 | **Organization** | 8-way set-associative, 64 sets, per-set LRU |
 | **Policy** | Write-back; `write_sync` is write-through for ordered writes |
-| **Read-ahead** | Up to 8 chunks (32 KiB) per sequential miss |
+| **Read-ahead** | Adaptive: 32 KiB for a fresh sequential stream, ramping to 64 KiB (16 chunks) when sustained |
 | **Dirty limit** | Flush triggered at 256 dirty chunks (high-water mark) |
 | **bdflush** | Background mikuD service: sweeps dirty chunks to disk every 2 s (ascending-LBA elevator pass) |
 | **Coherence** | All kernel disk accesses go through `crate::block`; no second path |
