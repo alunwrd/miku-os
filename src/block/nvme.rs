@@ -12,7 +12,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 
-use super::driver::{BlkError, BlockDevInfo, BlockDriver};
+use super::driver::{BlkError, BlockDevInfo, BlockDriver, HealthInfo};
 use crate::net::pci::{pci_read32, pci_read8, PCI_ADDR, PCI_DATA, pci_addr};
 
 // Controller registers (offsets from BAR0)
@@ -35,6 +35,7 @@ const CSTS_RDY: u32 = 1;
 const ADM_CREATE_IO_SQ: u8 = 0x01;
 const ADM_CREATE_IO_CQ: u8 = 0x05;
 const ADM_IDENTIFY:     u8 = 0x06;
+const ADM_GET_LOG_PAGE: u8 = 0x02;
 
 // NVM I/O opcodes
 const NVM_WRITE: u8 = 0x01;
@@ -449,5 +450,38 @@ impl BlockDriver for Nvme {
         out.model = self.model;
         out.model_len = self.model_len;
         out
+    }
+
+    /// SMART / Health Information log page (LID 0x02, 512 bytes)
+    fn health(&mut self) -> Option<HealthInfo> {
+        let prp1 = crate::net::virt_to_phys(self.mem.ident.as_ptr() as u64);
+        // cdw10: NUMD (dwords - 1) in bits 27:16, LID in bits 7:0
+        let numd = (512 / 4 - 1) as u32;
+        if self.admin_cmd(ADM_GET_LOG_PAGE, 0xFFFF_FFFF, prp1, (numd << 16) | 0x02, 0).is_err() {
+            return None;
+        }
+        let log = &self.mem.ident;
+
+        let crit_warning = log[0];
+        // Composite temperature, Kelvin, LE u16
+        let temp_k = u16::from_le_bytes([log[1], log[2]]);
+        let pct_used = log[5];
+        let u128le = |off: usize| -> u64 {
+            // 16-byte LE counters; the low 8 bytes are plenty here
+            u64::from_le_bytes(log[off..off + 8].try_into().unwrap_or([0; 8]))
+        };
+        // Data units are 1000 x 512 B
+        let read_mb    = u128le(32).saturating_mul(512_000) / (1024 * 1024);
+        let written_mb = u128le(48).saturating_mul(512_000) / (1024 * 1024);
+        let poh        = u128le(128);
+
+        Some(HealthInfo {
+            healthy: crit_warning == 0,
+            temp_c: if temp_k == 0 { i16::MIN } else { temp_k as i16 - 273 },
+            percent_used: pct_used,
+            power_on_hours: poh,
+            data_read_mb: read_mb,
+            data_written_mb: written_mb,
+        })
     }
 }

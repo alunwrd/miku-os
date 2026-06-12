@@ -877,7 +877,7 @@ immutableフラグにより unlink / write / rename は拒否されます。
 |:--:|:--:|:--|
 | **tmpfs** | `/` | RAMベースのルートFS |
 | **devfs** | `/dev` | デバイス: `null`、`zero`、`random`、`urandom`、`console` |
-| **procfs** | `/proc` | `version`、`uptime`、`meminfo`、`mounts`、`cpuinfo`、`stat` |
+| **procfs** | `/proc` | `version`、`uptime`、`meminfo`、`mounts`、`cpuinfo`、`stat`、`heap`、`diskstats` |
 | **ext2** | `/mnt` | 実ディスクへの完全な読み書き |
 | **ext3** | `/mnt` | ext2上のジャーナリング (JBD2)、遅延書き込み |
 | **ext4** | `/mnt` | エクステントベースファイル + crc32cチェックサム |
@@ -1058,7 +1058,8 @@ immutableフラグにより unlink / write / rename は拒否されます。
 
 | コマンド | 説明 |
 |:--|:--|
-| `blkstat` | 全ブロックデバイス (ATA/AHCI/NVMe/virtio-blk) + BIO キュー + キャッシュ統計 |
+| `blkstat` | 全ブロックデバイス (ATA/AHCI/NVMe/virtio-blk) + GPT パーティションツリー + BIO キュー + キャッシュ統計 |
+| `smart <drive>` | SMART / NVMe ヘルスレポート: ステータス・温度・消耗度・電源投入時間・読み書き量 |
 | `mkfs.ext2 <drive>` | ext2フォーマット |
 | `mkfs.ext3 <drive>` | ext3フォーマット (ジャーナル付き) |
 | `mkfs.ext4 <drive>` | ext4フォーマット (エクステント + ジャーナル) |
@@ -1223,7 +1224,8 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 | `block::info(dev)` | デバイスのジオメトリ / 識別情報 |
 | `block::cache_stats()` | `(hits, misses, readaheads, dirty)` |
 | `block::io_stats()` | BIO キューの `(submitted, completed, errors)` |
-| `block::dev_stats(dev)` | デバイスごとの `(kind, sectors_read, sectors_written)` |
+| `block::dev_stats(dev)` | デバイスごとの `(kind, sectors_read, sectors_written, ios, avg_io_us)` |
+| `block::health(dev)` | SMART / NVMe ヘルススナップショット; バックエンドが対応しない場合は `None` |
 
 #### バッファキャッシュ
 
@@ -1263,6 +1265,7 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 | **完了** | CQ フェーズビット ポーリング |
 | **メモリ** | ページアライン単一アロケーション: admin SQ/CQ、I/O SQ/CQ、PRP リスト、IDENTIFY、バウンス |
 | **オペコード** | NVM READ (0x02)、NVM WRITE (0x01)、NVM FLUSH (0x00) |
+| **ヘルス** | Get Log Page (LID 0x02) - SMART/Health Information (512 バイト): 温度・消耗度・POH・読み書き量 |
 
 #### virtio-blk (レガシー/トランジショナル)
 
@@ -1284,6 +1287,7 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 | **保護** | 書き込み後のキャッシュフラッシュ、タイムアウト 50K イテレーション |
 | **アドレス指定** | LBA28 (最大 128 GB) + **LBA48** (READ/WRITE EXT、48 ビットアドレス) |
 | **DMA** | バスマスター DMA 対応検出と状態追跡 |
+| **ヘルス** | SMART RETURN STATUS (cmd 0xB0/feature 0xDA): LBA mid/high シグネチャで健康/故障を判定 |
 
 </details>
 

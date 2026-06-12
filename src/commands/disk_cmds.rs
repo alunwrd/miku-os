@@ -67,6 +67,20 @@ pub fn cmd_blkstat() {
                     st.io_errors, st.retries
                 );
             }
+            if let Ok(tbl) = gpt::gpt_read(id) {
+                for (i, e) in tbl.entries.iter().enumerate() {
+                    if !e.is_used() { continue; }
+                    let mut nbuf = [0u8; 36];
+                    let nlen = e.name_str(&mut nbuf);
+                    let name = core::str::from_utf8(&nbuf[..nlen]).unwrap_or("?");
+                    let start = { e.start_lba };
+                    let end   = { e.end_lba };
+                    println!(
+                        "        |- blk{}p{} {} {} MB lba {}..{} '{}'",
+                        id, i + 1, e.type_name(), e.size_mb(), start, end, name
+                    );
+                }
+            }
         }
     }
     if !any {
@@ -83,6 +97,47 @@ pub fn cmd_blkstat() {
         "  buffer cache: hits={} misses={} ({}% hit rate), readaheads={}, dirty={}",
         hits, misses, pct, ra, dirty
     );
+}
+
+/// SMART / health report for a block device
+pub fn cmd_smart(drive_str: &str) {
+    let idx = match parse_drive(drive_str) {
+        Some(i) => i,
+        None => { print_error!("  usage: smart <drive 0-7>"); return; }
+    };
+    let dev = blk_dev(idx);
+
+    let Some(info) = crate::block::info(dev) else {
+        print_error!("  no device blk{}", idx);
+        return;
+    };
+    cprintln!(57, 197, 187, "  SMART / health: blk{} '{}'", dev, info.model_str());
+
+    match crate::block::health(dev) {
+        None => print_warn!("  device reports no health data"),
+        Some(h) => {
+            if h.healthy {
+                print_success!("  overall status: healty");
+            } else {
+                print_error!("  overall status: failing - back up your data!");
+            }
+            if h.temp_c != i16::MIN {
+                println!("  temperature:    {} C", h.temp_c);
+            }
+            if h.percent_used != 0xFF {
+                println!("  wear used:      {}%", h.percent_used);
+            }
+            if h.power_on_hours != u64::MAX {
+                println!("  power-on hours: {}", h.power_on_hours);
+            }
+            if h.data_read_mb != u64::MAX {
+                println!("  lifetime read:  {} MB", h.data_read_mb);
+            }
+            if h.data_written_mb != u64::MAX {
+                println!("  lifetime write: {} MB", h.data_written_mb);
+            }
+        }
+    }
 }
 
 pub fn cmd_gpt_show(drive_str: &str) {

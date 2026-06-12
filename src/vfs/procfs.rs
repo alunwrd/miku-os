@@ -29,10 +29,19 @@ pub fn wall_clock() -> u64 {
 }
 
 pub fn proc_read(name: &str, buf: &mut [u8], vnode_used: usize) -> VfsResult<usize> {
+    // diskstats needs more room than the shared 192-byte scratch
+    if name == "diskstats" {
+        let mut big = [0u8; 1024];
+        let len = format_diskstats(&mut big);
+        let to_copy = len.min(buf.len());
+        buf[..to_copy].copy_from_slice(&big[..to_copy]);
+        return Ok(to_copy);
+    }
+
     let mut tmp = [0u8; 192];
     let len = match name {
         "version" => {
-            let s = b"MikuOS v0.2.5-rc (x86_64)\nbuilt with love <3\n";
+            let s = b"MikuOS v0.2.6-rc (x86_64)\nbuilt with love <3\n";
             let l = s.len().min(192);
             tmp[..l].copy_from_slice(&s[..l]);
             l
@@ -175,5 +184,47 @@ fn write_u64(buf: &mut [u8; 192], pos: usize, val: u64) -> usize {
 }
 
 pub const PROC_ENTRIES: &[&str] = &[
-    "version", "uptime", "meminfo", "mounts", "cpuinfo", "stat", "heap",
+    "version", "uptime", "meminfo", "mounts", "cpuinfo", "stat", "heap", "diskstats",
 ];
+
+/// Linux /proc/diskstats analogue, one line per active block device:
+/// name kind ios sectors_read sectors_written errors retries avg_latency_us
+fn format_diskstats(buf: &mut [u8; 1024]) -> usize {
+    use core::fmt::Write;
+
+    struct W<'a> {
+        buf: &'a mut [u8; 1024],
+        pos: usize,
+    }
+    impl core::fmt::Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let n = bytes.len().min(1024 - self.pos);
+            self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
+            self.pos += n;
+            Ok(())
+        }
+    }
+
+    let mut w = W { buf, pos: 0 };
+    for id in 0..crate::vfs::types::MAX_BLOCK_DEVICES as u8 {
+        let Some(info) = crate::block::info(id) else { continue };
+        if info.total_sectors == 0 && info.model_len == 0 {
+            continue;
+        }
+        let Some(st) = crate::block::dev_stats(id) else { continue };
+        let kind = match st.kind {
+            crate::block::DevKind::Ata       => "ata",
+            crate::block::DevKind::VirtioBlk => "virtio",
+            crate::block::DevKind::Ahci      => "ahci",
+            crate::block::DevKind::Nvme      => "nvme",
+        };
+        let _ = writeln!(
+            w,
+            "blk{} {} {} {} {} {} {} {}",
+            id, kind, st.ios, st.sectors_read, st.sectors_written,
+            st.io_errors, st.retries, st.avg_io_us
+        );
+    }
+    w.pos
+}

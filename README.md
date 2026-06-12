@@ -55,7 +55,7 @@ and a Linux-style storage stack (block layer, write-back buffer cache, ext2/3/4,
 | **USB** | USB legacy handoff (EHCI/xHCI BIOS release) |
 | **Splash** | Boot splash screen via framebuffer |
 | **fwload** | On-demand firmware loader from `/lib/firmware` (Linux `request_firmware` model) |
-| **Storage** | Block layer + write-back buffer cache + ATA DMA / AHCI / NVMe / virtio-blk drivers |
+| **Storage** | Block layer + write-back buffer cache + ATA DMA / AHCI / NVMe / virtio-blk drivers + SMART/health monitoring |
 
 ---
 
@@ -609,7 +609,7 @@ Additional check: slot number != 0 (false positive prevention)
 | **kill()** | Send signal to process (SIGTERM, SIGKILL, SIGCHLD) |
 | **Zombie reaping** | Automatic via mikuD and wait4 |
 | **Process hierarchy** | Parent-child tracking via ppid |
-| **Per-process identity** | `cwd`, `umask`, `uid`, `gid`, `euid`, `egid` — stored atomically on `Process`, inherited by `fork()`, synced into VFS context on every syscall |
+| **Per-process identity** | `cwd`, `umask`, `uid`, `gid`, `euid`, `egid` - stored atomically on `Process`, inherited by `fork()`, synced into VFS context on every syscall |
 
 ---
 
@@ -724,7 +724,7 @@ Total: 60 syscalls (0..59). Socket fds start at `SOCK_FD_BASE = 4096`; `read`/`w
 | **Security** | TLS 1.2 / 1.3 (ECDHE + RSA + AES-GCM, constant-time) |
 | **Userspace sockets** | AF_INET/SOCK_STREAM via syscalls 56-59; `SOCK_FD_BASE=4096`; blocking TCP client with 30 s timeout; up to 64 sockets system-wide |
 
-**netd** — a mikuD service registered at `MultiUser` target that runs automatic DHCP after link comes up, so network is ready without any manual `dhcp` command.
+**netd** - a mikuD service registered at `MultiUser` target that runs automatic DHCP after link comes up, so network is ready without any manual `dhcp` command.
 
 </details>
 

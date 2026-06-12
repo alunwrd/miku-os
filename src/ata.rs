@@ -651,7 +651,7 @@ impl AtaDrive {
 
 // Block layer integration
 
-use crate::block::driver::{BlkError, BlockDevInfo, BlockDriver};
+use crate::block::driver::{BlkError, BlockDevInfo, BlockDriver, HealthInfo};
 
 impl From<AtaError> for BlkError {
     fn from(e: AtaError) -> Self {
@@ -661,6 +661,48 @@ impl From<AtaError> for BlkError {
             AtaError::DeviceFault    => BlkError::DeviceFault,
             AtaError::Timeout        => BlkError::Timeout,
             AtaError::ErrorBitSet    => BlkError::DeviceFault,
+        }
+    }
+}
+
+impl AtaDrive {
+    /// SMART RETURN STATUS (0xB0 / feature 0xDA): the device answers through
+    /// the LBA mid/high registers - 0x4F/0xC2 = healthy, 0xF4/0x2C = failing.
+    /// None when the drive ignores SMART entirely
+    fn smart_status(&mut self) -> Option<bool> {
+        if self.base_port == 0 {
+            return None;
+        }
+        let bp = self.base_port;
+        unsafe {
+            if Port::<u8>::new(bp + 7).read() == 0xFF {
+                return None;
+            }
+            Port::<u8>::new(self.control_port()).write(0x02);
+            self.wait_not_busy().ok()?;
+            let dev = if self.role == AtaRole::Slave { 1u8 << 4 } else { 0 };
+            Port::<u8>::new(bp + 6).write(0xA0 | dev);
+            self.delay_400ns();
+            Port::<u8>::new(bp + 1).write(0xDA); // FEATURES: RETURN STATUS
+            Port::<u8>::new(bp + 4).write(0x4F); // LBA mid (signature)
+            Port::<u8>::new(bp + 5).write(0xC2); // LBA high (signature)
+            Port::<u8>::new(bp + 7).write(0xB0); // SMART
+            self.delay_400ns();
+
+            let status = self.wait_not_busy().ok()?;
+            if status & STATUS_ERR != 0 {
+                // SMART not enabled / unsupported
+                Port::<u8>::new(self.control_port()).write(0x00);
+                return None;
+            }
+            let mid = Port::<u8>::new(bp + 4).read();
+            let high = Port::<u8>::new(bp + 5).read();
+            Port::<u8>::new(self.control_port()).write(0x00);
+            match (mid, high) {
+                (0x4F, 0xC2) => Some(true),
+                (0xF4, 0x2C) => Some(false),
+                _ => None,
+            }
         }
     }
 }
@@ -744,6 +786,13 @@ impl BlockDriver for AtaDrive {
 
     fn flush(&mut self) -> Result<(), BlkError> {
         AtaDrive::flush(self).map_err(Into::into)
+    }
+
+    fn health(&mut self) -> Option<HealthInfo> {
+        let ok = self.smart_status()?;
+        let mut h = HealthInfo::unknown_ok();
+        h.healthy = ok;
+        Some(h)
     }
 
     fn info(&mut self) -> BlockDevInfo {

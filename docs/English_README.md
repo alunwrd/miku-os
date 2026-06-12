@@ -818,7 +818,7 @@ The immutable flag prevents unlink / write / rename.
 |:--:|:--:|:--|
 | **tmpfs** | `/` | RAM-based root FS |
 | **devfs** | `/dev` | Devices: `null`, `zero`, `random`, `urandom`, `console` |
-| **procfs** | `/proc` | `version`, `uptime`, `meminfo`, `mounts`, `cpuinfo`, `stat` |
+| **procfs** | `/proc` | `version`, `uptime`, `meminfo`, `mounts`, `cpuinfo`, `stat`, `heap`, `diskstats` |
 | **ext2** | `/mnt` | Full read-write to real disk |
 | **ext3** | `/mnt` | Journaling (JBD2) on top of ext2, delayed writes |
 | **ext4** | `/mnt` | Extent-based files + crc32c checksums |
@@ -1010,7 +1010,8 @@ The block layer is the single routing point between filesystems and storage driv
 | `block::info(dev)` | Geometry / identity for a device |
 | `block::cache_stats()` | `(hits, misses, readaheads, dirty)` |
 | `block::io_stats()` | `(submitted, completed, errors)` from the BIO queue |
-| `block::dev_stats(dev)` | `(kind, sectors_read, sectors_written)` per device |
+| `block::dev_stats(dev)` | `(kind, sectors_read, sectors_written, ios, avg_io_us)` per device |
+| `block::health(dev)` | SMART / NVMe health snapshot; `None` if the backend has no health source |
 
 #### Buffer cache
 
@@ -1050,6 +1051,7 @@ The block layer is the single routing point between filesystems and storage driv
 | **Completion** | Polled CQ phase bit |
 | **Memory** | One page-aligned allocation: admin SQ/CQ, I/O SQ/CQ, PRP list, IDENTIFY buffer, bounce |
 | **Opcodes** | NVM READ (0x02), NVM WRITE (0x01), NVM FLUSH (0x00) |
+| **Health** | Get Log Page (LID 0x02) - SMART / Health Information (512 bytes): temp, wear, POH, lifetime R/W |
 
 #### virtio-blk (legacy/transitional)
 
@@ -1071,6 +1073,7 @@ The block layer is the single routing point between filesystems and storage driv
 | **Protection** | Cache flush after write, 50K iteration timeout |
 | **Addressing** | LBA28 (up to 128 GB) + **LBA48** (READ/WRITE EXT, 48-bit addressing) |
 | **DMA** | Bus-master DMA capability detection and state tracking |
+| **Health** | SMART RETURN STATUS (cmd 0xB0/feature 0xDA): LBA mid/high signature reports healthy vs. failing |
 
 </details>
 
@@ -1266,7 +1269,8 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
 | `mkfs.ext2 <drive>` | Format ext2 |
 | `mkfs.ext3 <drive>` | Format ext3 (with journal) |
 | `mkfs.ext4 <drive>` | Format ext4 (extents + journal) |
-| `blkstat` | Show all block devices (ATA/AHCI/NVMe/virtio-blk) + BIO queue + cache stats |
+| `blkstat` | Show all block devices (ATA/AHCI/NVMe/virtio-blk) + GPT partition tree + BIO queue + cache stats |
+| `smart <drive>` | SMART / NVMe health report: status, temperature, wear, power-on hours, lifetime R/W |
 | `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run format (layout only) |
 | `gpt <drive>` | Show GPT partition table |
 | `gpt.init <drive>` | Initialize empty GPT |

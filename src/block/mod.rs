@@ -492,6 +492,7 @@ pub fn dev_stats(dev_id: BlockDevId) -> Option<DevStats> {
         io_errors:       guard.io_errors,
         retries:         guard.retries,
         avg_io_us:       if guard.io_count > 0 { guard.total_io_us / guard.io_count } else { 0 },
+        ios:             guard.io_count,
     })
 }
 
@@ -504,6 +505,20 @@ pub struct DevStats {
     pub io_errors:       u64,
     pub retries:         u64,
     pub avg_io_us:       u64,
+    pub ios:             u64,
+}
+
+/// SMART-style health report from the device (NVMe health log, ATA SMART).
+/// None when the backend has no health source (virtio)
+pub fn health(dev_id: BlockDevId) -> Option<driver::HealthInfo> {
+    let slot = slot_ref(dev_id)?;
+    let mut guard = slot.lock();
+    if guard.kind == DevKind::Ata {
+        let _bus = ATA_BUS.lock();
+        guard.driver.health()
+    } else {
+        guard.driver.health()
+    }
 }
 
 /// Flush barrier: drain the device's dirty chunks (elevator-ordered), then

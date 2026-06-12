@@ -670,7 +670,7 @@ bits 12.. = номер swap слота
 | **kill()** | Отправка сигнала процессу (SIGTERM, SIGKILL, SIGCHLD) |
 | **Сбор зомби** | Автоматический через mikuD и wait4 |
 | **Иерархия процессов** | Отслеживание родитель-потомок через ppid |
-| **Per-process идентичность** | `cwd`, `umask`, `uid`, `gid`, `euid`, `egid` — атомарно хранятся в `Process`, наследуются при `fork()`, синхронизируются в VFS-контекст при каждом syscall |
+| **Per-process идентичность** | `cwd`, `umask`, `uid`, `gid`, `euid`, `egid` - атомарно хранятся в `Process`, наследуются при `fork()`, синхронизируются в VFS-контекст при каждом syscall |
 
 ---
 
@@ -785,7 +785,7 @@ bits 12.. = номер swap слота
 | **Безопасность** | TLS 1.2 / 1.3 (ECDHE + RSA + AES-GCM, constant-time) |
 | **Userspace сокеты** | AF_INET/SOCK_STREAM через syscall 56-59; `SOCK_FD_BASE=4096`; блокирующий TCP-клиент, таймаут 30 с; до 64 сокетов |
 
-**netd** — сервис mikuD, зарегистрированный на таргете `MultiUser`, автоматически выполняет DHCP после появления линка, не блокируя загрузку.
+**netd** - сервис mikuD, зарегистрированный на таргете `MultiUser`, автоматически выполняет DHCP после появления линка, не блокируя загрузку.
 
 </details>
 
@@ -881,7 +881,7 @@ bits 12.. = номер swap слота
 |:--:|:--:|:--|
 | **tmpfs** | `/` | RAM-based корневая FS |
 | **devfs** | `/dev` | Устройства: `null`, `zero`, `random`, `urandom`, `console` |
-| **procfs** | `/proc` | `version`, `uptime`, `meminfo`, `mounts`, `cpuinfo`, `stat` |
+| **procfs** | `/proc` | `version`, `uptime`, `meminfo`, `mounts`, `cpuinfo`, `stat`, `heap`, `diskstats` |
 | **ext2** | `/mnt` | Полная запись/чтение реального диска |
 | **ext3** | `/mnt` | Журналирование (JBD2) поверх ext2, отложенная запись |
 | **ext4** | `/mnt` | Файлы на основе экстентов + crc32c контрольные суммы |
@@ -1066,7 +1066,8 @@ bits 12.. = номер swap слота
 | `mkfs.ext2 <drive>` | Форматирование ext2 |
 | `mkfs.ext3 <drive>` | Форматирование ext3 (с журналом) |
 | `mkfs.ext4 <drive>` | Форматирование ext4 (экстенты + журнал) |
-| `blkstat` | Показать все блочные устройства (ATA/AHCI/NVMe/virtio-blk) + BIO-очередь + статистика кэша |
+| `blkstat` | Показать все блочные устройства (ATA/AHCI/NVMe/virtio-blk) + дерево GPT-разделов + BIO-очередь + статистика кэша |
+| `smart <drive>` | SMART / NVMe отчёт здоровья: статус, температура, износ, часы работы, объём R/W |
 | `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run форматирование (только layout) |
 | `gpt <drive>` | Показать таблицу GPT |
 | `gpt.init <drive>` | Инициализировать пустой GPT |
@@ -1229,7 +1230,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 
 #### Обзор
 
-Блочный уровень — единая точка маршрутизации между файловыми системами и драйверами хранилищ, по образцу Linux generic block layer. Конкретные драйверы регистрируются один раз за стабильным `BlockDevId`; уровни выше никогда не держат драйвер напрямую.
+Блочный уровень - единая точка маршрутизации между файловыми системами и драйверами хранилищ, по образцу Linux generic block layer. Конкретные драйверы регистрируются один раз за стабильным `BlockDevId`; уровни выше никогда не держат драйвер напрямую.
 
 | Параметр | Значение |
 |:--|:--|
@@ -1237,7 +1238,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **Макс. устройств** | 8 |
 | **Учёт I/O** | BIO-очередь: счётчики submitted / completed / errors |
 | **Блокировки** | Per-device mutex слота; ATA-слоты делят bus lock; PCI-устройства полностью параллельны |
-| **Ретраи** | Transient-ошибки (timeout/fault) — до 2 прозрачных повторов; счётчики errors/retries на устройство |
+| **Ретраи** | Transient-ошибки (timeout/fault) - до 2 прозрачных повторов; счётчики errors/retries на устройство |
 | **Латентность** | Замер каждого запроса по TSC; средняя латентность в `blkstat` (аналог iostat await) |
 
 #### API
@@ -1246,13 +1247,14 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 |:--|:--|
 | `block::probe()` | Обход PCI-шины: регистрирует AHCI-порты, virtio-blk и NVMe в IDs 4-7 |
 | `block::read(dev, lba, count, buf)` | Кэшированное чтение; последовательные промахи запускают readahead |
-| `block::write(dev, lba, count, buf)` | Write-back: данные попадают в кэш, запись на диск — при flush/вытеснении |
+| `block::write(dev, lba, count, buf)` | Write-back: данные попадают в кэш, запись на диск - при flush/вытеснении |
 | `block::write_sync(dev, lba, count, buf)` | Write-through: запись завершается до возврата (журналы, GPT, swap) |
 | `block::flush(dev)` | Сброс грязных чанков (elevator-порядок) + flush volatile-кэша устройства |
 | `block::info(dev)` | Геометрия / идентичность устройства |
 | `block::cache_stats()` | `(hits, misses, readaheads, dirty)` |
 | `block::io_stats()` | `(submitted, completed, errors)` из BIO-очереди |
-| `block::dev_stats(dev)` | `(kind, sectors_read, sectors_written)` на устройство |
+| `block::dev_stats(dev)` | `(kind, sectors_read, sectors_written, ios, avg_io_us)` на устройство |
+| `block::health(dev)` | SMART / NVMe снимок здоровья; `None` если бэкенд не поддерживает |
 
 #### Буферный кэш
 
@@ -1261,7 +1263,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **Гранулярность** | 4 KiB чанки (8 секторов на чанк) |
 | **Объём** | 512 чанков × 4 KiB = **2 MiB** |
 | **Организация** | 8-way set-associative, 64 набора, per-set LRU |
-| **Политика** | Write-back; `write_sync` — write-through для упорядоченных записей |
+| **Политика** | Write-back; `write_sync` - write-through для упорядоченных записей |
 | **Readahead** | Адаптивный: 32 KiB на свежий последовательный поток, до 64 KiB (16 чанков) на устойчивый |
 | **Грязный лимит** | Flush при 256 грязных чанках (high-water mark) |
 | **bdflush** | Фоновый сервис mikuD: каждые 2 с сбрасывает грязные чанки на диск (элеваторная развёртка по LBA) |
@@ -1292,6 +1294,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **Завершение** | Полинг CQ phase bit |
 | **Память** | Один page-aligned аллок: admin SQ/CQ, I/O SQ/CQ, PRP list, IDENTIFY, bounce |
 | **Опкоды** | NVM READ (0x02), NVM WRITE (0x01), NVM FLUSH (0x00) |
+| **Здоровье** | Get Log Page (LID 0x02) - SMART/Health Information (512 байт): температура, износ, POH, объём R/W |
 
 #### virtio-blk (legacy/transitional)
 
@@ -1300,7 +1303,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **Транспорт** | Legacy virtio-pci, port I/O (BAR0) |
 | **Кольцо** | Layout вычисляется runtime из размера очереди устройства |
 | **Макс. очередь** | 256 дескрипторов |
-| **Передача** | До 128 секторов (64 KiB) на запрос; большие — чанкуются block layer |
+| **Передача** | До 128 секторов (64 KiB) на запрос; большие - чанкуются block layer |
 | **Возможности** | FEATURE_BLK_FLUSH (bit 9) согласован |
 
 #### ATA (legacy PIO)
@@ -1313,6 +1316,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **Защита** | Flush кэша после записи, таймаут 50K итераций |
 | **Адресация** | LBA28 (до 128 ГБ) + **LBA48** (READ/WRITE EXT, 48-бит адресация) |
 | **DMA** | Определение и отслеживание возможности bus-master DMA |
+| **Здоровье** | SMART RETURN STATUS (cmd 0xB0/feature 0xDA): подпись LBA mid/high - здоровый или отказывающий |
 
 </details>
 
