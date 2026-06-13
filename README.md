@@ -1008,6 +1008,7 @@ Drive indices 0-3 address the legacy ATA slots, 4-7 the PCI-probed devices
 |:--|:--|
 | `blkstat` | Block layer overview: devices, per-device I/O counters, bio queue, buffer cache hit rate / dirty count |
 | `blkdiscard <drive> [lba count]` | Discard/TRIM a sector range (whole device when no range given) |
+| `blkzero <drive> <lba> <count>` | Zero a sector range (NVMe/virtio Write Zeroes, fallback writes) |
 | `fstrim` | Discard all free blocks of the active mounted ext filesystem (fstrim(8) analogue) |
 | `mkfs.ext2 <drive>` | Format ext2 |
 | `mkfs.ext3 <drive>` | Format ext3 (with journal) |
@@ -1078,9 +1079,11 @@ ATA PIO/DMA | AHCI | virtio-blk | NVMe
 | Component | Description |
 |:--|:--|
 | **Device registry** | 8 devices behind stable `BlockDevId`: 0-3 legacy ATA slots, 4-7 PCI-probed (AHCI/NVMe/virtio) |
-| **`BlockDriver` trait** | `read_blocks` / `write_blocks` / `flush` / `discard` / `info`, 64-bit LBA |
+| **`BlockDriver` trait** | `read_blocks` / `write_blocks` / `flush` / `discard` / `write_zeroes` / `info`, 64-bit LBA |
 | **Discard/TRIM** | `block::discard()` across all four backends (ATA/AHCI DSM TRIM, NVMe DSM deallocate, virtio-blk discard); fully covered cache chunks dropped before the device command |
+| **Write Zeroes** | `block::write_zeroes()`: NVMe (opcode 0x08) / virtio (`WRITE_ZEROES`) native command, zero-filled-write fallback otherwise |
 | **fstrim** | Filesystem-aware trim: walks ext block-group bitmaps and discards free-block runs; `mkfs.*` pre-discards the target region like real mkfs.ext4 |
+| **Raw block nodes** | `/dev/blkN` and `/dev/blkNpM` (major 8) expose whole disks and GPT partitions as byte-addressable devices on top of the block layer |
 | **Per-device locks** | I/O to distinct devices runs in parallel; legacy ATA slots share a bus lock (master/slave share ports) |
 | **Bio queue** | Live request accounting: submitted / completed / errors |
 | **Retries** | Transient errors (timeout / device fault) get up to 2 transparent re-issues; per-device error and retry counters |

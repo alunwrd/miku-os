@@ -351,12 +351,47 @@ pub fn cmd_touch(name: &str) {
     });
 }
 
+/// Print a byte slice as text without ever constructing a '&str' from
+/// invalid UTF-8 (which is undefined behavior and trips the debug
+/// 'char' validity check). Invalid sequences print as the replacement
+/// character, so binary data never panics the shell
+fn print_bytes_lossy(bytes: &[u8]) {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match core::str::from_utf8(rest) {
+            Ok(s) => {
+                print!("{}", s);
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                // safety: 'valid_up_to' guarantees this prefix is valid UTF-8
+                print!("{}", unsafe { core::str::from_utf8_unchecked(&rest[..valid]) });
+                print!("\u{FFFD}");
+                match e.error_len() {
+                    Some(len) => rest = &rest[valid + len..],
+                    None => break, // truncated trailing multibyte sequence
+                }
+            }
+        }
+    }
+}
+
 pub fn cmd_cat(name: &str) {
     let cwd = SESSION.lock().cwd;
-    let is_dev = name.starts_with("/dev/") || name.starts_with("dev/");
+    // A node is "device-like" (hex-dumped, not printed as text) when it
+    // resolves to a char/block device, regardless of the path spelling -
+    // 'cat urandom' from inside /dev must behave like 'cat /dev/urandom'
+    let mut is_dev = name.starts_with("/dev/") || name.starts_with("dev/");
     let ext2_ino: Option<u32> = with_vfs(|v| {
         match v.resolve_path(cwd, name) {
             Ok(id) if v.nodes[id].is_ext2_backed() => Some(v.nodes[id].ext2_ino),
+            Ok(id) => {
+                if v.nodes[id].is_device() {
+                    is_dev = true;
+                }
+                None
+            }
             _ => None,
         }
     });
@@ -380,8 +415,8 @@ pub fn cmd_cat(name: &str) {
             let mut buf = [0u8; 4096];
             let n = fs.read_file(&inode, 0, &mut buf[..read_size])?;
             console::set_color(230, 240, 240);
-            let s = unsafe { core::str::from_utf8_unchecked(&buf[..n]) };
-            println!("{}", s);
+            print_bytes_lossy(&buf[..n]);
+            println!("");
             console::reset_color();
             Ok(())
         });
@@ -415,8 +450,7 @@ pub fn cmd_cat(name: &str) {
                                     if (total + i + 1) % 16 == 0 { println!(""); }
                                 }
                             } else {
-                                let s = unsafe { core::str::from_utf8_unchecked(&buf[..n]) };
-                                print!("{}", s);
+                                print_bytes_lossy(&buf[..n]);
                             }
                             total += n;
                             if total >= max_read { break; }

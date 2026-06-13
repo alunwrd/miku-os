@@ -42,6 +42,7 @@ const NVM_WRITE: u8 = 0x01;
 const NVM_READ:  u8 = 0x02;
 const NVM_FLUSH: u8 = 0x00;
 const NVM_DSM:   u8 = 0x09; // Dataset Management (deallocate = discard)
+const NVM_WRITE_ZEROES: u8 = 0x08;
 
 const ADMIN_QD: usize = 16; // admin queue depth
 const IO_QD:    usize = 64; // I/O queue depth
@@ -88,6 +89,8 @@ pub struct Nvme {
     model_len: u8,
     /// Controller supports Dataset Management (ONCS bit 2) - the discard path
     has_dsm:   bool,
+    /// Controller supports Write Zeroes (ONCS bit 3)
+    has_wz:    bool,
 }
 
 #[inline]
@@ -188,6 +191,7 @@ impl Nvme {
             model:     [0u8; 40],
             model_len: 0,
             has_dsm:   false,
+            has_wz:    false,
         };
 
         // Reset: clear EN, wait for RDY to drop
@@ -226,9 +230,11 @@ impl Nvme {
         while n > 0 && (drv.model[n - 1] == b' ' || drv.model[n - 1] == 0) { n -= 1; }
         drv.model_len = n as u8;
 
-        // Optional NVM command support (ONCS, bytes 520-521): bit 2 = DSM
+        // Optional NVM command support (ONCS, bytes 520-521):
+        // bit 2 = DSM (discard), bit 3 = Write Zeroes
         let oncs = u16::from_le_bytes([drv.mem.ident[520], drv.mem.ident[521]]);
         drv.has_dsm = oncs & (1 << 2) != 0;
+        drv.has_wz  = oncs & (1 << 3) != 0;
 
         // IDENTIFY namespace 1 (CNS=0): size + LBA format
         if drv.admin_cmd(ADM_IDENTIFY, drv.nsid, ident_phys, 0, 0).is_err() {
@@ -270,10 +276,10 @@ impl Nvme {
         }
 
         crate::serial_println!(
-            "[nvme] '{}' ns{} {} sectors ({} MB) qd={} dsm={}",
+            "[nvme] '{}' ns{} {} sectors ({} MB) qd={} dsm={} wz={}",
             core::str::from_utf8(&drv.model[..drv.model_len as usize]).unwrap_or("?"),
             drv.nsid, drv.capacity, drv.capacity * 512 / (1024 * 1024), drv.io.depth,
-            drv.has_dsm
+            drv.has_dsm, drv.has_wz
         );
         Some(drv)
     }
@@ -484,6 +490,28 @@ impl BlockDriver for Nvme {
         // cdw10 = number of ranges - 1 = 0; cdw11 bit 2 (AD) = deallocate
         e[44..48].copy_from_slice(&(1u32 << 2).to_le_bytes());
         self.submit(1, &e)
+    }
+
+    /// Write Zeroes: zeroes the range on the device without moving data.
+    /// NLB is a 16-bit 0-based count, so up to 65536 sectors per command
+    fn write_zeroes(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
+        if !self.has_wz {
+            return Err(BlkError::Unsupported);
+        }
+        let mut done = 0u32;
+        while done < count {
+            let n = (count - done).min(65536);
+            let cur = lba + done as u64;
+            let mut e = [0u8; 64];
+            e[0] = NVM_WRITE_ZEROES;
+            e[4..8].copy_from_slice(&self.nsid.to_le_bytes());
+            e[40..44].copy_from_slice(&(cur as u32).to_le_bytes());
+            e[44..48].copy_from_slice(&((cur >> 32) as u32).to_le_bytes());
+            e[48..52].copy_from_slice(&(n - 1).to_le_bytes());
+            self.submit(1, &e)?;
+            done += n;
+        }
+        Ok(())
     }
 
     /// SMART / Health Information log page (LID 0x02, 512 bytes)

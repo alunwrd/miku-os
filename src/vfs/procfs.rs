@@ -41,7 +41,7 @@ pub fn proc_read(name: &str, buf: &mut [u8], vnode_used: usize) -> VfsResult<usi
     let mut tmp = [0u8; 192];
     let len = match name {
         "version" => {
-            let s = b"MikuOS v0.2.7-rc (x86_64)\nbuilt with love <3\n";
+            let s = b"MikuOS v0.2.8-rc (x86_64)\nbuilt with love <3\n";
             let l = s.len().min(192);
             tmp[..l].copy_from_slice(&s[..l]);
             l

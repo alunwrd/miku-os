@@ -34,8 +34,9 @@ const STATUS_DRIVER:      u8 = 0x02;
 const STATUS_DRIVER_OK:   u8 = 0x04;
 const STATUS_FAILED:      u8 = 0x80;
 
-const FEATURE_BLK_FLUSH:   u32 = 1 << 9;
-const FEATURE_BLK_DISCARD: u32 = 1 << 13;
+const FEATURE_BLK_FLUSH:        u32 = 1 << 9;
+const FEATURE_BLK_DISCARD:      u32 = 1 << 13;
+const FEATURE_BLK_WRITE_ZEROES: u32 = 1 << 14;
 
 const VRING_DESC_F_NEXT:  u16 = 0x0001;
 const VRING_DESC_F_WRITE: u16 = 0x0002;
@@ -44,7 +45,8 @@ const VRING_DESC_F_WRITE: u16 = 0x0002;
 const VIRTIO_BLK_T_IN:      u32 = 0; // device -> driver (read)
 const VIRTIO_BLK_T_OUT:     u32 = 1; // driver -> device (write)
 const VIRTIO_BLK_T_FLUSH:   u32 = 4;
-const VIRTIO_BLK_T_DISCARD: u32 = 11; // payload: discard segments, no data
+const VIRTIO_BLK_T_DISCARD:      u32 = 11; // payload: discard segments, no data
+const VIRTIO_BLK_T_WRITE_ZEROES: u32 = 13; // same segment payload as discard
 
 // Request status byte written by the device
 const VIRTIO_BLK_S_OK: u8 = 0;
@@ -94,6 +96,9 @@ pub struct VirtioBlk {
     /// sector cap from device config (0 = device stated no limit)
     has_discard: bool,
     max_discard: u32,
+    /// VIRTIO_BLK_F_WRITE_ZEROES negotiated, with its own sector cap
+    has_wz: bool,
+    max_wz: u32,
 }
 
 macro_rules! ior16 { ($base:expr, $off:expr) => { unsafe { Port::<u16>::new($base + $off).read() } } }
@@ -159,8 +164,9 @@ impl VirtioBlk {
         let dev_features = ior32!(io_base, REG_DEVICE_FEATURES);
         let has_flush   = dev_features & FEATURE_BLK_FLUSH != 0;
         let has_discard = dev_features & FEATURE_BLK_DISCARD != 0;
+        let has_wz      = dev_features & FEATURE_BLK_WRITE_ZEROES != 0;
         iow32!(io_base, REG_GUEST_FEATURES,
-            dev_features & (FEATURE_BLK_FLUSH | FEATURE_BLK_DISCARD));
+            dev_features & (FEATURE_BLK_FLUSH | FEATURE_BLK_DISCARD | FEATURE_BLK_WRITE_ZEROES));
 
         // Queue 0 is the only virtio-blk request queue
         iow16!(io_base, REG_QUEUE_SELECT, 0);
@@ -191,6 +197,8 @@ impl VirtioBlk {
             has_flush,
             has_discard,
             max_discard: 0,
+            has_wz,
+            max_wz: 0,
         };
 
         let ring_phys = crate::net::virt_to_phys(drv.ring.0.as_ptr() as u64);
@@ -204,15 +212,19 @@ impl VirtioBlk {
         let cap_hi = ior32!(io_base, REG_CONFIG_CAPACITY + 4) as u64;
         drv.capacity = cap_lo | (cap_hi << 32);
 
-        // max_discard_sectors lives at offset 36 of the blk config block
+        // Per-request caps from the blk config block: max_discard_sectors at
+        // offset 36, max_write_zeroes_sectors at offset 48
         if has_discard {
             drv.max_discard = ior32!(io_base, REG_CONFIG_CAPACITY + 36);
         }
+        if has_wz {
+            drv.max_wz = ior32!(io_base, REG_CONFIG_CAPACITY + 48);
+        }
 
         crate::serial_println!(
-            "[virtio-blk] io=0x{:04X} queue={} capacity={} sectors ({} MB) flush={} discard={}",
+            "[virtio-blk] io=0x{:04X} queue={} capacity={} sectors ({} MB) flush={} discard={} wz={}",
             io_base, queue_num, drv.capacity, drv.capacity * 512 / (1024 * 1024),
-            has_flush, has_discard
+            has_flush, has_discard, has_wz
         );
         Some(drv)
     }
@@ -353,6 +365,26 @@ impl BlockDriver for VirtioBlk {
             self.dma.data[8..12].copy_from_slice(&n.to_le_bytes());
             self.dma.data[12..16].copy_from_slice(&0u32.to_le_bytes());
             self.request(VIRTIO_BLK_T_DISCARD, 0, 16)?;
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// Write zeroes: same 16-byte segment as discard, request type 13.
+    /// flags = 0 (no unmap hint), capped at the device's per-request limit
+    fn write_zeroes(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
+        if !self.has_wz {
+            return Err(BlkError::Unsupported);
+        }
+        let cap = if self.max_wz == 0 { u32::MAX } else { self.max_wz };
+        let mut done = 0u32;
+        while done < count {
+            let n = (count - done).min(cap);
+            let seg_lba = lba + done as u64;
+            self.dma.data[0..8].copy_from_slice(&seg_lba.to_le_bytes());
+            self.dma.data[8..12].copy_from_slice(&n.to_le_bytes());
+            self.dma.data[12..16].copy_from_slice(&0u32.to_le_bytes());
+            self.request(VIRTIO_BLK_T_WRITE_ZEROES, 0, 16)?;
             done += n;
         }
         Ok(())

@@ -425,6 +425,10 @@ pub fn execute(input: &str) {
             else { disk_cmds::cmd_blkdiscard(rest); }
         }
         "fstrim"     => disk_cmds::cmd_fstrim(),
+        "blkzero"    => {
+            if a1.is_empty() { println!("Usage: blkzero <drive 0-7> <lba> <count>"); }
+            else { disk_cmds::cmd_blkzero(rest); }
+        }
         "smart"      => disk_cmds::cmd_smart(a1),
         "swapon.raw" => disk_cmds::cmd_swapon_raw(rest),
         "swapon.auto"=> disk_cmds::cmd_swapon_auto(),

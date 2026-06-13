@@ -100,6 +100,41 @@ pub fn cmd_blkstat() {
     );
 }
 
+/// Zero a sector range - blkdiscard(8) with --zeroout. Uses the device's
+/// native Write Zeroes command when present, zero-filled writes otherwise
+pub fn cmd_blkzero(args: &str) {
+    let mut it = args.split_whitespace();
+    let (Some(idx), Some(lba), Some(count)) = (
+        it.next().and_then(parse_drive),
+        it.next().and_then(|s| s.parse::<u64>().ok()),
+        it.next().and_then(|s| s.parse::<u64>().ok()),
+    ) else {
+        print_error!("  usage: blkzero <drive 0-7> <lba> <count>");
+        return;
+    };
+    let dev = blk_dev(idx);
+    if crate::block::info(dev).is_none() {
+        print_error!("  no device blk{}", idx);
+        return;
+    }
+
+    let mut done = 0u64;
+    while done < count {
+        let n = (count - done).min(u32::MAX as u64) as u32;
+        match crate::block::write_zeroes(dev, lba + done, n) {
+            Ok(()) => done += n as u64,
+            Err(e) => {
+                print_error!("  blk{}: zeroing failed at lba {}: {:?}", idx, lba + done, e);
+                return;
+            }
+        }
+    }
+    print_success!(
+        "  blk{}: zeroed {} sectors ({} KB) at lba {}",
+        idx, count, count * 512 / 1024, lba
+    );
+}
+
 /// fstrim(8) analogue: discard every free block of the active mounted ext
 /// filesystem, walking the group bitmaps, so the device can unmap the space
 pub fn cmd_fstrim() {

@@ -100,4 +100,11 @@ pub trait BlockDriver: Send {
     fn discard(&mut self, _lba: u64, _count: u32) -> Result<(), BlkError> {
         Err(BlkError::Unsupported)
     }
+    /// Zero the sector range without transferring data (NVMe Write Zeroes,
+    /// virtio WRITE_ZEROES). Unlike 'discard', the range must read back as
+    /// zeros afterwards. The block layer falls back to writing zero-filled
+    /// buffers when the backend reports 'Unsupported'
+    fn write_zeroes(&mut self, _lba: u64, _count: u32) -> Result<(), BlkError> {
+        Err(BlkError::Unsupported)
+    }
 }

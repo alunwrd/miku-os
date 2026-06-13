@@ -190,7 +190,7 @@ lazy_static! {
 
 pub fn init() {
     serial_println!("[shell] init");
-    cprintln!(57, 197, 187, "MikuOS v0.2.7-rc");
+    cprintln!(57, 197, 187, "MikuOS v0.2.8-rc");
     prompt();
 }
 

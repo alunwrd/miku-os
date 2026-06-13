@@ -212,6 +212,32 @@ pub fn probe() {
     }
 }
 
+/// GPT partition ranges per device - '(start_lba, sector_count)' - filled
+/// when the /dev block nodes are registered. Indexed by partition number
+/// minus one; 15 partitions per device match the /dev minor encoding
+/// ('minor = dev * 16 + part')
+static PARTITIONS: Mutex<[[Option<(u64, u64)>; 15]; MAX_BLOCK_DEVICES]> =
+    Mutex::new([[None; 15]; MAX_BLOCK_DEVICES]);
+
+pub fn set_partition(dev_id: BlockDevId, part_idx: usize, start_lba: u64, sectors: u64) {
+    if (dev_id as usize) < MAX_BLOCK_DEVICES && part_idx < 15 {
+        PARTITIONS.lock()[dev_id as usize][part_idx] = Some((start_lba, sectors));
+    }
+}
+
+/// Sector range behind a /dev block node: part 0 is the whole disk,
+/// parts 1-15 are GPT partitions registered via 'set_partition'
+pub fn node_range(dev_id: BlockDevId, part: u8) -> Option<(u64, u64)> {
+    if part == 0 {
+        let i = info(dev_id)?;
+        if i.total_sectors == 0 {
+            return None;
+        }
+        return Some((0, i.total_sectors));
+    }
+    *PARTITIONS.lock().get(dev_id as usize)?.get(part as usize - 1)?
+}
+
 /// Geometry/identity for a registered device, if present
 pub fn info(dev_id: BlockDevId) -> Option<BlockDevInfo> {
     let slot = slot_ref(dev_id)?;
@@ -553,6 +579,65 @@ pub fn discard(dev_id: BlockDevId, lba: u64, count: u32) -> Result<(), BlkError>
         c.invalidate_covered(dev_id, lba, count);
     }
     dispatch(dev_id, BioDirection::Discard, lba, count, |drv| drv.discard(lba, count))
+}
+
+/// Zero a sector range. Unlike 'discard', the range is guaranteed to read
+/// back as zeros. The chunk-aligned middle takes the device-side fast path
+/// (NVMe Write Zeroes / virtio WRITE_ZEROES - no data transfer); its cache
+/// chunks are dropped so later reads refetch zeros. The unaligned edges go
+/// through the regular write path, which keeps partially covered cache
+/// chunks coherent. Devices without a native command get zero-filled
+/// buffer writes instead
+pub fn write_zeroes(dev_id: BlockDevId, lba: u64, count: u32) -> Result<(), BlkError> {
+    let Some(inf) = info(dev_id) else { return Err(BlkError::NoDevice) };
+    if inf.read_only {
+        return Err(BlkError::ReadOnly);
+    }
+    let end = (lba + count as u64).min(inf.total_sectors);
+    if lba >= end {
+        return Ok(());
+    }
+
+    let zeros = [0u8; cache::CHUNK_BYTES];
+    let mid_start = (lba + cache::CHUNK_SECTORS - 1) & !(cache::CHUNK_SECTORS - 1);
+    let mid_end   = end & !(cache::CHUNK_SECTORS - 1);
+
+    if mid_start >= mid_end {
+        // Range smaller than one aligned chunk: a plain zero write suffices
+        return write(dev_id, lba, (end - lba) as u32, &zeros[..((end - lba) * 512) as usize]);
+    }
+    if lba < mid_start {
+        write(dev_id, lba, (mid_start - lba) as u32, &zeros[..((mid_start - lba) * 512) as usize])?;
+    }
+    if mid_end < end {
+        write(dev_id, mid_end, (end - mid_end) as u32, &zeros[..((end - mid_end) * 512) as usize])?;
+    }
+
+    if let Some(c) = CACHE.lock().as_mut() {
+        c.invalidate_covered(dev_id, mid_start, (mid_end - mid_start) as u32);
+    }
+
+    let mid_count = (mid_end - mid_start) as u32;
+    let r = dispatch(dev_id, BioDirection::Write, mid_start, mid_count, |drv| {
+        drv.write_zeroes(mid_start, mid_count)
+    });
+    if !matches!(r, Err(BlkError::Unsupported)) {
+        return r;
+    }
+
+    // Fallback: stream zero-filled buffers, one full transfer at a time
+    let zbuf = [0u8; 16 * cache::CHUNK_BYTES];
+    let mut at = mid_start;
+    let mut left = mid_count;
+    while left > 0 {
+        let n = left.min((zbuf.len() / 512) as u32);
+        dispatch(dev_id, BioDirection::Write, at, n, |drv| {
+            drv.write_blocks(at, n, &zbuf[..n as usize * 512])
+        })?;
+        at += n as u64;
+        left -= n;
+    }
+    Ok(())
 }
 
 /// Flush barrier: drain the device's dirty chunks (elevator-ordered), then

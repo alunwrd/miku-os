@@ -76,7 +76,7 @@ fn draw_title(w: usize, h: usize) {
     // Using the text console: set the cursor near the center and write.
     // Because the console is fixed-pitch with CHAR_WIDTH=9 per glyph, we
     // compute a roughly-centered x
-    let title = "MikuOS v0.2.7-rc";
+    let title = "MikuOS v0.2.8-rc";
     let title_px = title.len() * 9;
     let x = (w.saturating_sub(title_px)) / 2;
     draw_text_at(x, cy - 20, title, 57, 197, 187);

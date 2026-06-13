@@ -6,6 +6,30 @@ use crate::vfs::devfs;
 use crate::vfs::procfs;
 use crate::vfs::types::*;
 
+/// Format a raw block-node name into 'buf': "blkN" for part 0, "blkNpM"
+/// otherwise. Returns the byte length written
+fn fmt_block_name(buf: &mut [u8; 8], dev: u8, part: u8) -> usize {
+    fn push_dec(buf: &mut [u8; 8], pos: &mut usize, mut v: u8) {
+        if v >= 10 {
+            buf[*pos] = b'0' + v / 10;
+            *pos += 1;
+            v %= 10;
+        }
+        buf[*pos] = b'0' + v;
+        *pos += 1;
+    }
+    let mut pos = 0;
+    buf[..3].copy_from_slice(b"blk");
+    pos += 3;
+    push_dec(buf, &mut pos, dev);
+    if part > 0 {
+        buf[pos] = b'p';
+        pos += 1;
+        push_dec(buf, &mut pos, part);
+    }
+    pos
+}
+
 mod syslibs {
     pub struct SysLib {
         pub dir: &'static str,
@@ -254,6 +278,88 @@ impl MikuVFS {
         }
 
         crate::serial_println!("[vfs] devfs: {} devices mounted at /dev", count);
+    }
+
+    /// Populate /dev with raw block-device nodes once the block layer has
+    /// probed its controllers. Run from 'kernel_main' after 'block::probe'
+    /// (devfs itself is mounted earlier, before any device exists). Each
+    /// registered device gets /dev/blkN for the whole disk, plus
+    /// /dev/blkNpM for every used GPT partition
+    pub fn register_block_nodes(&mut self) {
+        use crate::vfs::devfs::DevType;
+
+        // The four legacy ATA slots register lazily on first use; force them
+        // in so their disks appear in /dev too (PCI devices are already up)
+        for idx in 0..4 {
+            let _ = crate::block::register_ata(crate::ata::AtaDrive::from_idx(idx));
+        }
+
+        let Some(&dev_dir) = self.nodes[0].children.find_by_name("dev").map(|id| id as usize).as_ref()
+        else {
+            crate::serial_println!("[vfs] register_block_nodes: no /dev");
+            return;
+        };
+
+        let mut count = 0u8;
+        for dev in 0..crate::vfs::types::MAX_BLOCK_DEVICES as u8 {
+            let Some(info) = crate::block::info(dev) else { continue };
+            if info.total_sectors == 0 && info.model_len == 0 {
+                continue;
+            }
+
+            // Whole-disk node /dev/blkN (partition 0)
+            let mut name = [0u8; 8];
+            let nlen = fmt_block_name(&mut name, dev, 0);
+            let nstr = core::str::from_utf8(&name[..nlen]).unwrap_or("blk");
+            self.add_block_node(dev_dir, nstr, DevType::Block { dev, part: 0 },
+                info.total_sectors * 512);
+            count += 1;
+
+            // GPT partitions -> /dev/blkNpM, recording each range so byte
+            // I/O on the node is clamped to the partition
+            if let Ok(tbl) = crate::gpt::gpt_read(dev) {
+                for (i, e) in tbl.entries.iter().enumerate() {
+                    if !e.is_used() || i >= 15 { continue; }
+                    let part = (i + 1) as u8;
+                    let sectors = e.size_sectors();
+                    crate::block::set_partition(dev, i, e.start_lba, sectors);
+
+                    let plen = fmt_block_name(&mut name, dev, part);
+                    let pstr = core::str::from_utf8(&name[..plen]).unwrap_or("blk");
+                    self.add_block_node(dev_dir, pstr, DevType::Block { dev, part },
+                        sectors * 512);
+                    count += 1;
+                }
+            }
+        }
+        crate::serial_println!("[vfs] devfs: {} block nodes registered in /dev", count);
+    }
+
+    fn add_block_node(&mut self, dev_dir: usize, name: &str,
+        dev_type: crate::vfs::devfs::DevType, size: u64)
+    {
+        // Idempotent: a re-probe must not double-insert
+        if self.nodes[dev_dir].children.find_by_name(name).is_some() {
+            return;
+        }
+        let Ok(id) = self.alloc_vnode() else { return };
+        self.nodes[id].init(
+            id as InodeId,
+            dev_dir as InodeId,
+            name,
+            VNodeKind::BlockDevice,
+            FsType::DevFS,
+            FileMode::default_dev(),
+            0,
+            0,
+            self.now(),
+        );
+        self.nodes[id].dev_major = dev_type.major();
+        self.nodes[id].dev_minor = dev_type.minor();
+        self.nodes[id].size = size;
+        if !self.nodes[dev_dir].children.insert(name, id as InodeId) {
+            self.nodes[id].active = false;
+        }
     }
 
     fn mount_procfs(&mut self) {

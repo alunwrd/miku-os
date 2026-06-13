@@ -876,7 +876,7 @@ immutableフラグにより unlink / write / rename は拒否されます。
 | FS | マウントポイント | 説明 |
 |:--:|:--:|:--|
 | **tmpfs** | `/` | RAMベースのルートFS |
-| **devfs** | `/dev` | デバイス: `null`、`zero`、`random`、`urandom`、`console` |
+| **devfs** | `/dev` | デバイス: `null`、`zero`、`random`、`urandom`、`console`、および生ブロックノード `blkN` / `blkNpM` (major 8) |
 | **procfs** | `/proc` | `version`、`uptime`、`meminfo`、`mounts`、`cpuinfo`、`stat`、`heap`、`diskstats` |
 | **ext2** | `/mnt` | 実ディスクへの完全な読み書き |
 | **ext3** | `/mnt` | ext2上のジャーナリング (JBD2)、遅延書き込み |
@@ -1060,6 +1060,7 @@ immutableフラグにより unlink / write / rename は拒否されます。
 |:--|:--|
 | `blkstat` | 全ブロックデバイス (ATA/AHCI/NVMe/virtio-blk) + GPT パーティションツリー + BIO キュー + キャッシュ統計 |
 | `blkdiscard <drive> [lba count]` | セクター範囲の discard/TRIM (範囲省略でディスク全体); blkdiscard(8) 相当 |
+| `blkzero <drive> <lba> <count>` | セクター範囲のゼロ化 (NVMe/virtio Write Zeroes、フォールバックはゼロ書き込み) |
 | `fstrim` | アクティブなマウント済み ext FS の全フリーブロックをグループビットマップ走査で discard; fstrim(8) 相当 |
 | `smart <drive>` | SMART / NVMe ヘルスレポート: ステータス・温度・消耗度・電源投入時間・読み書き量 |
 | `mkfs.ext2 <drive>` | ext2フォーマット |
@@ -1224,6 +1225,7 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 | `block::write_sync(dev, lba, count, buf)` | ライトスルー: 戻る前にデバイス書き込み完了 (ジャーナル、GPT、swap) |
 | `block::flush(dev)` | ダーティチャンクのドレイン (エレベーター順) + デバイスライトキャッシュフラッシュ |
 | `block::discard(dev, lba, count)` | セクター範囲の discard/TRIM; 完全に覆われたキャッシュチャンク (ダーティ含む) はデバイスコマンド前に破棄 |
+| `block::write_zeroes(dev, lba, count)` | 範囲のゼロ化; 整列した中央は NVMe/virtio ネイティブ Write Zeroes、端は通常書き込み、フォールバックはゼロ書き込み |
 | `MikuFS::trim_free_blocks(minlen)` | FITRIM: マウント済み FS のグループビットマップを走査しフリーブロック連を discard (`fstrim` コマンド); `mkfs.*` はフォーマット前に対象領域全体を discard |
 | `block::info(dev)` | デバイスのジオメトリ / 識別情報 (`discard` 対応フラグ含む) |
 | `block::cache_stats()` | `(hits, misses, readaheads, write_merges, dirty)` |
@@ -1272,6 +1274,7 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 | **メモリ** | ページアライン単一アロケーション: admin SQ/CQ、I/O SQ/CQ、PRP リスト、IDENTIFY、バウンス |
 | **オペコード** | NVM READ (0x02)、NVM WRITE (0x01)、NVM FLUSH (0x00)、NVM DSM (0x09、deallocate = discard) |
 | **Discard** | deallocate 属性付き Dataset Management; ONCS ビット 2 で対応判定 |
+| **Write Zeroes** | Write Zeroes コマンド (オペコード 0x08); ONCS ビット 3 で対応判定 |
 | **ヘルス** | Get Log Page (LID 0x02) - SMART/Health Information (512 バイト): 温度・消耗度・POH・読み書き量 |
 
 #### virtio-blk (レガシー/トランジショナル)
@@ -1282,7 +1285,7 @@ GSP-RM イメージ (gsp_t.bin) は含まれません - NVIDIA open-kernel-modul
 | **リング** | レイアウトはデバイス報告のキューサイズから実行時計算 |
 | **最大キュー** | 256 デスクリプター |
 | **転送** | リクエストあたり最大 128 セクター (64 KiB); 大きい転送はブロック層でチャンク化 |
-| **機能** | FLUSH (bit 9) と DISCARD (bit 13) をネゴシエーション; discard はコンフィグの `max_discard_sectors` で制限 |
+| **機能** | FLUSH (bit 9)、DISCARD (bit 13)、WRITE_ZEROES (bit 14) をネゴシエーション; discard/ゼロ化はコンフィグの `max_discard_sectors` / `max_write_zeroes_sectors` で制限 |
 
 #### ATA (レガシー PIO)
 

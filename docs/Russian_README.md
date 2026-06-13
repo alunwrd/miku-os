@@ -880,7 +880,7 @@ bits 12.. = номер swap слота
 | FS | Точка монтирования | Описание |
 |:--:|:--:|:--|
 | **tmpfs** | `/` | RAM-based корневая FS |
-| **devfs** | `/dev` | Устройства: `null`, `zero`, `random`, `urandom`, `console` |
+| **devfs** | `/dev` | Устройства: `null`, `zero`, `random`, `urandom`, `console`, плюс сырые блочные узлы `blkN` / `blkNpM` (major 8) |
 | **procfs** | `/proc` | `version`, `uptime`, `meminfo`, `mounts`, `cpuinfo`, `stat`, `heap`, `diskstats` |
 | **ext2** | `/mnt` | Полная запись/чтение реального диска |
 | **ext3** | `/mnt` | Журналирование (JBD2) поверх ext2, отложенная запись |
@@ -1068,6 +1068,7 @@ bits 12.. = номер swap слота
 | `mkfs.ext4 <drive>` | Форматирование ext4 (экстенты + журнал) |
 | `blkstat` | Показать все блочные устройства (ATA/AHCI/NVMe/virtio-blk) + дерево GPT-разделов + BIO-очередь + статистика кэша |
 | `blkdiscard <drive> [lba count]` | Discard/TRIM диапазона секторов (без диапазона - весь диск); аналог blkdiscard(8) |
+| `blkzero <drive> <lba> <count>` | Обнуление диапазона секторов (NVMe/virtio Write Zeroes, фоллбэк - запись нулей) |
 | `fstrim` | Discard всех свободных блоков активной смонтированной ext-ФС по битмапам групп; аналог fstrim(8) |
 | `smart <drive>` | SMART / NVMe отчёт здоровья: статус, температура, износ, часы работы, объём R/W |
 | `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run форматирование (только layout) |
@@ -1253,6 +1254,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | `block::write_sync(dev, lba, count, buf)` | Write-through: запись завершается до возврата (журналы, GPT, swap) |
 | `block::flush(dev)` | Сброс грязных чанков (elevator-порядок) + flush volatile-кэша устройства |
 | `block::discard(dev, lba, count)` | Discard/TRIM диапазона секторов; полностью покрытые чанки кэша сбрасываются (включая грязные) до команды устройству |
+| `block::write_zeroes(dev, lba, count)` | Обнуление диапазона; нативный Write Zeroes (NVMe/virtio) для выровненной середины, обычная запись по краям, фоллбэк - запись нулей |
 | `MikuFS::trim_free_blocks(minlen)` | FITRIM: обход битмапов групп смонтированной ФС, discard серий свободных блоков (команда `fstrim`); mkfs.* предварительно discard-ит всю область |
 | `block::info(dev)` | Геометрия / идентичность устройства (включая флаг `discard`) |
 | `block::cache_stats()` | `(hits, misses, readaheads, write_merges, dirty)` |
@@ -1301,6 +1303,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **Память** | Один page-aligned аллок: admin SQ/CQ, I/O SQ/CQ, PRP list, IDENTIFY, bounce |
 | **Опкоды** | NVM READ (0x02), NVM WRITE (0x01), NVM FLUSH (0x00), NVM DSM (0x09, deallocate = discard) |
 | **Discard** | Dataset Management с атрибутом deallocate; поддержка по биту 2 ONCS |
+| **Write Zeroes** | Команда Write Zeroes (опкод 0x08); поддержка по биту 3 ONCS |
 | **Здоровье** | Get Log Page (LID 0x02) - SMART/Health Information (512 байт): температура, износ, POH, объём R/W |
 
 #### virtio-blk (legacy/transitional)
@@ -1311,7 +1314,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **Кольцо** | Layout вычисляется runtime из размера очереди устройства |
 | **Макс. очередь** | 256 дескрипторов |
 | **Передача** | До 128 секторов (64 KiB) на запрос; большие - чанкуются block layer |
-| **Возможности** | FLUSH (bit 9) и DISCARD (bit 13) согласованы; discard ограничен `max_discard_sectors` из конфига |
+| **Возможности** | FLUSH (bit 9), DISCARD (bit 13) и WRITE_ZEROES (bit 14) согласованы; discard/обнуление ограничены `max_discard_sectors` / `max_write_zeroes_sectors` из конфига |
 
 #### ATA (legacy PIO)
 

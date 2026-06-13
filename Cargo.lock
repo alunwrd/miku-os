@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "ld-miku"
-version = "0.2.7-rc"
+version = "0.2.8-rc"
 
 [[package]]
 name = "linked_list_allocator"
@@ -92,11 +92,11 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "miku-os-builder"
-version = "0.2.7-rc"
+version = "0.2.8-rc"
 
 [[package]]
 name = "miku-os-release"
-version = "0.2.7-rc"
+version = "0.2.8-rc"
 dependencies = [
  "fontdue",
  "lazy_static",

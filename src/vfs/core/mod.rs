@@ -72,6 +72,13 @@ pub fn init_vfs() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Register /dev block-device nodes (/dev/blkN, /dev/blkNpM). Call once
+/// after 'block::probe', since the block layer must already know its
+/// devices and partitions
+pub fn register_block_nodes() {
+    with_vfs(|vfs| vfs.register_block_nodes());
+}
+
 fn get_vfs() -> &'static mut MikuVFS {
     if !VFS_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
         panic!("[vfs] accessed before init");

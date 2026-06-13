@@ -817,7 +817,7 @@ The immutable flag prevents unlink / write / rename.
 | FS | Mount Point | Description |
 |:--:|:--:|:--|
 | **tmpfs** | `/` | RAM-based root FS |
-| **devfs** | `/dev` | Devices: `null`, `zero`, `random`, `urandom`, `console` |
+| **devfs** | `/dev` | Devices: `null`, `zero`, `random`, `urandom`, `console`, plus raw block nodes `blkN` / `blkNpM` (major 8) |
 | **procfs** | `/proc` | `version`, `uptime`, `meminfo`, `mounts`, `cpuinfo`, `stat`, `heap`, `diskstats` |
 | **ext2** | `/mnt` | Full read-write to real disk |
 | **ext3** | `/mnt` | Journaling (JBD2) on top of ext2, delayed writes |
@@ -1008,6 +1008,7 @@ The block layer is the single routing point between filesystems and storage driv
 | `block::write_sync(dev, lba, count, buf)` | Write-through: device write completes before return (journals, GPT, swap) |
 | `block::flush(dev)` | Drain dirty cache (elevator-ordered) + flush device write cache |
 | `block::discard(dev, lba, count)` | Discard/TRIM a sector range; fully covered cache chunks (dirty included) are dropped before the device command |
+| `block::write_zeroes(dev, lba, count)` | Zero a range; NVMe/virtio native Write Zeroes for the aligned middle, regular writes on the edges, zero-filled-write fallback |
 | `MikuFS::trim_free_blocks(minlen)` | FITRIM: walks the mounted fs's group bitmaps and discards free-block runs (the `fstrim` command); `mkfs.*` pre-discards the whole target region |
 | `block::info(dev)` | Geometry / identity for a device (includes the `discard` capability flag) |
 | `block::cache_stats()` | `(hits, misses, readaheads, write_merges, dirty)` |
@@ -1056,6 +1057,7 @@ The block layer is the single routing point between filesystems and storage driv
 | **Memory** | One page-aligned allocation: admin SQ/CQ, I/O SQ/CQ, PRP list, IDENTIFY buffer, bounce |
 | **Opcodes** | NVM READ (0x02), NVM WRITE (0x01), NVM FLUSH (0x00), NVM DSM (0x09, deallocate = discard) |
 | **Discard** | Dataset Management with the deallocate attribute; capability from ONCS bit 2 |
+| **Write Zeroes** | Write Zeroes command (opcode 0x08); capability from ONCS bit 3 |
 | **Health** | Get Log Page (LID 0x02) - SMART / Health Information (512 bytes): temp, wear, POH, lifetime R/W |
 
 #### virtio-blk (legacy/transitional)
@@ -1066,7 +1068,7 @@ The block layer is the single routing point between filesystems and storage driv
 | **Ring** | Layout computed at runtime from device-reported queue size |
 | **Max queue** | 256 descriptors |
 | **Transfer** | Up to 128 sectors (64 KiB) per request; larger transfers chunked by block layer |
-| **Features** | FLUSH (bit 9) and DISCARD (bit 13) negotiated; discards capped at the device's `max_discard_sectors` |
+| **Features** | FLUSH (bit 9), DISCARD (bit 13) and WRITE_ZEROES (bit 14) negotiated; discards/zeroes capped at the device's `max_discard_sectors` / `max_write_zeroes_sectors` |
 
 #### ATA (legacy PIO)
 
@@ -1277,6 +1279,7 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
 | `mkfs.ext4 <drive>` | Format ext4 (extents + journal) |
 | `blkstat` | Show all block devices (ATA/AHCI/NVMe/virtio-blk) + GPT partition tree + BIO queue + cache stats |
 | `blkdiscard <drive> [lba count]` | Discard/TRIM a sector range (whole device when no range given); blkdiscard(8) analogue |
+| `blkzero <drive> <lba> <count>` | Zero a sector range (NVMe/virtio Write Zeroes, zero-filled-write fallback) |
 | `fstrim` | Discard all free blocks of the active mounted ext filesystem by walking the group bitmaps; fstrim(8) analogue |
 | `smart <drive>` | SMART / NVMe health report: status, temperature, wear, power-on hours, lifetime R/W |
 | `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run format (layout only) |
