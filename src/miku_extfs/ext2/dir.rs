@@ -194,6 +194,20 @@ impl MikuFS {
         Err(FsError::NotFound)
     }
 
+    /// Indirect-level count of an htree directory's dx_root (0 = a single
+    /// level, where every block past the root is a leaf of real entries).
+    /// Used to keep linear directory writes away from index blocks
+    pub fn htree_depth(&mut self, dir_inode: &Inode) -> Result<u8, FsError> {
+        let bs = self.block_size as usize;
+        let root_phys = self.get_file_block(dir_inode, 0)?;
+        if root_phys == 0 {
+            return Ok(0);
+        }
+        let mut root_buf = [0u8; 4096];
+        self.read_block_into(root_phys, &mut root_buf[..bs])?;
+        Ok(root_buf[30]) // dx_root.info.indirect_levels
+    }
+
     // ext3/4 htree (dx_root) indexed directory lookup
     fn htree_lookup(&mut self, dir_inode: &Inode, name: &str) -> Result<u32, FsError> {
         let bs = self.block_size as usize;

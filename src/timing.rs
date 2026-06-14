@@ -60,7 +60,7 @@ impl Stopwatch {
     }
 }
 
-/// Busy-wait for approximately `us` microseconds.
+/// Busy-wait for approximately 'us' microseconds.
 /// Safe to call before the scheduler exists. Falls back to I/O port reads
 /// if TSC isn't calibrated yet (each 0x80 read is ~1us on real hardware)
 pub fn udelay(us: u64) {

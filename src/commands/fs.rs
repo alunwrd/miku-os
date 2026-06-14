@@ -1,10 +1,10 @@
 use crate::console;
 use crate::shell::SESSION;
 use crate::vfs::{
-    self, with_vfs, with_vfs_ro, FileMode, OpenFlags, VNodeKind, VfsError, VfsResult,
+    self, with_vfs, with_vfs_ro, FileMode, OpenFlags, SeekFrom, VNodeKind, VfsError, VfsResult,
     MAX_VNODES, InodeId, FsType, NAME_LEN,
 };
-use crate::{cprintln, print, print_error, print_success, println, serial_println};
+use crate::{cprintln, print, print_error, print_success, print_warn, println, serial_println};
 
 fn print_ls_vnode(name: &str, kind: VNodeKind) {
     match kind {
@@ -470,6 +470,155 @@ pub fn cmd_cat(name: &str) {
             Err(e) => print_error!("cat: {:?}", e),
         }
     });
+}
+
+/// Parse a dd-style size: a decimal count with an optional K/M/G suffix
+/// (powers of 1024, like coreutils dd)
+fn dd_parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult): (&str, u64) = match s.as_bytes().last() {
+        Some(b'K') | Some(b'k') => (&s[..s.len() - 1], 1024),
+        Some(b'M') | Some(b'm') => (&s[..s.len() - 1], 1024 * 1024),
+        Some(b'G') | Some(b'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => (s, 1),
+    };
+    num.parse::<u64>().ok().and_then(|v| v.checked_mul(mult))
+}
+
+/// dd(1): copy blocks between any two VFS objects - regular/ext files,
+/// /dev/zero, and the raw /dev/blkN block-device nodes. Supports
+/// if= of= bs= count= skip= seek= conv=notrunc,fsync
+pub fn cmd_dd(args: &str) {
+    /// Cap a single block (and the heap buffer) at 8 MiB
+    const MAX_BS: u64 = 8 * 1024 * 1024;
+
+    let mut if_path = "";
+    let mut of_path = "";
+    let mut bs: u64 = 512;
+    let mut count: Option<u64> = None;
+    let mut skip: u64 = 0;
+    let mut seek: u64 = 0;
+    let mut conv_notrunc = false;
+    let mut conv_fsync = false;
+
+    for tok in args.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("if=") {
+            if_path = v;
+        } else if let Some(v) = tok.strip_prefix("of=") {
+            of_path = v;
+        } else if let Some(v) = tok.strip_prefix("bs=") {
+            match dd_parse_size(v) { Some(x) => bs = x, None => { print_error!("dd: bad bs"); return; } }
+        } else if let Some(v) = tok.strip_prefix("count=") {
+            match dd_parse_size(v) { Some(x) => count = Some(x), None => { print_error!("dd: bad count"); return; } }
+        } else if let Some(v) = tok.strip_prefix("skip=") {
+            match dd_parse_size(v) { Some(x) => skip = x, None => { print_error!("dd: bad skip"); return; } }
+        } else if let Some(v) = tok.strip_prefix("seek=") {
+            match dd_parse_size(v) { Some(x) => seek = x, None => { print_error!("dd: bad seek"); return; } }
+        } else if let Some(v) = tok.strip_prefix("conv=") {
+            for c in v.split(',') {
+                match c {
+                    "notrunc" => conv_notrunc = true,
+                    "fsync" | "sync" => conv_fsync = true,
+                    other => { print_error!("dd: unknown conv '{}'", other); return; }
+                }
+            }
+        } else {
+            print_error!("dd: unknown operand '{}'", tok);
+            return;
+        }
+    }
+
+    if if_path.is_empty() || of_path.is_empty() {
+        println!("Usage: dd if=<src> of=<dst> [bs=N] [count=N] [skip=N] [seek=N] [conv=notrunc,fsync]");
+        return;
+    }
+    if bs == 0 || bs > MAX_BS {
+        print_error!("dd: bs must be 1..={} bytes", MAX_BS);
+        return;
+    }
+
+    let cwd = SESSION.lock().cwd;
+
+    // Open both ends and apply skip/seek up front (offsets persist on the fd)
+    let fds = with_vfs(|v| -> VfsResult<(usize, usize)> {
+        let src = v.open(cwd, if_path, OpenFlags(OpenFlags::READ), FileMode::default_file())?;
+        let mut dflags = OpenFlags::WRITE | OpenFlags::CREATE;
+        if !conv_notrunc {
+            dflags |= OpenFlags::TRUNCATE;
+        }
+        let dst = match v.open(cwd, of_path, OpenFlags(dflags), FileMode::default_file()) {
+            Ok(d) => d,
+            Err(e) => { let _ = v.close(src); return Err(e); }
+        };
+        if skip > 0 {
+            if let Err(e) = v.seek(src, SeekFrom::Start(skip * bs)) {
+                let _ = v.close(src); let _ = v.close(dst); return Err(e);
+            }
+        }
+        if seek > 0 {
+            if let Err(e) = v.seek(dst, SeekFrom::Start(seek * bs)) {
+                let _ = v.close(src); let _ = v.close(dst); return Err(e);
+            }
+        }
+        Ok((src, dst))
+    });
+    let (src, dst) = match fds {
+        Ok(x) => x,
+        Err(e) => { print_error!("dd: {:?}", e); return; }
+    };
+
+    let mut buf = alloc::vec![0u8; bs as usize];
+    let mut records_in = 0u64;
+    let mut records_out = 0u64;
+    let mut total = 0u64;
+    let mut short = false;
+
+    // One block per VFS-lock acquisition, so a large copy never holds the
+    // global lock for the whole transfer
+    loop {
+        if let Some(c) = count {
+            if records_in >= c { break; }
+        }
+        let step = with_vfs(|v| -> VfsResult<(usize, usize)> {
+            let n = v.read(src, &mut buf)?;
+            if n == 0 {
+                return Ok((0, 0));
+            }
+            let mut w = 0usize;
+            while w < n {
+                let x = v.write(dst, &buf[w..n])?;
+                if x == 0 { break; }
+                w += x;
+            }
+            Ok((n, w))
+        });
+        match step {
+            Ok((0, _)) => break,
+            Ok((n, w)) => {
+                records_in += 1;
+                records_out += 1;
+                total += w as u64;
+                if w < n { short = true; break; }
+            }
+            Err(e) => { print_error!("dd: {:?}", e); break; }
+        }
+    }
+
+    with_vfs(|v| {
+        if conv_fsync {
+            let _ = v.fsync(dst);
+        }
+        let _ = v.close(src);
+        let _ = v.close(dst);
+    });
+
+    if short {
+        print_warn!("dd: short write (destination full?)");
+    }
+    print_success!(
+        "  {}+0 records in, {}+0 records out, {} bytes ({} KB) copied",
+        records_in, records_out, total, total / 1024
+    );
 }
 
 pub fn cmd_write(name: &str, text: &str) {

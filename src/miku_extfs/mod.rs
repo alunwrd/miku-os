@@ -311,6 +311,23 @@ impl MikuFS {
         Ok(())
     }
 
+    /// Like 'write_block_direct_nocache' but with a write barrier (FUA), so
+    /// the block is crash-durable the instant the call returns. Whole-block
+    /// only - used for the journal commit record
+    pub fn write_block_barrier_nocache(&mut self, block_num: u32, data: &[u8]) -> Result<(), FsError> {
+        let spb = self.sectors_per_block() as u8;
+        let base_lba = self.block_to_lba(block_num);
+        let bs = self.block_size as usize;
+        if data.len() >= bs {
+            self.reader.write_block_barrier(base_lba, &data[..bs], spb)
+        } else {
+            // Short buffer: pad to a full block, then barrier-write it
+            let mut blk = [0u8; 4096];
+            blk[..data.len()].copy_from_slice(data);
+            self.reader.write_block_barrier(base_lba, &blk[..bs], spb)
+        }
+    }
+
     pub fn write_block_data_direct(&mut self, block_num: u32, data: &[u8]) -> Result<(), FsError> {
         let spb = self.sectors_per_block() as u8;
         let base_lba = self.block_to_lba(block_num);

@@ -303,7 +303,10 @@ impl MikuFS {
         commit[4..8].copy_from_slice(&JBD_COMMIT_BLOCK.to_be_bytes());
         commit[8..12].copy_from_slice(&self.journal_seq.to_be_bytes());
         let commit_disk_block = self.journal_block_to_disk(self.journal_pos)?;
-        self.write_block_direct_nocache(commit_disk_block, &commit[..bs])?;
+        // Barrier-write the commit record: with FUA it is on stable media
+        // before we advance the journal, so a crash here cannot leave a
+        // transaction that replay would treat as committed but isn't durable
+        self.write_block_barrier_nocache(commit_disk_block, &commit[..bs])?;
         self.journal_pos = self.advance_journal_pos(self.journal_pos);
 
         self.mark_journal_dirty_fast()?;

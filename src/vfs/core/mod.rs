@@ -79,6 +79,29 @@ pub fn register_block_nodes() {
     with_vfs(|vfs| vfs.register_block_nodes());
 }
 
+/// Re-read a device's GPT and refresh its /dev/blkNpM nodes (partprobe).
+/// Returns '(partitions_now, stale_removed)'
+pub fn rescan_block_partitions(dev: u8) -> (usize, usize) {
+    with_vfs(|vfs| vfs.rescan_block_partitions(dev))
+}
+
+/// Read up to buf.len() bytes from a vnode at a byte offset (no fd). The
+/// file-backed mmap page-fault fill path
+pub fn read_at_vnode(vid: usize, offset: u64, buf: &mut [u8]) -> Result<usize, crate::vfs::types::VfsError> {
+    with_vfs(|vfs| vfs.read_at_vnode(vid, offset, buf))
+}
+
+/// Write buf to a vnode at a byte offset (no fd). MAP_SHARED writeback path
+pub fn write_at_vnode(vid: usize, offset: u64, buf: &[u8]) -> Result<usize, crate::vfs::types::VfsError> {
+    with_vfs(|vfs| vfs.write_at_vnode(vid, offset, buf))
+}
+
+/// Resolve an open fd in the current process to its (vnode_id, size) so
+/// mmap can pin a backing object that outlives the fd
+pub fn fd_backing(fd: usize) -> Option<(u32, u64)> {
+    with_vfs(|vfs| vfs.fd_backing(fd))
+}
+
 fn get_vfs() -> &'static mut MikuVFS {
     if !VFS_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
         panic!("[vfs] accessed before init");
@@ -183,10 +206,10 @@ impl MikuVFS {
     }
 
     /// Drop a process's FD table at reap time. Each open descriptor
-    /// dec_refs its vnode, mirroring what `close(fd)` would do for an
+    /// dec_refs its vnode, mirroring what 'close(fd)' would do for an
     /// orderly close. Returns the list of vnode ids that were released
     /// so the caller can run any deferred-free cleanup (the inline
-    /// unlink-on-close path lives in `close()` and is intentionally not
+    /// unlink-on-close path lives in 'close()' and is intentionally not
     /// duplicated here - reaping happens after the process is already
     /// dead, the on-disk delete will be handled by the ext layer's own
     /// orphan inode logic if applicable)
@@ -203,7 +226,7 @@ impl MikuVFS {
     /// Close every descriptor flagged O_CLOEXEC in the calling process's
     /// table. Returns the released vnode ids so the caller can run the
     /// standard dec_ref + deferred-free cleanup, matching what an
-    /// ordinary `close()` would do
+    /// ordinary 'close()' would do
     pub fn close_cloexec_fds(&mut self) -> alloc::vec::Vec<crate::vfs::InodeId> {
         let pid = crate::scheduler::current_pid();
         let mut victims = alloc::vec::Vec::new();

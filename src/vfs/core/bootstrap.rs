@@ -335,6 +335,60 @@ impl MikuVFS {
         crate::serial_println!("[vfs] devfs: {} block nodes registered in /dev", count);
     }
 
+    /// Re-read one device's GPT and bring its /dev/blkNpM nodes in line with
+    /// it - the partprobe path. Existing partition nodes are dropped (unless
+    /// held open) and recreated from the fresh table, so partitions added or
+    /// removed with the 'gpt' commands appear without a reboot. Returns
+    /// '(partitions_now, removed)'
+    pub fn rescan_block_partitions(&mut self, dev: u8) -> (usize, usize) {
+        use crate::vfs::devfs::DevType;
+
+        let Some(&dev_dir) = self.nodes[0].children.find_by_name("dev").map(|id| id as usize).as_ref()
+        else {
+            return (0, 0);
+        };
+
+        // Drop the device's current partition nodes (parts 1..=15); the
+        // whole-disk blkN node stays. A node still open by someone is left in
+        // place to avoid pulling the rug out from under it
+        let mut removed = 0usize;
+        let mut name = [0u8; 8];
+        for part in 1..=15u8 {
+            let plen = fmt_block_name(&mut name, dev, part);
+            let pstr = core::str::from_utf8(&name[..plen]).unwrap_or("");
+            if let Some(cid) = self.nodes[dev_dir].children.find_by_name(pstr) {
+                let cid = cid as usize;
+                if self.nodes[cid].refcount == 0 {
+                    self.nodes[dev_dir].children.remove_by_name(pstr);
+                    self.nodes[cid].active = false;
+                    removed += 1;
+                }
+            }
+        }
+        crate::block::clear_partitions(dev);
+
+        // Re-read the GPT and (re)create nodes for every used entry
+        let mut now = 0usize;
+        if let Ok(tbl) = crate::gpt::gpt_read(dev) {
+            for (i, e) in tbl.entries.iter().enumerate() {
+                if !e.is_used() || i >= 15 { continue; }
+                let part = (i + 1) as u8;
+                let sectors = e.size_sectors();
+                crate::block::set_partition(dev, i, e.start_lba, sectors);
+
+                let plen = fmt_block_name(&mut name, dev, part);
+                let pstr = core::str::from_utf8(&name[..plen]).unwrap_or("blk");
+                self.add_block_node(dev_dir, pstr, DevType::Block { dev, part },
+                    sectors * 512);
+                now += 1;
+            }
+        }
+        crate::serial_println!(
+            "[vfs] partprobe dev {}: {} partitions ({} stale removed)", dev, now, removed
+        );
+        (now, removed)
+    }
+
     fn add_block_node(&mut self, dev_dir: usize, name: &str,
         dev_type: crate::vfs::devfs::DevType, size: u64)
     {

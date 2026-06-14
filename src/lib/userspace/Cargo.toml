@@ -16,3 +16,7 @@ path = "src/test_full.rs"
 [[bin]]
 name = "hello"
 path = "src/hello.rs"
+
+[[bin]]
+name = "mmaptest"
+path = "src/mmaptest.rs"

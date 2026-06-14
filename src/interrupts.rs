@@ -386,6 +386,18 @@ extern "x86-interrupt" fn page_fault_handler(
         x86_64::structures::idt::PageFaultErrorCode::USER_MODE
     );
 
+    // File-backed mmap: a not-present fault inside a file-backed VMA fills
+    // the page lazily from its file. User-mode only, so the brief VFS lock
+    // taken to read the file can't deadlock against kernel code holding it
+    if from_user {
+        let present = safe_to_walk
+            && crate::vmm::read_pte_raw(cr3, page_addr)
+                .map_or(false, |p| p & crate::vmm::PTE_PRESENT != 0);
+        if !present && crate::mmap::handle_file_fault(cr3, fault_addr) {
+            return;
+        }
+    }
+
     crate::serial_println!(
         "[page fault] addr={:#x} code={:?} user={}",
         fault_addr, error_code, from_user

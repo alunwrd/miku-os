@@ -185,6 +185,10 @@ extern "C" fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         57 => net::sys_connect(a1, a2, a3),
         58 => net::sys_send(a1, a2, a3, a4),
         59 => net::sys_recv(a1, a2, a3, a4),
+        // 60  mmap_file(args_ptr) - file-backed mmap; args struct in user
+        // memory carries the six fields that don't fit the 4-arg ABI
+        60 => memory::sys_mmap_file(a1),
+        61 => memory::sys_msync(a1, a2),
         _  => {
             crate::serial_println!("[syscall] unknown nr={}", nr);
             err(ENOSYS)

@@ -562,9 +562,10 @@ Use `_start_main`, not `_start`. `miku.rs` contains a `global_asm!` trampoline t
 | **MMAP range** | 0x100000000 ~ 0x7F0000000000 |
 | **BRK range** | 0x6000000000 ~ |
 | **Max VMAs** | 256 entries |
-| **Features** | mmap, munmap, mprotect, brk |
+| **Features** | mmap, munmap, mprotect, brk, **file-backed mmap**, msync |
 | **MAP_FIXED** | Unmaps existing mappings + removes overlapping VMAs |
 | **VMA validation** | Rollback on insert failure |
+| **File-backed** | `sys_mmap_file` maps a file lazily; pages fault in from the file via the page-fault handler (`read_at_vnode`), MAP_SHARED dirty pages write back on munmap/msync via the PTE dirty bit |
 
 </details>
 
@@ -930,6 +931,7 @@ The immutable flag prevents unlink / write / rename.
 | `touch <path>` | Create file (RAM) |
 | `cat <path>` | File contents |
 | `write <path> <text>` | Write to file (RAM) |
+| `dd if= of= [bs= count= skip= seek= conv=]` | Copy blocks between files and `/dev` nodes (image write / sector backup) |
 | `rm [-rf] <path>` | Delete file/directory |
 | `rmdir <path>` | Delete directory (ext compatible) |
 | `mv <old> <new>` | Rename |
@@ -1010,6 +1012,7 @@ Drive indices 0-3 address the legacy ATA slots, 4-7 the PCI-probed devices
 | `blkdiscard <drive> [lba count]` | Discard/TRIM a sector range (whole device when no range given) |
 | `blkzero <drive> <lba> <count>` | Zero a sector range (NVMe/virtio Write Zeroes, fallback writes) |
 | `fstrim` | Discard all free blocks of the active mounted ext filesystem (fstrim(8) analogue) |
+| `blkonline <drive>` | Bring a device taken offline by failfast back online |
 | `mkfs.ext2 <drive>` | Format ext2 |
 | `mkfs.ext3 <drive>` | Format ext3 (with journal) |
 | `mkfs.ext4 <drive>` | Format ext4 (extents + journal) |
@@ -1018,6 +1021,7 @@ Drive indices 0-3 address the legacy ATA slots, 4-7 the PCI-probed devices
 | `gpt.init <drive>` | Initialize empty GPT |
 | `gpt.add <drive> <partition spec>` | Add partition |
 | `gpt.del <drive> <partition>` | Delete partition |
+| `partprobe [drive]` | Re-read GPT and refresh `/dev/blkNpM` nodes at runtime |
 | `mkswap <drive> <partition>` | Create swap area on partition |
 | `swapon <drive> <partition>` | Activate swap |
 | `swapon.raw <drive> <start> <size>` | Activate raw-range swap |
@@ -1083,10 +1087,14 @@ ATA PIO/DMA | AHCI | virtio-blk | NVMe
 | **Discard/TRIM** | `block::discard()` across all four backends (ATA/AHCI DSM TRIM, NVMe DSM deallocate, virtio-blk discard); fully covered cache chunks dropped before the device command |
 | **Write Zeroes** | `block::write_zeroes()`: NVMe (opcode 0x08) / virtio (`WRITE_ZEROES`) native command, zero-filled-write fallback otherwise |
 | **fstrim** | Filesystem-aware trim: walks ext block-group bitmaps and discards free-block runs; `mkfs.*` pre-discards the target region like real mkfs.ext4 |
-| **Raw block nodes** | `/dev/blkN` and `/dev/blkNpM` (major 8) expose whole disks and GPT partitions as byte-addressable devices on top of the block layer |
-| **Per-device locks** | I/O to distinct devices runs in parallel; legacy ATA slots share a bus lock (master/slave share ports) |
+| **Raw block nodes** | `/dev/blkN` and `/dev/blkNpM` (major 8) expose whole disks and GPT partitions as byte-addressable devices on top of the block layer; `dd` copies images to/from them, `fsync` flushes them |
+| **Multi-queue (blk-mq)** | I/O dispatches through `&self` driver methods with no device-wide lock; several CPUs run requests on one device at once. NVMe spreads them across 4 per-CPU I/O queue pairs (true parallel); single-queue backends serialize internally. All accounting is atomic |
+| **Per-device locks** | Legacy ATA slots share a channel bus lock (master/slave share ports); PCI devices are independent |
 | **Bio queue** | Live request accounting: submitted / completed / errors |
 | **Retries** | Transient errors (timeout / device fault) get up to 2 transparent re-issues; per-device error and retry counters |
+| **Failfast state machine** | Per-device Online/Degraded/Offline (SCSI-style). After 8 consecutive post-retry failures a device goes Offline and rejects I/O immediately instead of hanging on hardware timeouts; `blkonline` resets it |
+| **FUA barriers** | `block::write_barrier` commits with Force Unit Access (NVMe FUA bit, ATA WRITE DMA FUA EXT); used for the ext3/4 journal commit block. Backends without FUA fall back to write-plus-flush |
+| **partprobe** | `/dev/blkNpM` partition nodes can be rescanned from the GPT at runtime, adding new and removing deleted partitions without a reboot |
 | **Latency** | Per-request TSC timing; `blkstat` reports average I/O latency per device (iostat `await`) |
 | **PCI probe** | One boot-time bus walk registers AHCI ports, NVMe namespaces, virtio-blk devices |
 | **io_relax** | I/O wait loops yield to the scheduler instead of burning CPU |
@@ -1110,7 +1118,7 @@ ATA PIO/DMA | AHCI | virtio-blk | NVMe
 |:--|:--|
 | **ATA (IDE)** | PIO + bus-master DMA (PRDT, 64 KiB bounce, IRQ14/15 completion flags), LBA28/LBA48, IDENTIFY, automatic PIO fallback, TRIM via DMA |
 | **AHCI (SATA)** | PCI 01.06, MMIO ABAR, port bring-up per spec (ST/FRE stop, command list / received FIS / command table), H2D FIS commands, polled PxCI, TRIM |
-| **NVMe** | PCI 01.08, controller reset + admin queue pair, IDENTIFY controller/namespace, I/O queue pair (qd 64), PRP1 + PRP list, phase-bit completion, DSM deallocate |
+| **NVMe** | PCI 01.08, controller reset + admin queue pair, IDENTIFY controller/namespace, **4 I/O queue pairs (qd 64) with per-CPU routing and per-queue locks for parallel I/O**, PRP1 + PRP list, phase-bit completion, DSM deallocate, FUA, Write Zeroes |
 | **virtio-blk** | Legacy virtio-pci transport, ring layout computed from the device queue size, 3-descriptor requests, `VIRTIO_BLK_F_FLUSH` + `VIRTIO_BLK_F_DISCARD` |
 
 All four share a 64 KiB bounce buffer model (128 sectors per command) and are

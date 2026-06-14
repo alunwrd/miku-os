@@ -667,7 +667,7 @@ impl Console {
         }
     }
 
-    /// Paint a horizontal gradient from `left` to `right` across the given
+    /// Paint a horizontal gradient from 'left' to 'right' across the given
     /// rectangle. Useful for colour-bar tests.
     pub fn fill_hgradient(
         &mut self,

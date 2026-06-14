@@ -295,14 +295,14 @@ pub fn init(gpu: &pci::GpuDevice) -> Result<(), &'static str> {
     if tu116::matches(gpu.device) {
         // Stage the GSP-RM image (parse ELF, build radix3, materialize the
         // WPR-meta in sysmem). This is fast and allocation-bound; no Falcon
-        // is started, so it does not slow the boot. After this `is_loaded()`
+        // is started, so it does not slow the boot. After this 'is_loaded()'
         // is true and the device is ready for an on-demand boot.
         //
         // The actual engine bring-up (NVDEC scrubber -> SEC2 ACR -> booter ->
         // GSP handshake) is NOT run here on purpose: those kick Falcons and
         // poll for a halt that, until the ACR WPR2-lock gate is solved, never
         // comes (which previously added tens of seconds of MMIO spinning to
-        // every kernel boot. Run it explicitly with `nvidia gsp-rm-boot-full`
+        // every kernel boot. Run it explicitly with 'nvidia gsp-rm-boot-full'
         let gsp_rm_fw = super::tu116_fw::gsp_rm_570();
         match super::gsprm::load(&bar0_region, gsp_rm_fw.bytes()) {
             Ok(rep) => serial_println!(

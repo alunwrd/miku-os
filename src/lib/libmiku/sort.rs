@@ -8,7 +8,7 @@ use crate::mem;
 
 pub type CmpFn = extern "C" fn(*const u8, *const u8) -> i32;
 
-// internal: swap two elements of `size` bytes
+// internal: swap two elements of 'size' bytes
 
 unsafe fn swap_elements(a: *mut u8, b: *mut u8, size: usize) {
     if a == b { return; }
@@ -109,7 +109,7 @@ unsafe fn insertion_sort_range(base: *mut u8, lo: usize, hi: usize, size: usize,
 }
 
 //   binary search: returns pointer to found element, or null
-// Array must be sorted according to `cmp`
+// Array must be sorted according to 'cmp'
 
 #[no_mangle]
 pub extern "C" fn miku_bsearch(
@@ -156,7 +156,7 @@ pub extern "C" fn miku_reverse(base: *mut u8, count: usize, size: usize) {
     }
 }
 
-// is_sorted: check if array is sorted according to `cmp`
+// is_sorted: check if array is sorted according to 'cmp'
 
 #[no_mangle]
 pub extern "C" fn miku_is_sorted(

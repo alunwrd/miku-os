@@ -28,7 +28,7 @@
 //     We never write PMC_ENABLE / NV_PMC_DEVICE_ENABLE here. On Turing the
 //     NVDEC enable bit lives in NV_PMC_DEVICE_ENABLE (BAR0+0x88c), which has
 //     a chip-specific layout we do not fully model. If NVDEC reads back as
-//     gated we abort with `EngineGated` rather than guess at the bit.
+//     gated we abort with 'EngineGated' rather than guess at the bit.
 //
 // Sources cross-checked: nouveau (drivers/gpu/drm/nouveau/nvkm/subdev/acr,
 // engine/nvdec) and open-gpu-kernel-modules (the scrubber is the

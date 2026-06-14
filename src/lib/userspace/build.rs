@@ -110,6 +110,8 @@ unsigned long miku_brk(unsigned long a) { return (unsigned long)miku_syscall1(6,
 void *miku_mmap(unsigned long a, unsigned long l, unsigned long p) { return (void *)0; }
 long miku_munmap(void *a, unsigned long l) { return 0; }
 long miku_mprotect(unsigned long a, unsigned long l, unsigned long p) { return 0; }
+void *miku_mmap_file(unsigned long a, unsigned long l, unsigned long p, unsigned long f, long fd, unsigned long o) { return (void *)0; }
+long miku_msync(void *a, unsigned long l) { return 0; }
 long miku_set_tls(unsigned long a) { return 0; }
 unsigned long miku_get_tls(void) { return 0; }
 long miku_map_lib(const char *n, unsigned long l) { return 0; }

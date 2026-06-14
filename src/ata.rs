@@ -62,7 +62,7 @@ impl AtaDrive {
         }
     }
 
-    /// Inverse of `from_idx`: a stable 0..=3 index used by the block layer as
+    /// Inverse of 'from_idx': a stable 0..=3 index used by the block layer as
     /// the device id, so registering the same physical drive is idempotent
     pub fn idx(&self) -> usize {
         match (self.base_port, self.role) {
@@ -296,7 +296,7 @@ impl AtaDrive {
         Ok(())
     }
 
-    /// Read `count` sectors (1..=65536, 0 means 65536) using LBA48 PIO
+    /// Read 'count' sectors (1..=65536, 0 means 65536) using LBA48 PIO
     pub fn read_sectors_ext(&mut self, lba: u64, buf: &mut [u8], count: u16) -> Result<(), AtaError> {
         if self.base_port == 0 { return Err(AtaError::NoDevice); }
         let n = if count == 0 { 65536usize } else { count as usize };
@@ -313,7 +313,7 @@ impl AtaDrive {
         Ok(())
     }
 
-    /// Write `count` sectors (1..=65536, 0 means 65536) using LBA48 PIO
+    /// Write 'count' sectors (1..=65536, 0 means 65536) using LBA48 PIO
     pub fn write_sectors_ext(&mut self, lba: u64, buf: &[u8], count: u16) -> Result<(), AtaError> {
         if self.base_port == 0 { return Err(AtaError::NoDevice); }
         let n = if count == 0 { 65536usize } else { count as usize };
@@ -823,8 +823,42 @@ impl AtaDrive {
     }
 }
 
-impl BlockDriver for AtaDrive {
-    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError> {
+/// Block-layer wrapper: the block layer now dispatches I/O through '&self'
+/// driver methods (no device-wide lock), so the mutable ATA driver lives
+/// behind an internal mutex. The legacy ATA port registers are still shared
+/// per channel, so this also keeps two drives on one channel serialized.
+/// 'AtaDrive' itself is untouched - swap/mkfs keep using it directly
+pub struct AtaBlockDev(spin::Mutex<AtaDrive>);
+
+impl AtaBlockDev {
+    pub fn new(drive: AtaDrive) -> Self {
+        Self(spin::Mutex::new(drive))
+    }
+}
+
+impl BlockDriver for AtaBlockDev {
+    fn read_blocks(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError> {
+        self.0.lock().bd_read_blocks(lba, count, buf)
+    }
+    fn write_blocks(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
+        self.0.lock().bd_write_blocks(lba, count, buf)
+    }
+    fn flush(&self) -> Result<(), BlkError> {
+        self.0.lock().bd_flush()
+    }
+    fn discard(&self, lba: u64, count: u32) -> Result<(), BlkError> {
+        self.0.lock().bd_discard(lba, count)
+    }
+    fn health(&self) -> Option<HealthInfo> {
+        self.0.lock().bd_health()
+    }
+    fn info(&self) -> BlockDevInfo {
+        self.0.lock().bd_info()
+    }
+}
+
+impl AtaDrive {
+    fn bd_read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError> {
         if (count as usize) * 512 > buf.len() {
             return Err(BlkError::BufferTooSmall);
         }
@@ -863,7 +897,7 @@ impl BlockDriver for AtaDrive {
         Ok(())
     }
 
-    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
+    fn bd_write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
         if (count as usize) * 512 > buf.len() {
             return Err(BlkError::BufferTooSmall);
         }
@@ -900,13 +934,13 @@ impl BlockDriver for AtaDrive {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), BlkError> {
+    fn bd_flush(&mut self) -> Result<(), BlkError> {
         AtaDrive::flush(self).map_err(Into::into)
     }
 
     /// TRIM via DATA SET MANAGEMENT: 8-byte range entries (48-bit LBA +
     /// 16-bit count), 64 per 512-byte block, one block per DMA command
-    fn discard(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
+    fn bd_discard(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
         if !self.trim_capable() {
             return Err(BlkError::Unsupported);
         }
@@ -926,14 +960,14 @@ impl BlockDriver for AtaDrive {
         Ok(())
     }
 
-    fn health(&mut self) -> Option<HealthInfo> {
+    fn bd_health(&mut self) -> Option<HealthInfo> {
         let ok = self.smart_status()?;
         let mut h = HealthInfo::unknown_ok();
         h.healthy = ok;
         Some(h)
     }
 
-    fn info(&mut self) -> BlockDevInfo {
+    fn bd_info(&mut self) -> BlockDevInfo {
         let mut out = BlockDevInfo::unknown();
         if let Ok(words) = self.identify() {
             out.lba48 = words[83] & (1 << 10) != 0;

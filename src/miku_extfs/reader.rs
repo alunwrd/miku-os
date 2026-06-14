@@ -60,6 +60,17 @@ impl DiskReader {
             .map_err(|_| FsError::IoError)
     }
 
+    /// Barrier write: the block is on stable media when this returns (FUA on
+    /// capable devices, write-plus-flush otherwise). Used for the journal
+    /// commit block, where crash durability is the whole point
+    pub fn write_block_barrier(
+        &mut self, lba: u32, buf: &[u8], sectors: u8,
+    ) -> Result<(), FsError> {
+        self.io_count += 1;
+        crate::block::write_barrier(self.dev_id, (self.start_lba + lba) as u64, sectors as u32, buf)
+            .map_err(|_| FsError::IoError)
+    }
+
     pub fn read_block(
         &mut self, lba: u32, buf: &mut [u8], sectors: u8,
     ) -> Result<(), FsError> {

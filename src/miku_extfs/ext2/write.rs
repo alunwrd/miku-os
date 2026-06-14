@@ -1021,7 +1021,27 @@ impl MikuFS {
         let num_blocks = if inode.size_lo() == 0 { 0 }
         else { (inode.size_lo() as usize + bs - 1) / bs };
 
-        for b in 0..num_blocks {
+        // htree directories (created by Linux's dir_index) keep an index in
+        // block 0 (dx_root) and, for multi-level trees, in dx_node blocks.
+        // A linear insert must never write those index blocks or it corrupts
+        // the tree. Single-level trees (the common case) have real entry
+        // leaves from block 1 on, so we insert there and let the linear
+        // lookup/readdir fallback find them; deeper trees we refuse rather
+        // than risk damage, so the on-disk directory stays consistent.
+        let start_block = if inode.has_flag(EXT4_INDEX_FL) && self.superblock.has_dir_index() {
+            if self.htree_depth(&inode)? > 0 {
+                crate::serial_println!(
+                    "[extfs] add_dir_entry: refusing write to multi-level htree dir {} (would corrupt index)",
+                    dir_ino
+                );
+                return Err(FsError::UnsupportedFeature);
+            }
+            1
+        } else {
+            0
+        };
+
+        for b in start_block..num_blocks {
             let phys = self.get_file_block(&inode, b as u32)?;
             if phys == 0 { continue; }
 

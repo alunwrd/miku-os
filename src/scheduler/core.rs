@@ -9,7 +9,7 @@
 //                                  frame the timer ISR pushes, then jumps
 //                                  into schedule_from_isr and iretq's into
 //                                  whichever task was selected
-//     wake_sleepers_isr`        - promote sleepers whose deadline passed
+//     wake_sleepers_isr'        - promote sleepers whose deadline passed
 //                                  Driven only from the BSP timer ISR so
 //                                  nobody pushes the same task twice
 

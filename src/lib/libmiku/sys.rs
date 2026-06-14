@@ -44,6 +44,8 @@ pub const SYS_SOCKET:     u64 = 56;
 pub const SYS_CONNECT:    u64 = 57;
 pub const SYS_SEND:       u64 = 58;
 pub const SYS_RECV:       u64 = 59;
+pub const SYS_MMAP_FILE:  u64 = 60;
+pub const SYS_MSYNC:      u64 = 61;
 
 pub const NR_SYSCALLS: u64 = 36;
 

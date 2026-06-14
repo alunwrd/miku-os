@@ -110,6 +110,8 @@ extern "C" {
     pub fn miku_mmap(addr: u64, len: usize, prot: u64) -> *mut u8;
     pub fn miku_munmap(addr: *mut u8, len: usize) -> i64;
     pub fn miku_mprotect(addr: u64, len: usize, prot: u64) -> i64;
+    pub fn miku_mmap_file(addr: u64, len: usize, prot: u64, flags: u64, fd: i64, offset: u64) -> *mut u8;
+    pub fn miku_msync(addr: *mut u8, len: usize) -> i64;
     pub fn miku_set_tls(addr: u64) -> i64;
     pub fn miku_get_tls() -> u64;
     pub fn miku_map_lib(name: *const u8, name_len: usize) -> i64;

@@ -44,7 +44,7 @@ pub fn model_name(device_id: u16) -> &'static str {
     }
 }
 
-/// True if `device_id` is one of the TU116 SKUs we recognise.
+/// True if 'device_id' is one of the TU116 SKUs we recognise.
 pub fn matches(device_id: u16) -> bool {
     DEVICE_IDS.iter().any(|&id| id == device_id)
 }

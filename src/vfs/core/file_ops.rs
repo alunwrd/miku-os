@@ -302,6 +302,147 @@ impl MikuVFS {
         Ok(done)
     }
 
+    /// Resolve an open fd to '(vnode_id, current file size)'. mmap stores
+    /// the vnode id (not the fd) so the mapping survives the fd being closed
+    pub fn fd_backing(&mut self, fd: usize) -> Option<(u32, u64)> {
+        let file = self.fds().get(fd).ok()?;
+        let vid = file.vnode_id as usize;
+        if !self.valid_vnode(vid) || self.nodes[vid].is_dir() {
+            return None;
+        }
+        // Refresh ext-backed size from disk so the mapping sees the real EOF
+        if self.nodes[vid].is_ext_backed() {
+            let ino = self.nodes[vid].ext2_ino;
+            if let Some(sz) = crate::commands::ext2_cmds::with_ext2_pub(|fs| {
+                fs.read_inode(ino).map(|i| i.size()).unwrap_or(0)
+            }) {
+                if sz > 0 { self.nodes[vid].size = sz; }
+            }
+        }
+        Some((vid as u32, self.nodes[vid].size))
+    }
+
+    /// Read up to 'buf.len()' bytes from a vnode at a byte offset, with no
+    /// fd and no offset bookkeeping. This is the page-fault fill path for
+    /// file-backed mmap: it must work from any process, given only the
+    /// stable vnode id stored in the VMA. Handles ext-backed and tmpfs
+    /// regular files; bytes past EOF are zero-filled by the caller
+    pub fn read_at_vnode(&mut self, vid: usize, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        if !self.valid_vnode(vid) || buf.is_empty() {
+            return Ok(0);
+        }
+        if self.nodes[vid].is_dir() {
+            return Err(VfsError::IsDirectory);
+        }
+
+        if self.nodes[vid].is_ext_backed() {
+            let ext2_ino = self.nodes[vid].ext2_ino;
+            let result = crate::commands::ext2_cmds::with_ext2_pub(|fs| {
+                let inode = fs.read_inode(ext2_ino).map_err(|_| VfsError::IoError)?;
+                let size = inode.size() as u64;
+                if offset >= size {
+                    return Ok(0usize);
+                }
+                let avail = (size - offset) as usize;
+                let to_read = buf.len().min(avail);
+                fs.read_file(&inode, offset, &mut buf[..to_read]).map_err(|_| VfsError::IoError)
+            });
+            return match result {
+                Some(Ok(n)) => Ok(n),
+                Some(Err(e)) => Err(e),
+                None => Err(VfsError::IoError),
+            };
+        }
+
+        // tmpfs / page cache
+        let size = self.nodes[vid].size;
+        if offset >= size {
+            return Ok(0);
+        }
+        let avail = (size - offset) as usize;
+        let to_read = buf.len().min(avail);
+        let mut done = 0;
+        while done < to_read {
+            let file_off = offset as usize + done;
+            let page_num = file_off / PAGE_SIZE;
+            let page_off = file_off % PAGE_SIZE;
+            let chunk = (PAGE_SIZE - page_off).min(to_read - done);
+            match self.nodes[vid].addr_space.get_page(page_num) {
+                Some(pid) => {
+                    if let Some(data) = self.page_cache.get_page_data(pid) {
+                        buf[done..done + chunk].copy_from_slice(&data[page_off..page_off + chunk]);
+                    } else {
+                        buf[done..done + chunk].fill(0);
+                    }
+                }
+                None => buf[done..done + chunk].fill(0),
+            }
+            done += chunk;
+        }
+        Ok(done)
+    }
+
+    /// Write 'buf' to a vnode at a byte offset with no fd - the writeback
+    /// path for dirtied MAP_SHARED pages on munmap/msync. Only regular
+    /// files are writable this way
+    pub fn write_at_vnode(&mut self, vid: usize, offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        if !self.valid_vnode(vid) || buf.is_empty() {
+            return Ok(0);
+        }
+        if self.nodes[vid].is_dir() {
+            return Err(VfsError::IsDirectory);
+        }
+        if self.is_readonly_fs(vid) {
+            return Err(VfsError::ReadOnly);
+        }
+
+        if self.nodes[vid].is_ext_backed() {
+            let ext2_ino = self.nodes[vid].ext2_ino;
+            let result = crate::commands::ext2_cmds::with_ext2_pub(|fs| {
+                fs.ext2_write_file(ext2_ino, buf, offset).map_err(|_| VfsError::IoError)
+            });
+            return match result {
+                Some(Ok(n)) => Ok(n),
+                Some(Err(e)) => Err(e),
+                None => Err(VfsError::IoError),
+            };
+        }
+
+        // tmpfs: write straight into the page-cache pages backing the vnode
+        let max = AddressSpace::max_size() as usize;
+        let offset = offset as usize;
+        if offset >= max {
+            return Err(VfsError::FileTooLarge);
+        }
+        let to_write = buf.len().min(max - offset);
+        let mut done = 0;
+        while done < to_write {
+            let file_off = offset + done;
+            let page_num = file_off / PAGE_SIZE;
+            let page_off = file_off % PAGE_SIZE;
+            let chunk = (PAGE_SIZE - page_off).min(to_write - done);
+            let pid = match self.nodes[vid].addr_space.get_page(page_num) {
+                Some(pid) => pid,
+                None => {
+                    let pid = self.page_cache.alloc_page()?;
+                    self.nodes[vid].addr_space.set_page(page_num, pid)?;
+                    pid
+                }
+            };
+            if let Some(page_data) = self.page_cache.get_page_data_mut(pid) {
+                page_data[page_off..page_off + chunk].copy_from_slice(&buf[done..done + chunk]);
+                self.page_cache.mark_dirty(pid);
+            } else {
+                return Err(VfsError::IoError);
+            }
+            done += chunk;
+        }
+        if (offset + done) as u64 > self.nodes[vid].size {
+            self.nodes[vid].size = (offset + done) as u64;
+        }
+        Ok(done)
+    }
+
     /// Read an entire file by absolute path into an owned buffer, via normal
     /// VFS path resolution. Kernel-internal: needs no fd table, so it is safe
     /// to call during early boot. Handles ext-backed and tmpfs regular files.
@@ -382,8 +523,8 @@ impl MikuVFS {
     }
 
     /// Graft an ext-mounted directory onto a VFS path as a mount point: after
-    /// this, resolving `parent_path`/`name` descends into the ext filesystem
-    /// at inode `ext_ino`. Mirrors how `cd` into an ext subtree attaches a
+    /// this, resolving 'parent_path'/'name' descends into the ext filesystem
+    /// at inode 'ext_ino'. Mirrors how 'cd' into an ext subtree attaches a
     /// vnode (see commands::fs). Used to mount the root disk's /lib/firmware
     /// onto the VFS so firmware reads go through the normal path, like Linux.
     pub fn graft_ext_dir(&mut self, parent_path: &str, name: &str, ext_ino: u32) -> VfsResult<usize> {
@@ -606,6 +747,12 @@ impl MikuVFS {
                 Some(Err(e)) => return Err(e),
                 None => return Err(VfsError::IoError),
             }
+        }
+
+        // A raw block-device node commits straight to its device: drain the
+        // block layer's dirty cache for that disk and flush its write cache
+        if let Some(crate::vfs::devfs::DevType::Block { dev, .. }) = self.get_dev_type(vid) {
+            crate::block::flush(dev).map_err(|_| VfsError::IoError)?;
         }
 
         self.nodes[vid].flags.dirty = false;

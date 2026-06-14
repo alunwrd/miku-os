@@ -65,7 +65,7 @@ const FWSEC_CTXDMA: u8 = 4;
 const FRTS_CMD_REGION_TYPE_FB: u32 = 0x0000_0002;
 
 /// FRTS error scratch register. nouveau verifies FRTS via
-/// `rd32(0x001400 + 0xe*4) >> 16` (the top 16 bits are the error code).
+/// 'rd32(0x001400 + 0xe*4) >> 16' (the top 16 bits are the error code).
 /// 0x1400 + 0x38 = 0x1438 (NV_PGC6_AON_SECURE_SCRATCH_GROUP_03).
 const FWSEC_FRTS_ERR_SCRATCH: u32 = 0x0000_1438;
 
@@ -135,7 +135,7 @@ fn rd8(rom: &[u8], off: usize) -> Option<u8> {
 ///   bit_entry('p') -> PMU table pointer (u32 at token offset 0)
 ///   PMU table header: ver@0, hdr@1, len@2, cnt@3
 ///   entry[i] at table + hdr + i*len:  type@0 (u8), data@2 (u32)
-///   pick the entry with type == 0x85, return its `data` (a VBIOS offset
+///   pick the entry with type == 0x85, return its 'data' (a VBIOS offset
 ///   to the falcon ucode descriptor).
 ///
 /// The PMU table and the ucode descriptor live in the VBIOS data image, so
@@ -343,7 +343,7 @@ impl FwsecBlDmemDescV2 {
     /// Build the descriptor for a FWSEC image staged at 'image_phys'.
     /// Mirrors tu102_gsp_fwsec_load_bld exactly: full physical addresses in
     /// the u64 base fields, code/data section geometry from the ucode desc.
-    /// FWSEC carries its signature inside its own image, so `signature` here
+    /// FWSEC carries its signature inside its own image, so 'signature' here
     /// stays zero (unlike the HS booter path which patches a prod sig in).
     pub fn build(desc: &UcodeDescV2, image_phys: u64) -> Self {
         // nmem (non-secure imem) = IMEMLoadSize - IMEMSecSize, based at

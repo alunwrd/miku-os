@@ -20,7 +20,7 @@ pub fn send_signal(pid: u64, sig: u32) {
     });
 }
 
-/// Send SIGCHLD to the parent of `child_pid`
+/// Send SIGCHLD to the parent of 'child_pid'
 pub fn send_sigchld(child_pid: u64) {
     let ppid = crate::scheduler::get_ppid(child_pid);
     if ppid != 0 {

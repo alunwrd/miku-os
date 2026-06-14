@@ -295,7 +295,7 @@ fn cmd_nvidia_firmware() {
             FwEngine::HostSw => "host",
         };
         // Pull each blob from the store on demand; the buffer is freed when
-        // `fw` drops at the end of the iteration.
+        // 'fw' drops at the end of the iteration.
         let fw = match crate::fwload::request(b.path) {
             Ok(fw) => fw,
             Err(e) => {
@@ -1440,7 +1440,7 @@ fn cmd_nvidia_gsprm_load() {
                     l.gsp_fw_heap_offset, l.gsp_fw_heap_size);
                 crate::println!("    WprMeta   @ {:#x}  ({} bytes, pinned)", r.meta_phys, r.meta_size);
                 if r.radix3_resolves {
-                    cprintln!(120, 220, 150, "    OK - staged & pinned; run `nvidia gsp-rm-boot` to hand it to the booter");
+                    cprintln!(120, 220, 150, "    OK - staged & pinned; run 'nvidia gsp-rm-boot' to hand it to the booter");
                 } else {
                     crate::print_warn!("    radix3 chain does NOT resolve - see serial log");
                 }

@@ -49,7 +49,7 @@ pub struct GenericGpu {
 }
 
 /// Every generic NVIDIA GPU we have brought up. The GTX 1650 has its own
-/// dedicated slot (`ACTIVE_GTX1650`); this holds the rest
+/// dedicated slot ('ACTIVE_GTX1650'); this holds the rest
 static GENERIC_GPUS: Mutex<Vec<GenericGpu>> = Mutex::new(Vec::new());
 
 /// Run a closure over the list of generic GPUs. Returns the closure result

@@ -1,6 +1,6 @@
 // GSP-RM bring-up infrastructure for TU116 (Turing).
 //
-// This is the layer between `gsp.rs` (which only kicks the booter HS image
+// This is the layer between 'gsp.rs' (which only kicks the booter HS image
 // and watches it halt) and a working GSP-RM offload driver. It collects
 // the pieces that are well-defined and can be built on a cold system:
 //
@@ -11,9 +11,9 @@
 //     the WPR meta block magic / revision the booter validates
 //
 // What it deliberately does NOT do, and why:
-//   The signed GSP-RM ELF (`gsp-*.bin`, tens of MiB) is not shipped in
+//   The signed GSP-RM ELF ('gsp-*.bin', tens of MiB) is not shipped in
 //   this tree. Without it there is nothing to stage in WPR2, so the boot
-//   path bottoms out at `GsprmError::MissingFirmware`. Everything up to
+//   path bottoms out at 'GsprmError::MissingFirmware'. Everything up to
 //   that point - register reads, layout maths, sysmem buffer allocation,
 //   radix3 construction over a caller-supplied page list - is real.
 //
@@ -555,7 +555,7 @@ pub struct DryrunReport {
     pub meta_size: usize,
 }
 
-/// Read a little-endian u64 PTE at index `i` from a radix-level buffer
+/// Read a little-endian u64 PTE at index 'i' from a radix-level buffer
 fn read_pte(buf: &DmaBuffer, i: usize) -> u64 {
     let s = buf.as_slice();
     let off = i * 8;
@@ -967,7 +967,7 @@ pub fn load(bar0: &MmioRegion, blob: &[u8]) -> Result<LoadReport, LoadError> {
 
 // Persistent GSP-RM state + booter handoff
 
-/// Everything `load()' pins for the rest of the GSP bring-up. Dropping
+/// Everything 'load()' pins for the rest of the GSP bring-up. Dropping
 /// this frees all the sysmem buffers
 pub struct GspRmState {
     /// '.fwimage' staged in phys-contiguous sysmem
@@ -1097,7 +1097,7 @@ const GSP_HANDSHAKE_TIMEOUT_NS: u64 = 500_000_000;
 const PTIMER_TIME_0: u32 = 0x0000_9400;
 
 /// Pinned RPC driver for the booted GSP-RM. Holds the CMDQ/MSGQ region for
-/// the lifetime of the session so the rings stay mapped after `boot`
+/// the lifetime of the session so the rings stay mapped after 'boot'
 static RPC: Mutex<Option<super::rpc::RpcDriver>> = Mutex::new(None);
 
 /// Run a closure with the pinned RPC driver, if GSP-RM handshake set one up

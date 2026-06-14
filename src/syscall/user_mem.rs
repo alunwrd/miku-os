@@ -120,7 +120,7 @@ pub fn read_user_path(ptr: u64, len: u64) -> Result<String, u64> {
 }
 
 // Copy a NUL-terminated C string from user space into kernel memory.
-// Reads byte by byte (after page-level mapping check) up to `max` bytes,
+// Reads byte by byte (after page-level mapping check) up to 'max' bytes,
 // stopping at the first NUL. Returns EINVAL on missing terminator and
 // EFAULT on unmapped pages
 pub fn read_user_cstr(ptr: u64, max: u64) -> Result<String, u64> {
@@ -148,7 +148,7 @@ pub fn read_user_cstr(ptr: u64, max: u64) -> Result<String, u64> {
     Err(err(EINVAL))
 }
 
-// Read a user-supplied argv: an array of `argc` user pointers, each
+// Read a user-supplied argv: an array of 'argc' user pointers, each
 // pointing to a NUL-terminated string. Strings are copied into kernel-
 // owned memory so the caller can swap address spaces safely afterwards.
 // Caps applied: at most MAX_ARGV_ENTRIES entries, each at most

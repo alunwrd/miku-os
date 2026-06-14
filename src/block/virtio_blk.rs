@@ -11,6 +11,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use spin::Mutex as SpinMutex;
 use x86_64::instructions::port::Port;
 
 use super::driver::{BlkError, BlockDevInfo, BlockDriver};
@@ -309,8 +310,39 @@ impl VirtioBlk {
     }
 }
 
-impl BlockDriver for VirtioBlk {
-    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError> {
+/// Block-layer wrapper: virtio-blk uses one request queue and one bounce
+/// buffer, so concurrent '&self' dispatch serializes on this internal mutex
+pub struct VirtioBlockDev(SpinMutex<VirtioBlk>);
+
+impl VirtioBlockDev {
+    pub fn new(dev: VirtioBlk) -> Self {
+        Self(SpinMutex::new(dev))
+    }
+}
+
+impl BlockDriver for VirtioBlockDev {
+    fn read_blocks(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError> {
+        self.0.lock().bd_read_blocks(lba, count, buf)
+    }
+    fn write_blocks(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
+        self.0.lock().bd_write_blocks(lba, count, buf)
+    }
+    fn flush(&self) -> Result<(), BlkError> {
+        self.0.lock().bd_flush()
+    }
+    fn discard(&self, lba: u64, count: u32) -> Result<(), BlkError> {
+        self.0.lock().bd_discard(lba, count)
+    }
+    fn write_zeroes(&self, lba: u64, count: u32) -> Result<(), BlkError> {
+        self.0.lock().bd_write_zeroes(lba, count)
+    }
+    fn info(&self) -> BlockDevInfo {
+        self.0.lock().bd_info()
+    }
+}
+
+impl VirtioBlk {
+    fn bd_read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError> {
         if (count as usize) * 512 > buf.len() {
             return Err(BlkError::BufferTooSmall);
         }
@@ -326,7 +358,7 @@ impl BlockDriver for VirtioBlk {
         Ok(())
     }
 
-    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
+    fn bd_write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
         if (count as usize) * 512 > buf.len() {
             return Err(BlkError::BufferTooSmall);
         }
@@ -342,7 +374,7 @@ impl BlockDriver for VirtioBlk {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), BlkError> {
+    fn bd_flush(&mut self) -> Result<(), BlkError> {
         if self.has_flush {
             self.request(VIRTIO_BLK_T_FLUSH, 0, 0)
         } else {
@@ -352,7 +384,7 @@ impl BlockDriver for VirtioBlk {
 
     /// Discard: one 16-byte segment (sector, num_sectors, flags) per request
     /// in the data descriptor, capped at the device's max_discard_sectors
-    fn discard(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
+    fn bd_discard(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
         if !self.has_discard {
             return Err(BlkError::Unsupported);
         }
@@ -372,7 +404,7 @@ impl BlockDriver for VirtioBlk {
 
     /// Write zeroes: same 16-byte segment as discard, request type 13.
     /// flags = 0 (no unmap hint), capped at the device's per-request limit
-    fn write_zeroes(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
+    fn bd_write_zeroes(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
         if !self.has_wz {
             return Err(BlkError::Unsupported);
         }
@@ -390,7 +422,7 @@ impl BlockDriver for VirtioBlk {
         Ok(())
     }
 
-    fn info(&mut self) -> BlockDevInfo {
+    fn bd_info(&mut self) -> BlockDevInfo {
         let mut out = BlockDevInfo::unknown();
         out.total_sectors = self.capacity;
         out.lba48 = true;

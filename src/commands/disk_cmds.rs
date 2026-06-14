@@ -68,6 +68,21 @@ pub fn cmd_blkstat() {
                     st.io_errors, st.retries
                 );
             }
+            match st.state {
+                crate::block::DevState::Online => {}
+                crate::block::DevState::Degraded => {
+                    print_warn!("        state: DEGRADED (recent I/O errors)");
+                }
+                crate::block::DevState::Offline => {
+                    print_error!(
+                        "        state: OFFLINE (failing fast; run 'blkonline {}' to retry)",
+                        id
+                    );
+                }
+            }
+            if st.offline_count > 0 {
+                print_warn!("        taken offline {} time(s) this boot", st.offline_count);
+            }
             if let Ok(tbl) = gpt::gpt_read(id) {
                 for (i, e) in tbl.entries.iter().enumerate() {
                     if !e.is_used() { continue; }
@@ -98,6 +113,142 @@ pub fn cmd_blkstat() {
         "  buffer cache: hits={} misses={} ({}% hit rate), readaheads={}, write merges={}, dirty={}",
         hits, misses, pct, ra, merges, dirty
     );
+}
+
+/// Concurrent NVMe stress test: several kernel threads hammer distinct
+/// regions of the NVMe device at once. Because the block layer now
+/// dispatches with no device-wide lock and NVMe spreads requests across
+/// per-CPU queues, the I/O really overlaps - this checks it stays correct
+/// (no cross-queue corruption) under that parallelism
+const NS_WORKERS: usize = 4;
+static NS_DEV:    core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
+static NS_NEXT:   core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static NS_RESULT: [core::sync::atomic::AtomicU8; NS_WORKERS] = [
+    core::sync::atomic::AtomicU8::new(0),
+    core::sync::atomic::AtomicU8::new(0),
+    core::sync::atomic::AtomicU8::new(0),
+    core::sync::atomic::AtomicU8::new(0),
+];
+
+fn nvme_worker() -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    let id = NS_NEXT.fetch_add(1, Relaxed);
+    let dev = NS_DEV.load(Relaxed);
+    // Each worker owns a distinct 8-sector region far from any filesystem
+    let base = 100_000u64 + id as u64 * 64;
+    let mut wbuf = [0u8; 4096];
+    let mut rbuf = [0u8; 4096];
+    let mut ok = true;
+    'outer: for it in 0..120u32 {
+        let pat = ((id.wrapping_mul(37).wrapping_add(it as usize)) & 0xFF) as u8;
+        for b in wbuf.iter_mut() { *b = pat; }
+        if crate::block::write_sync(dev, base, 8, &wbuf).is_err() { ok = false; break; }
+        if crate::block::read(dev, base, 8, &mut rbuf).is_err() { ok = false; break; }
+        for &b in rbuf.iter() {
+            if b != pat { ok = false; break 'outer; }
+        }
+    }
+    NS_RESULT[id].store(if ok { 1 } else { 2 }, Relaxed);
+    loop { crate::scheduler::sleep(100_000); }
+}
+
+pub fn cmd_nvmestress() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut dev = None;
+    for id in 0..crate::vfs::types::MAX_BLOCK_DEVICES as u8 {
+        if let Some(st) = crate::block::dev_stats(id) {
+            if st.kind == crate::block::DevKind::Nvme {
+                dev = Some(id);
+                break;
+            }
+        }
+    }
+    let Some(d) = dev else { print_error!("  no NVMe device found"); return; };
+
+    cprintln!(57, 197, 187, "  NVMe concurrent stress: {} workers x 120 write+verify", NS_WORKERS);
+    NS_DEV.store(d, Relaxed);
+    NS_NEXT.store(0, Relaxed);
+    for r in NS_RESULT.iter() { r.store(0, Relaxed); }
+
+    let mut pids = [0u64; NS_WORKERS];
+    for p in pids.iter_mut() {
+        *p = crate::scheduler::spawn(nvme_worker);
+    }
+
+    // Wait for all workers to report (bounded so a hang can't wedge the shell)
+    let mut waited = 0u32;
+    loop {
+        if NS_RESULT.iter().all(|r| r.load(Relaxed) != 0) { break; }
+        crate::scheduler::sleep(20);
+        waited += 1;
+        if waited > 2000 { print_error!("  timeout waiting for workers"); break; }
+    }
+    for &p in pids.iter() { crate::scheduler::kill(p); }
+
+    let pass = NS_RESULT.iter().filter(|r| r.load(Relaxed) == 1).count();
+    let fail = NS_RESULT.iter().filter(|r| r.load(Relaxed) == 2).count();
+    if pass == NS_WORKERS {
+        print_success!("  all {} workers passed - concurrent NVMe I/O is correct", pass);
+    } else {
+        print_error!("  {} passed, {} failed - concurrency bug!", pass, fail);
+    }
+    if let Some(st) = crate::block::dev_stats(d) {
+        println!("  blk{}: {} ios, {} KB read, {} KB written",
+            d, st.ios, st.sectors_read * 512 / 1024, st.sectors_written * 512 / 1024);
+    }
+}
+
+/// partprobe(8): re-read the GPT of one drive (or all) and refresh the
+/// /dev/blkNpM nodes, so partitions changed with the gpt commands show up
+/// without a reboot
+pub fn cmd_partprobe(args: &str) {
+    let arg = args.trim();
+    if arg.is_empty() {
+        // All registered devices
+        let mut any = false;
+        for id in 0..crate::vfs::types::MAX_BLOCK_DEVICES as u8 {
+            let Some(info) = crate::block::info(id) else { continue };
+            if info.total_sectors == 0 { continue; }
+            any = true;
+            let (now, removed) = crate::vfs::core::rescan_block_partitions(id);
+            println!("  blk{}: {} partitions ({} stale removed)", id, now, removed);
+        }
+        if !any { print_warn!("  no block devices"); }
+        return;
+    }
+    let Some(idx) = parse_drive(arg) else {
+        print_error!("  usage: partprobe [drive 0-7]");
+        return;
+    };
+    let dev = blk_dev(idx);
+    if crate::block::info(dev).map_or(true, |i| i.total_sectors == 0) {
+        print_error!("  no device blk{}", idx);
+        return;
+    }
+    let (now, removed) = crate::vfs::core::rescan_block_partitions(dev);
+    print_success!("  blk{}: {} partitions ({} stale removed)", idx, now, removed);
+}
+
+/// Bring a block device back online after it was failed out (Linux's
+/// 'echo running > /sys/block/.../device/state')
+pub fn cmd_blkonline(drive_str: &str) {
+    let idx = match parse_drive(drive_str) {
+        Some(i) => i,
+        None => { print_error!("  usage: blkonline <drive 0-7>"); return; }
+    };
+    let dev = blk_dev(idx);
+    match crate::block::reset_device(dev) {
+        None => print_error!("  no device blk{}", idx),
+        Some(crate::block::DevState::Offline) => {
+            print_success!("  blk{}: offline -> online, I/O will be retried", idx);
+        }
+        Some(crate::block::DevState::Degraded) => {
+            print_success!("  blk{}: degraded -> online, error run cleared", idx);
+        }
+        Some(crate::block::DevState::Online) => {
+            print_info!("  blk{}: already online", idx);
+        }
+    }
 }
 
 /// Zero a sector range - blkdiscard(8) with --zeroout. Uses the device's

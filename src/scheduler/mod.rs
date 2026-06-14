@@ -80,7 +80,7 @@ pub fn set_current_cwd(id: u64) {
 }
 
 // Per-process VFS identity accessors. Used by fork to copy parent state
-// and by `with_vfs` to sync vfs.ctx before invoking syscall closures.
+// and by 'with_vfs' to sync vfs.ctx before invoking syscall closures.
 // Idle / pre-init callers (pid 0 with no Process entry) get sensible
 // defaults (umask 0o022, root cred)
 

@@ -11,6 +11,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use spin::Mutex as SpinMutex;
 
 use super::driver::{BlkError, BlockDevInfo, BlockDriver};
 use crate::net::pci::{pci_read32, pci_read8, PCI_ADDR, PCI_DATA, pci_addr};
@@ -53,10 +54,11 @@ const SIG_SATA_DISK: u32 = 0x0000_0101;
 
 const FIS_TYPE_H2D: u8 = 0x27;
 
-const ATA_READ_DMA_EXT:    u8 = 0x25;
-const ATA_WRITE_DMA_EXT:   u8 = 0x35;
-const ATA_FLUSH_CACHE_EXT: u8 = 0xEA;
-const ATA_IDENTIFY:        u8 = 0xEC;
+const ATA_READ_DMA_EXT:     u8 = 0x25;
+const ATA_WRITE_DMA_EXT:     u8 = 0x35;
+const ATA_WRITE_DMA_FUA_EXT: u8 = 0x3D;
+const ATA_FLUSH_CACHE_EXT:  u8 = 0xEA;
+const ATA_IDENTIFY:         u8 = 0xEC;
 const ATA_DSM:             u8 = 0x06; // DATA SET MANAGEMENT (TRIM)
 
 /// DSM FEATURES bit 0: the range payload is a TRIM request
@@ -351,10 +353,62 @@ impl AhciPort {
         }
         Ok(())
     }
+
+    /// Shared write loop; 'fua' selects WRITE DMA FUA EXT so the data is on
+    /// stable media when the command completes
+    fn write_loop(&mut self, lba: u64, count: u32, buf: &[u8], fua: bool) -> Result<(), BlkError> {
+        if (count as usize) * 512 > buf.len() {
+            return Err(BlkError::BufferTooSmall);
+        }
+        let cmd = if fua { ATA_WRITE_DMA_FUA_EXT } else { ATA_WRITE_DMA_EXT };
+        let mut done = 0u32;
+        while done < count {
+            let chunk = (count - done).min(MAX_XFER_SECTORS);
+            let bytes = chunk as usize * 512;
+            let off = done as usize * 512;
+            self.mem.bounce[..bytes].copy_from_slice(&buf[off..off + bytes]);
+            self.issue(cmd, lba + done as u64, chunk as u16, bytes, true, 0)?;
+            done += chunk;
+        }
+        Ok(())
+    }
 }
 
-impl BlockDriver for AhciPort {
-    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError> {
+/// Block-layer wrapper: one AHCI port has a single command slot and bounce
+/// buffer, so concurrent '&self' dispatch serializes on this internal mutex
+/// (no parallelism within one port, same as before - the win is that the
+/// block layer no longer needs a device-wide lock around every backend)
+pub struct AhciBlockDev(SpinMutex<AhciPort>);
+
+impl AhciBlockDev {
+    pub fn new(port: AhciPort) -> Self {
+        Self(SpinMutex::new(port))
+    }
+}
+
+impl BlockDriver for AhciBlockDev {
+    fn read_blocks(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError> {
+        self.0.lock().bd_read_blocks(lba, count, buf)
+    }
+    fn write_blocks(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
+        self.0.lock().write_loop(lba, count, buf, false)
+    }
+    fn write_blocks_fua(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
+        self.0.lock().write_loop(lba, count, buf, true)
+    }
+    fn flush(&self) -> Result<(), BlkError> {
+        self.0.lock().issue(ATA_FLUSH_CACHE_EXT, 0, 0, 0, false, 0)
+    }
+    fn discard(&self, lba: u64, count: u32) -> Result<(), BlkError> {
+        self.0.lock().bd_discard(lba, count)
+    }
+    fn info(&self) -> BlockDevInfo {
+        self.0.lock().bd_info()
+    }
+}
+
+impl AhciPort {
+    fn bd_read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError> {
         if (count as usize) * 512 > buf.len() {
             return Err(BlkError::BufferTooSmall);
         }
@@ -370,30 +424,10 @@ impl BlockDriver for AhciPort {
         Ok(())
     }
 
-    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
-        if (count as usize) * 512 > buf.len() {
-            return Err(BlkError::BufferTooSmall);
-        }
-        let mut done = 0u32;
-        while done < count {
-            let chunk = (count - done).min(MAX_XFER_SECTORS);
-            let bytes = chunk as usize * 512;
-            let off = done as usize * 512;
-            self.mem.bounce[..bytes].copy_from_slice(&buf[off..off + bytes]);
-            self.issue(ATA_WRITE_DMA_EXT, lba + done as u64, chunk as u16, bytes, true, 0)?;
-            done += chunk;
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<(), BlkError> {
-        self.issue(ATA_FLUSH_CACHE_EXT, 0, 0, 0, false, 0)
-    }
-
     /// DATA SET MANAGEMENT / TRIM. The payload is 512-byte blocks of 8-byte
     /// range entries - 48-bit LBA in the low bits, a 16-bit sector count in
     /// the top - so one block describes up to 64 ranges; long discards loop
-    fn discard(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
+    fn bd_discard(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
         if !self.has_trim {
             return Err(BlkError::Unsupported);
         }
@@ -414,7 +448,7 @@ impl BlockDriver for AhciPort {
         Ok(())
     }
 
-    fn info(&mut self) -> BlockDevInfo {
+    fn bd_info(&mut self) -> BlockDevInfo {
         let mut out = BlockDevInfo::unknown();
         out.total_sectors = self.capacity;
         out.lba48 = true;

@@ -36,27 +36,64 @@ pub enum DevKind {
     Nvme,
 }
 
+/// Operational state of a device, modelled on the SCSI device states Linux
+/// keeps. Healthy devices are 'Online'; a device that has taken errors but
+/// still completes I/O is 'Degraded'; one that has failed too many requests
+/// in a row is taken 'Offline' and every further request fails fast instead
+/// of waiting out a full hardware timeout. This is what keeps a dying disk
+/// from hanging the whole system
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevState {
+    Online,
+    Degraded,
+    Offline,
+}
+
+impl DevState {
+    const fn as_u8(self) -> u8 {
+        match self { DevState::Online => 0, DevState::Degraded => 1, DevState::Offline => 2 }
+    }
+    fn from_u8(v: u8) -> Self {
+        match v { 1 => DevState::Degraded, 2 => DevState::Offline, _ => DevState::Online }
+    }
+}
+
+/// Consecutive post-retry failures that take a device offline
+const OFFLINE_THRESHOLD: u32 = 8;
+
+use core::sync::atomic::{AtomicU64, AtomicU32, AtomicU8, Ordering};
+
+/// A registered device. The driver is dispatched through '&self' without a
+/// device-wide lock, so several CPUs can have I/O in flight on it at once
+/// (NVMe spreads them across queues; single-queue backends serialize on
+/// their own internal lock). All accounting is therefore atomic
 struct DeviceSlot {
     driver: Box<dyn BlockDriver>,
     info:   BlockDevInfo,
     kind:   DevKind,
     /// Bytes read / written / discarded, for 'iostat'-style reporting
-    sectors_read:      u64,
-    sectors_written:   u64,
-    sectors_discarded: u64,
+    sectors_read:      AtomicU64,
+    sectors_written:   AtomicU64,
+    sectors_discarded: AtomicU64,
     /// Failed requests (after retries) and retry attempts that recovered
-    io_errors: u64,
-    retries:   u64,
+    io_errors: AtomicU64,
+    retries:   AtomicU64,
     /// Accumulated device time for average-latency reporting ('await')
-    total_io_us: u64,
-    io_count:    u64,
+    total_io_us: AtomicU64,
+    io_count:    AtomicU64,
+    /// Operational state (DevState as u8) plus the run of consecutive
+    /// failures driving it, and how many times it has gone offline overall
+    state:         AtomicU8,
+    consec_errors: AtomicU32,
+    offline_count: AtomicU64,
 }
 
-type SlotRef = Arc<Mutex<DeviceSlot>>;
+type SlotRef = Arc<DeviceSlot>;
 
-/// Device registry. Held only for slot lookup/insertion - never across an
-/// I/O operation, so I/O to different devices proceeds in parallel, each
-/// serialized by its own slot mutex (Linux's per-queue locking)
+/// Device registry. The registry mutex is held only for slot lookup /
+/// insertion, never across I/O; the device behind the Arc is dispatched
+/// concurrently. Different devices, and different CPUs on one NVMe, proceed
+/// in parallel (Linux's blk-mq)
 static REGISTRY: Mutex<[Option<SlotRef>; MAX_BLOCK_DEVICES]> =
     Mutex::new([None, None, None, None, None, None, None, None]);
 
@@ -92,7 +129,7 @@ pub fn register_ata(drive: AtaDrive) -> BlockDevId {
     }
 
     // IDENTIFY outside any registry lock; the bus lock covers the ports
-    let mut boxed: Box<dyn BlockDriver> = Box::new(drive);
+    let boxed: Box<dyn BlockDriver> = Box::new(crate::ata::AtaBlockDev::new(drive));
     let info = {
         let _bus = ATA_BUS.lock();
         boxed.info()
@@ -104,20 +141,27 @@ pub fn register_ata(drive: AtaDrive) -> BlockDevId {
 
     let mut reg = REGISTRY.lock();
     if reg[id].is_none() {
-        reg[id] = Some(Arc::new(Mutex::new(DeviceSlot {
-            driver: boxed,
-            info,
-            kind: DevKind::Ata,
-            sectors_read: 0,
-            sectors_written: 0,
-            sectors_discarded: 0,
-            io_errors: 0,
-            retries: 0,
-            total_io_us: 0,
-            io_count: 0,
-        })));
+        reg[id] = Some(Arc::new(DeviceSlot::new(boxed, info, DevKind::Ata)));
     }
     id as BlockDevId
+}
+
+impl DeviceSlot {
+    fn new(driver: Box<dyn BlockDriver>, info: BlockDevInfo, kind: DevKind) -> Self {
+        Self {
+            driver, info, kind,
+            sectors_read:      AtomicU64::new(0),
+            sectors_written:   AtomicU64::new(0),
+            sectors_discarded: AtomicU64::new(0),
+            io_errors:         AtomicU64::new(0),
+            retries:           AtomicU64::new(0),
+            total_io_us:       AtomicU64::new(0),
+            io_count:          AtomicU64::new(0),
+            state:             AtomicU8::new(DevState::Online.as_u8()),
+            consec_errors:     AtomicU32::new(0),
+            offline_count:     AtomicU64::new(0),
+        }
+    }
 }
 
 /// One step of an I/O completion wait: spin briefly, but once the scheduler
@@ -134,7 +178,7 @@ pub fn io_relax(iter: u64) {
 
 /// Register a probed (non-ATA) driver into the dynamic id range and run a
 /// first test read that doubles as the partition-table peek
-fn register_dynamic(mut boxed: Box<dyn BlockDriver>, kind: DevKind, label: &str) {
+fn register_dynamic(boxed: Box<dyn BlockDriver>, kind: DevKind, label: &str) {
     let info = boxed.info();
 
     let mut reg = REGISTRY.lock();
@@ -150,18 +194,7 @@ fn register_dynamic(mut boxed: Box<dyn BlockDriver>, kind: DevKind, label: &str)
         id, label, info.model_str(), info.total_sectors,
         info.total_sectors * 512 / (1024 * 1024)
     );
-    reg[id] = Some(Arc::new(Mutex::new(DeviceSlot {
-        driver: boxed,
-        info,
-        kind,
-        sectors_read: 0,
-        sectors_written: 0,
-        sectors_discarded: 0,
-        io_errors: 0,
-        retries: 0,
-        total_io_us: 0,
-        io_count: 0,
-    })));
+    reg[id] = Some(Arc::new(DeviceSlot::new(boxed, info, kind)));
     drop(reg);
 
     let mut sec0 = [0u8; 512];
@@ -196,7 +229,7 @@ pub fn probe() {
     let n = ahci::find_ports(&mut ahci_ports);
     for slot in ahci_ports.iter_mut().take(n) {
         if let Some(port) = slot.take() {
-            register_dynamic(Box::new(port), DevKind::Ahci, "ahci");
+            register_dynamic(Box::new(ahci::AhciBlockDev::new(port)), DevKind::Ahci, "ahci");
         }
     }
 
@@ -204,7 +237,7 @@ pub fn probe() {
     let n = virtio_blk::find_devices(&mut found);
     for pci in found.iter().take(n) {
         let Some(drv) = virtio_blk::VirtioBlk::new(pci) else { continue };
-        register_dynamic(Box::new(drv), DevKind::VirtioBlk, "virtio-blk");
+        register_dynamic(Box::new(virtio_blk::VirtioBlockDev::new(drv)), DevKind::VirtioBlk, "virtio-blk");
     }
 
     if let Some(drv) = nvme::find_controller() {
@@ -225,6 +258,14 @@ pub fn set_partition(dev_id: BlockDevId, part_idx: usize, start_lba: u64, sector
     }
 }
 
+/// Forget every partition range of a device - used by a partition rescan
+/// before re-reading the GPT, so a removed partition stops being addressable
+pub fn clear_partitions(dev_id: BlockDevId) {
+    if (dev_id as usize) < MAX_BLOCK_DEVICES {
+        PARTITIONS.lock()[dev_id as usize] = [None; 15];
+    }
+}
+
 /// Sector range behind a /dev block node: part 0 is the whole disk,
 /// parts 1-15 are GPT partitions registered via 'set_partition'
 pub fn node_range(dev_id: BlockDevId, part: u8) -> Option<(u64, u64)> {
@@ -240,9 +281,7 @@ pub fn node_range(dev_id: BlockDevId, part: u8) -> Option<(u64, u64)> {
 
 /// Geometry/identity for a registered device, if present
 pub fn info(dev_id: BlockDevId) -> Option<BlockDevInfo> {
-    let slot = slot_ref(dev_id)?;
-    let guard = slot.lock();
-    Some(guard.info)
+    Some(slot_ref(dev_id)?.info)
 }
 
 /// '(submitted, completed, errors)' counters from the live bio queue
@@ -444,6 +483,27 @@ pub fn write_sync(dev_id: BlockDevId, lba: u64, count: u32, buf: &[u8]) -> Resul
     result
 }
 
+/// Barrier write: like 'write_sync' but the data is committed to stable
+/// media with Force Unit Access, so it survives a power loss the instant
+/// this returns - no separate device flush needed. This is the durability
+/// primitive for journal commit blocks. Backends without a hardware FUA
+/// bit fall back to write-plus-flush, which is heavier but just as safe
+pub fn write_barrier(dev_id: BlockDevId, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
+    if count == 0 {
+        return Ok(());
+    }
+    let result = dispatch(dev_id, BioDirection::Write, lba, count, |drv| {
+        drv.write_blocks_fua(lba, count, buf)
+    });
+    if let Some(c) = CACHE.lock().as_mut() {
+        match result {
+            Ok(()) => c.update_on_write(dev_id, lba, count, buf),
+            Err(_) => c.invalidate_range(dev_id, lba, count),
+        }
+    }
+    result
+}
+
 /// Write out every dirty chunk of 'dev_id' in ascending LBA order - a
 /// single elevator sweep across the disk. Adjacent dirty chunks coalesce
 /// into one driver command of up to 64 KiB (the block layer's request
@@ -517,17 +577,19 @@ pub fn cache_stats() -> (u64, u64, u64, u64, u64) {
 
 /// Per-device '(kind, sectors_read, sectors_written)' counters
 pub fn dev_stats(dev_id: BlockDevId) -> Option<DevStats> {
-    let slot = slot_ref(dev_id)?;
-    let guard = slot.lock();
+    let s = slot_ref(dev_id)?;
+    let ios = s.io_count.load(Ordering::Relaxed);
     Some(DevStats {
-        kind:              guard.kind,
-        sectors_read:      guard.sectors_read,
-        sectors_written:   guard.sectors_written,
-        sectors_discarded: guard.sectors_discarded,
-        io_errors:         guard.io_errors,
-        retries:           guard.retries,
-        avg_io_us:         if guard.io_count > 0 { guard.total_io_us / guard.io_count } else { 0 },
-        ios:               guard.io_count,
+        kind:              s.kind,
+        sectors_read:      s.sectors_read.load(Ordering::Relaxed),
+        sectors_written:   s.sectors_written.load(Ordering::Relaxed),
+        sectors_discarded: s.sectors_discarded.load(Ordering::Relaxed),
+        io_errors:         s.io_errors.load(Ordering::Relaxed),
+        retries:           s.retries.load(Ordering::Relaxed),
+        avg_io_us:         if ios > 0 { s.total_io_us.load(Ordering::Relaxed) / ios } else { 0 },
+        ios,
+        state:             DevState::from_u8(s.state.load(Ordering::Relaxed)),
+        offline_count:     s.offline_count.load(Ordering::Relaxed),
     })
 }
 
@@ -542,18 +604,35 @@ pub struct DevStats {
     pub retries:           u64,
     pub avg_io_us:         u64,
     pub ios:               u64,
+    pub state:             DevState,
+    pub offline_count:     u64,
+}
+
+/// Current operational state of a device
+pub fn dev_state(dev_id: BlockDevId) -> Option<DevState> {
+    Some(DevState::from_u8(slot_ref(dev_id)?.state.load(Ordering::Relaxed)))
+}
+
+/// Bring a device back online by hand (Linux's 'echo running >
+/// state'): clears the failure run so I/O is attempted again. Returns the
+/// state before the reset, or None if there is no such device
+pub fn reset_device(dev_id: BlockDevId) -> Option<DevState> {
+    let s = slot_ref(dev_id)?;
+    let prev = DevState::from_u8(s.state.swap(DevState::Online.as_u8(), Ordering::Relaxed));
+    s.consec_errors.store(0, Ordering::Relaxed);
+    crate::serial_println!("[block] dev {} reset {:?} -> online", dev_id, prev);
+    Some(prev)
 }
 
 /// SMART-style health report from the device (NVMe health log, ATA SMART).
 /// None when the backend has no health source (virtio)
 pub fn health(dev_id: BlockDevId) -> Option<driver::HealthInfo> {
     let slot = slot_ref(dev_id)?;
-    let mut guard = slot.lock();
-    if guard.kind == DevKind::Ata {
+    if slot.kind == DevKind::Ata {
         let _bus = ATA_BUS.lock();
-        guard.driver.health()
+        slot.driver.health()
     } else {
-        guard.driver.health()
+        slot.driver.health()
     }
 }
 
@@ -647,19 +726,19 @@ pub fn flush(dev_id: BlockDevId) -> Result<(), BlkError> {
     flush_dirty_only(dev_id)?;
 
     let Some(slot) = slot_ref(dev_id) else { return Err(BlkError::NoDevice) };
-    let mut guard = slot.lock();
-    if guard.kind == DevKind::Ata {
+    if slot.kind == DevKind::Ata {
         let _bus = ATA_BUS.lock();
-        guard.driver.flush()
+        slot.driver.flush()
     } else {
-        guard.driver.flush()
+        slot.driver.flush()
     }
 }
 
-/// Core dispatch: push the op as a bio request onto the accounting queue,
-/// lock only the target device's slot (plus the shared ATA bus lock for
-/// legacy slots, whose channels share I/O ports) and run it. I/O to distinct
-/// PCI devices proceeds fully in parallel
+/// Core dispatch: push the op onto the accounting queue, then run it through
+/// the driver's '&self' method with no device-wide lock. Several CPUs can be
+/// in here for the same NVMe at once (each routed to its own queue); legacy
+/// ATA still takes the shared bus lock since its channels share I/O ports.
+/// All accounting and the failfast state machine are atomic
 fn dispatch<F>(
     dev_id: BlockDevId,
     dir: BioDirection,
@@ -668,7 +747,7 @@ fn dispatch<F>(
     mut run: F,
 ) -> Result<(), BlkError>
 where
-    F: FnMut(&mut Box<dyn BlockDriver>) -> Result<(), BlkError>,
+    F: FnMut(&Box<dyn BlockDriver>) -> Result<(), BlkError>,
 {
     /// Transient errors get this many extra attempts before giving up.
     /// Sector reads/writes are idempotent, so blind re-issue is safe.
@@ -676,24 +755,31 @@ where
 
     let Some(slot) = slot_ref(dev_id) else { return Err(BlkError::NoDevice) };
 
-    // Enqueue for accounting / future scheduling. Buffer travels with the
-    // closure, so the queued request carries no page id (synchronous path)
     let block_count = count.min(u16::MAX as u32) as u16;
     let ticket = BIO
         .lock()
         .submit(dir, dev_id, lba, block_count, INVALID_ID)
         .ok();
 
-    let mut guard = slot.lock();
+    // Failfast: an offline device rejects I/O at once rather than spinning
+    // through a full hardware timeout (and its retries) on every request
+    if slot.state.load(Ordering::Relaxed) == DevState::Offline.as_u8() {
+        if let Some(idx) = ticket {
+            BIO.lock().complete(idx, false);
+        }
+        return Err(BlkError::Offline);
+    }
+
     let sw = crate::timing::Stopwatch::start();
 
     let mut attempt = 0u32;
     let result = loop {
-        let r = if guard.kind == DevKind::Ata {
+        let r = if slot.kind == DevKind::Ata {
             let _bus = ATA_BUS.lock();
-            run(&mut guard.driver)
+            run(&slot.driver)
         } else {
-            run(&mut guard.driver)
+            // PCI devices (NVMe especially) run with no device-wide lock
+            run(&slot.driver)
         };
         match r {
             Ok(()) => break Ok(()),
@@ -701,7 +787,7 @@ where
                 if attempt < MAX_RETRIES =>
             {
                 attempt += 1;
-                guard.retries += 1;
+                slot.retries.fetch_add(1, Ordering::Relaxed);
                 crate::serial_println!(
                     "[block] dev {} {:?} lba={} count={}: {:?} - retry {}/{}",
                     dev_id, dir, lba, count, e, attempt, MAX_RETRIES
@@ -711,24 +797,49 @@ where
         }
     };
 
-    // Latency accounting once the TSC is calibrated (early-boot I/O would
-    // otherwise record garbage).
+    // Latency accounting once the TSC is calibrated
     if crate::timing::tsc_khz() > 0 {
-        guard.total_io_us += sw.elapsed_us();
-        guard.io_count += 1;
+        slot.total_io_us.fetch_add(sw.elapsed_us(), Ordering::Relaxed);
+        slot.io_count.fetch_add(1, Ordering::Relaxed);
     }
 
     match result {
-        Ok(()) => match dir {
-            BioDirection::Read => guard.sectors_read += count as u64,
-            BioDirection::Write => guard.sectors_written += count as u64,
-            BioDirection::Discard => guard.sectors_discarded += count as u64,
-        },
+        Ok(()) => {
+            match dir {
+                BioDirection::Read => { slot.sectors_read.fetch_add(count as u64, Ordering::Relaxed); }
+                BioDirection::Write => { slot.sectors_written.fetch_add(count as u64, Ordering::Relaxed); }
+                BioDirection::Discard => { slot.sectors_discarded.fetch_add(count as u64, Ordering::Relaxed); }
+            }
+            // A success clears the failure run; a degraded device recovers
+            slot.consec_errors.store(0, Ordering::Relaxed);
+            if slot.state.compare_exchange(
+                DevState::Degraded.as_u8(), DevState::Online.as_u8(),
+                Ordering::Relaxed, Ordering::Relaxed,
+            ).is_ok() {
+                crate::serial_println!("[block] dev {} recovered -> online", dev_id);
+            }
+        }
         // Unsupported is a capability answer, not an I/O failure
         Err(BlkError::Unsupported) => {}
-        Err(_) => guard.io_errors += 1,
+        Err(_) => {
+            slot.io_errors.fetch_add(1, Ordering::Relaxed);
+            let c = slot.consec_errors.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = slot.state.compare_exchange(
+                DevState::Online.as_u8(), DevState::Degraded.as_u8(),
+                Ordering::Relaxed, Ordering::Relaxed,
+            );
+            if c >= OFFLINE_THRESHOLD {
+                let prev = slot.state.swap(DevState::Offline.as_u8(), Ordering::Relaxed);
+                if prev != DevState::Offline.as_u8() {
+                    slot.offline_count.fetch_add(1, Ordering::Relaxed);
+                    crate::serial_println!(
+                        "[block] dev {} taken OFFLINE after {} consecutive errors - failing fast until reset",
+                        dev_id, c
+                    );
+                }
+            }
+        }
     }
-    drop(guard);
 
     if let Some(idx) = ticket {
         BIO.lock().complete(idx, result.is_ok());

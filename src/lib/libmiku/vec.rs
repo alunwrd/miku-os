@@ -122,7 +122,7 @@ pub extern "C" fn miku_vec_get_mut(v: *mut MikuVec, index: usize) -> *mut u8 {
     }
 }
 
-// push: append element to the end. `elem` points to elem_size bytes
+// push: append element to the end. 'elem' points to elem_size bytes
 
 #[no_mangle]
 pub extern "C" fn miku_vec_push(v: *mut MikuVec, elem: *const u8) -> bool {

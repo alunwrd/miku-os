@@ -348,7 +348,7 @@ pub extern "C" fn miku_list_get_u64(l: *const MikuList, index: usize) -> u64 {
     unsafe { *(ptr as *const u64) }
 }
 
-// find index of first element matching `elem`, returns -1 if not found
+// find index of first element matching 'elem', returns -1 if not found
 #[no_mangle]
 pub extern "C" fn miku_list_index_of(l: *const MikuList, elem: *const u8) -> i32 {
     if l.is_null() || elem.is_null() { return -1; }

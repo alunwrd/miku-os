@@ -98,7 +98,7 @@ impl SocketTable {
 
 static SOCKETS: Mutex<SocketTable> = Mutex::new(SocketTable::new());
 
-/// True if `fd` falls in the socket descriptor range
+/// True if 'fd' falls in the socket descriptor range
 #[inline]
 pub fn is_socket_fd(fd: u64) -> bool {
     let fd = fd as usize;
@@ -119,7 +119,7 @@ fn idx_to_fd(idx: usize) -> u64 {
 // Slot allocation / lifecycle
 // ----------------------------------------------------------------------
 
-/// Allocate a TCP socket owned by `pid`. Returns the socket fd or None if the
+/// Allocate a TCP socket owned by 'pid'. Returns the socket fd or None if the
 /// table is full
 pub fn create_tcp(pid: u64) -> Option<u64> {
     let mut tbl = SOCKETS.lock();
@@ -138,7 +138,7 @@ pub fn create_tcp(pid: u64) -> Option<u64> {
     None
 }
 
-/// Close and free the socket behind `fd`. Returns true if it was a live socket
+/// Close and free the socket behind 'fd'. Returns true if it was a live socket
 pub fn close_fd(fd: u64) -> bool {
     let idx = match fd_to_idx(fd) { Some(i) => i, None => return false };
 
@@ -157,7 +157,7 @@ pub fn close_fd(fd: u64) -> bool {
     true
 }
 
-/// Free every socket still owned by `pid` (process-exit cleanup). Does not run
+/// Free every socket still owned by 'pid' (process-exit cleanup). Does not run
 /// the graceful FIN handshake - the process is already gone, so we just drop
 /// the connections (the peer will see an RST or time out, like a hard exit)
 pub fn close_all_for_pid(pid: u64) {
@@ -169,7 +169,7 @@ pub fn close_all_for_pid(pid: u64) {
     }
 }
 
-/// True if `fd` is a socket owned by `pid`
+/// True if 'fd' is a socket owned by 'pid'
 pub fn owned_by(fd: u64, pid: u64) -> bool {
     match fd_to_idx(fd) {
         Some(idx) => {
@@ -184,7 +184,7 @@ pub fn owned_by(fd: u64, pid: u64) -> bool {
 // Blocking operations (lock released during the network call)
 // ----------------------------------------------------------------------
 
-/// Connect the socket behind `fd` to `ip:port`. Blocking. Returns Ok on an
+/// Connect the socket behind 'fd' to 'ip:port'. Blocking. Returns Ok on an
 /// established connection, or an errno on failure
 pub fn connect(fd: u64, ip: [u8; 4], port: u16) -> Result<(), SockError> {
     let idx = fd_to_idx(fd).ok_or(SockError::BadFd)?;
@@ -254,10 +254,10 @@ fn return_socket(idx: usize, sock: Box<TcpSocket>) {
         slot.tcp = Some(sock);
         slot.state = SockState::Connected;
     }
-    // else: closed under us - dropping `sock` runs its destructor
+    // else: closed under us - dropping 'sock' runs its destructor
 }
 
-/// Send all of `data` on the socket. Blocking. Returns bytes sent or errno
+/// Send all of 'data' on the socket. Blocking. Returns bytes sent or errno
 pub fn send(fd: u64, data: &[u8]) -> Result<usize, SockError> {
     let idx = fd_to_idx(fd).ok_or(SockError::BadFd)?;
     let mut sock = take_connected(idx)?;
@@ -275,7 +275,7 @@ pub fn send(fd: u64, data: &[u8]) -> Result<usize, SockError> {
     }
 }
 
-/// Receive up to `buf.len()` bytes. Blocking: waits until at least one byte
+/// Receive up to 'buf.len()' bytes. Blocking: waits until at least one byte
 /// arrives or the peer closes (then returns 0 = EOF). Returns bytes read or
 /// errno
 pub fn recv(fd: u64, buf: &mut [u8]) -> Result<usize, SockError> {

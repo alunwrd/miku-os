@@ -241,7 +241,7 @@ fn ehci_handoff(bus: u8, dev: u8, func: u8) {
     }
 
     // Walk the EECP-rooted PCI capability chain. Each cap header is
-    // 32 bits at PCI cfg offset `cap`: ID in [7:0], NEXT in [15:8]
+    // 32 bits at PCI cfg offset 'cap': ID in [7:0], NEXT in [15:8]
     // We look for cap ID 0x01 (USB Legacy Support)
     let mut cap = eecp;
     let mut hops = 0u32;

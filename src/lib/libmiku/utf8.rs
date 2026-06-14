@@ -4,7 +4,7 @@
 const REPLACEMENT_CHAR: u32 = 0xFFFD;
 
 // encode a single codepoint to UTF-8
-// Writes to `out`, returns number of bytes written (1-4), or 0 on error
+// Writes to 'out', returns number of bytes written (1-4), or 0 on error
 
 #[no_mangle]
 pub extern "C" fn miku_utf8_encode(codepoint: u32, out: *mut u8) -> usize {

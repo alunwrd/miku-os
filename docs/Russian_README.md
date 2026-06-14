@@ -623,7 +623,8 @@ Hello MikuOS!
 | **Диапазон MMAP** | 0x100000000 ~ 0x7F0000000000 |
 | **Диапазон BRK** | 0x6000000000 ~ |
 | **Макс. VMA** | 256 записей |
-| **Функции** | mmap, munmap, mprotect, brk |
+| **Функции** | mmap, munmap, mprotect, brk, file-backed mmap, msync |
+| **File-backed** | `sys_mmap_file` лениво отображает файл (заполнение по page-fault); грязные MAP_SHARED страницы пишутся обратно на munmap/msync |
 | **MAP_FIXED** | Unmap существующих маппингов + удаление перекрывающихся VMA |
 | **Проверка VMA** | Откат при неудаче insert |
 
@@ -990,6 +991,7 @@ bits 12.. = номер swap слота
 | `touch <path>` | Создание файла (RAM) |
 | `cat <path>` | Содержимое файла |
 | `write <path> <text>` | Запись в файл (RAM) |
+| `dd if= of= [bs= count= skip= seek= conv=notrunc,fsync]` | Копирование блоков между файлами, `/dev/zero` и сырыми узлами `/dev/blkN` |
 | `rm [-rf] <path>` | Удаление файла/директории |
 | `rmdir <path>` | Удаление директории (ext совместимо) |
 | `mv <old> <new>` | Переименование |
@@ -1070,12 +1072,14 @@ bits 12.. = номер swap слота
 | `blkdiscard <drive> [lba count]` | Discard/TRIM диапазона секторов (без диапазона - весь диск); аналог blkdiscard(8) |
 | `blkzero <drive> <lba> <count>` | Обнуление диапазона секторов (NVMe/virtio Write Zeroes, фоллбэк - запись нулей) |
 | `fstrim` | Discard всех свободных блоков активной смонтированной ext-ФС по битмапам групп; аналог fstrim(8) |
+| `blkonline <drive>` | Вернуть устройство, выведенное failfast в offline, обратно online (сбрасывает серию ошибок) |
 | `smart <drive>` | SMART / NVMe отчёт здоровья: статус, температура, износ, часы работы, объём R/W |
 | `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run форматирование (только layout) |
 | `gpt <drive>` | Показать таблицу GPT |
 | `gpt.init <drive>` | Инициализировать пустой GPT |
 | `gpt.add <drive> <spec>` | Добавить раздел |
 | `gpt.del <drive> <partition>` | Удалить раздел |
+| `partprobe [drive]` | Перечитать GPT и обновить узлы `/dev/blkNpM` в рантайме (partprobe(8)) |
 | `mkswap <drive> <partition>` | Создать swap на разделе |
 | `swapon <drive> <partition>` | Активировать swap |
 | `swapon.raw <drive> <start> <size>` | Активировать swap по сырым координатам |
@@ -1242,6 +1246,9 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **Учёт I/O** | BIO-очередь: счётчики submitted / completed / errors |
 | **Блокировки** | Per-device mutex слота; ATA-слоты делят bus lock; PCI-устройства полностью параллельны |
 | **Ретраи** | Transient-ошибки (timeout/fault) - до 2 прозрачных повторов; счётчики errors/retries на устройство |
+| **Failfast-состояние** | Online/Degraded/Offline на устройство (по образцу SCSI); после 8 подряд пост-retry ошибок устройство уходит Offline и сразу возвращает ошибку вместо зависания на таймаутах. `blkonline <drive>` сбрасывает; состояние видно в `blkstat` и `/proc/diskstats` |
+| **FUA-барьеры** | `block::write_barrier` коммитит с Force Unit Access (бит FUA у NVMe, ATA WRITE DMA FUA EXT) для commit-блока журнала ext3/4; бэкенды без FUA откатываются на запись+flush |
+| **partprobe** | Узлы разделов `/dev/blkNpM` перечитываются из GPT в рантайме (`partprobe`), без перезагрузки |
 | **Латентность** | Замер каждого запроса по TSC; средняя латентность в `blkstat` (аналог iostat await) |
 
 #### API
@@ -1297,7 +1304,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 
 | Параметр | Значение |
 |:--|:--|
-| **Очереди** | 1 admin queue pair (глубина 16) + 1 I/O queue pair (глубина 64) |
+| **Очереди** | 1 admin queue pair (глубина 16) + **4 I/O queue pairs (глубина 64)**, маршрутизация по CPU, per-queue блокировки - несколько CPU параллельно submit/poll (blk-mq) |
 | **Передача** | До 128 секторов (64 KiB) на команду через PRP1 + PRP list page |
 | **Завершение** | Полинг CQ phase bit |
 | **Память** | Один page-aligned аллок: admin SQ/CQ, I/O SQ/CQ, PRP list, IDENTIFY, bounce |

@@ -119,7 +119,7 @@ pub fn sys_fork() -> u64 {
     // stack top): rcx, r11, rbp, rbx, r12, r13, r14, r15, r10, r9, r8.
     // The kernel stack top lives at gs:[0x10] (percpu::Cpu::kernel_rsp)
     // and the saved user RSP at gs:[0x18] (percpu::Cpu::user_rsp). See
-    // `syscall_handler` in src/syscall/mod.rs and `Cpu` in src/percpu.rs
+    // 'syscall_handler' in src/syscall/mod.rs and 'Cpu' in src/percpu.rs
     // - keep those three call sites in lock-step
     let kernel_stack_top: u64;
     let user_rsp: u64;
@@ -236,7 +236,7 @@ pub fn sys_kill(target_pid: u64, sig: u64) -> u64 {
 
 // 46  exec(path_ptr, path_len, argv_ptr, argc) -> never on success
 //
-// argv_ptr is an array of `argc` u64 user pointers, each pointing to a
+// argv_ptr is an array of 'argc' u64 user pointers, each pointing to a
 // NUL-terminated string. argv[0] conventionally repeats the program
 // name. If userspace passes argc=0 or argv_ptr=0 we fall back to a
 // single-entry argv of [path] so the loader always has a valid argv[0]

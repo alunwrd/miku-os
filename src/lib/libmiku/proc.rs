@@ -39,6 +39,25 @@ pub extern "C" fn miku_munmap(addr: *mut u8, len: usize) -> i64 {
     unsafe { sc2(SYS_MUNMAP, addr as u64, len as u64) }
 }
 
+/// File-backed mmap. 'flags' is MAP_SHARED (1) or MAP_PRIVATE (2). The six
+/// parameters travel through a struct in our own stack memory, since the
+/// 4-argument syscall ABI can't carry them all
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn miku_mmap_file(
+    addr: u64, len: usize, prot: u64, flags: u64, fd: i64, offset: u64,
+) -> *mut u8 {
+    let args: [u64; 6] = [addr, len as u64, prot, flags, fd as u64, offset];
+    let r = unsafe { sc1(SYS_MMAP_FILE, args.as_ptr() as u64) };
+    if r < 0 { core::ptr::null_mut() } else { r as *mut u8 }
+}
+
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn miku_msync(addr: *mut u8, len: usize) -> i64 {
+    unsafe { sc2(SYS_MSYNC, addr as u64, len as u64) }
+}
+
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn miku_mprotect(addr: u64, len: usize, prot: u64) -> i64 {

@@ -10,7 +10,7 @@ fn pt_index(virt: u64, level: u8) -> usize {
     ((virt >> (12 + 9 * level as u64)) & 0x1FF) as usize
 }
 
-// Walk page tables from P4 down to the P1 entry pointer for `virt`.
+// Walk page tables from P4 down to the P1 entry pointer for 'virt'.
 // Returns a mutable pointer to the raw PTE u64 in the P1 table, or None
 // if any intermediate table is not present.
 #[inline]

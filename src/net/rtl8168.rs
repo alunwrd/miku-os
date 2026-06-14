@@ -44,7 +44,7 @@ impl Desc {
 
 /// Publish a descriptor to the chip in the correct order: buffer address +
 /// VLAN first, then a full memory fence, then flags (which carries the OWN
-/// bit). This matters because a plain d = Desc { flags: OWN|..., .. }`
+/// bit). This matters because a plain d = Desc { flags: OWN|..., .. }'
 /// lets the compiler emit the field stores in any order it likes - if
 /// flags lands before buf_lo/buf_hi, the NIC sees OWN=1 with stale or
 /// zero buffer pointers and silently drops the frame. That is the failure

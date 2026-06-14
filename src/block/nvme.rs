@@ -11,6 +11,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use spin::Mutex as SpinMutex;
 
 use super::driver::{BlkError, BlockDevInfo, BlockDriver, HealthInfo};
 use crate::net::pci::{pci_read32, pci_read8, PCI_ADDR, PCI_DATA, pci_addr};
@@ -47,42 +48,64 @@ const NVM_WRITE_ZEROES: u8 = 0x08;
 const ADMIN_QD: usize = 16; // admin queue depth
 const IO_QD:    usize = 64; // I/O queue depth
 
+/// Independent I/O queue pairs. Requests route to one by CPU, so this many
+/// CPUs can submit and poll NVMe commands at the same time - true blk-mq
+const NUM_IO_QUEUES: usize = 4;
+
 pub const MAX_XFER_SECTORS: u32 = 128; // 64 KiB per command
 const BOUNCE_SIZE: usize = MAX_XFER_SECTORS as usize * 512;
 
-/// All controller-visible memory in one physically-contiguous, page-aligned
-/// allocation. Queue bases must be page aligned, hence the padded fields
+/// Admin queue pair plus the IDENTIFY/log scratch page. One per controller
 #[repr(C, align(4096))]
-struct NvmeMem {
-    admin_sq: [u8; 4096],        // 16 x 64 B used
-    admin_cq: [u8; 4096],        // 16 x 16 B used
-    io_sq:    [u8; 4096],        // 64 x 64 B
-    io_cq:    [u8; 4096],        // 64 x 16 B
-    prp_list: [u8; 4096],        // PRP entries for bounce pages 1..15
-    ident:    [u8; 4096],        // IDENTIFY result buffer
-    bounce:   [u8; BOUNCE_SIZE],
+struct AdminMem {
+    sq:    [u8; 4096],
+    cq:    [u8; 4096],
+    ident: [u8; 4096],
 }
 
-struct Queue {
+/// One I/O queue pair's controller-visible memory, page-aligned. Each queue
+/// has its own bounce buffer and PRP list, so the queues never touch each
+/// other's DMA region and can run fully in parallel
+#[repr(C, align(4096))]
+struct IoQueueMem {
+    sq:     [u8; 4096],
+    cq:     [u8; 4096],
+    prp:    [u8; 4096],
+    bounce: [u8; BOUNCE_SIZE],
+}
+
+/// Mutable ring cursors for one queue, guarded so concurrent submitters on
+/// the same queue serialize while different queues proceed independently
+struct QState {
     sq_tail: u16,
     cq_head: u16,
     phase:   u8,
-    depth:   u16,
+    cid:     u16,
 }
 
-impl Queue {
-    const fn new(depth: u16) -> Self {
-        Self { sq_tail: 0, cq_head: 0, phase: 1, depth }
+impl QState {
+    const fn new() -> Self {
+        Self { sq_tail: 0, cq_head: 0, phase: 1, cid: 0 }
     }
+}
+
+/// One I/O queue: its DMA memory plus a lock over its cursors
+struct IoQueue {
+    qid: u16,
+    mem: Box<IoQueueMem>,
+    st:  SpinMutex<QState>,
 }
 
 pub struct Nvme {
     mmio:      u64,   // virtual base of BAR0
     db_stride: u64,
-    mem:       Box<NvmeMem>,
-    admin:     Queue,
-    io:        Queue,
-    cid:       u16,
+    admin_mem: Box<AdminMem>,
+    admin:     SpinMutex<QState>,
+    admin_depth: u16,
+    io_depth:  u16,
+    io:        alloc::vec::Vec<IoQueue>,
+    /// Round-robin fallback for queue selection before per-CPU is meaningful
+    rr:        core::sync::atomic::AtomicUsize,
     nsid:      u32,
     capacity:  u64,   // in 512-byte sectors
     model:     [u8; 40],
@@ -171,21 +194,22 @@ impl Nvme {
         let mqes = (cap & 0xFFFF) as usize + 1;
         let timeout_500ms = ((cap >> 24) & 0xFF) as u64;
 
+        let admin_depth = ADMIN_QD.min(mqes) as u16;
+        let io_depth = IO_QD.min(mqes) as u16;
+
         let mut drv = Nvme {
             mmio,
             db_stride,
-            mem: Box::new(NvmeMem {
-                admin_sq: [0u8; 4096],
-                admin_cq: [0u8; 4096],
-                io_sq:    [0u8; 4096],
-                io_cq:    [0u8; 4096],
-                prp_list: [0u8; 4096],
-                ident:    [0u8; 4096],
-                bounce:   [0u8; BOUNCE_SIZE],
+            admin_mem: Box::new(AdminMem {
+                sq:    [0u8; 4096],
+                cq:    [0u8; 4096],
+                ident: [0u8; 4096],
             }),
-            admin: Queue::new(ADMIN_QD.min(mqes) as u16),
-            io:    Queue::new(IO_QD.min(mqes) as u16),
-            cid:   0,
+            admin: SpinMutex::new(QState::new()),
+            admin_depth,
+            io_depth,
+            io: alloc::vec::Vec::new(),
+            rr: core::sync::atomic::AtomicUsize::new(0),
             nsid:  1,
             capacity:  0,
             model:     [0u8; 40],
@@ -201,9 +225,9 @@ impl Nvme {
             return None;
         }
 
-        let asq = crate::net::virt_to_phys(drv.mem.admin_sq.as_ptr() as u64);
-        let acq = crate::net::virt_to_phys(drv.mem.admin_cq.as_ptr() as u64);
-        let aqa = ((drv.admin.depth as u32 - 1) << 16) | (drv.admin.depth as u32 - 1);
+        let asq = crate::net::virt_to_phys(drv.admin_mem.sq.as_ptr() as u64);
+        let acq = crate::net::virt_to_phys(drv.admin_mem.cq.as_ptr() as u64);
+        let aqa = ((admin_depth as u32 - 1) << 16) | (admin_depth as u32 - 1);
         wr32(mmio + REG_AQA, aqa);
         wr64(mmio + REG_ASQ, asq);
         wr64(mmio + REG_ACQ, acq);
@@ -218,13 +242,13 @@ impl Nvme {
         }
 
         // IDENTIFY controller (CNS=1): model string for blkstat
-        let ident_phys = crate::net::virt_to_phys(drv.mem.ident.as_ptr() as u64);
+        let ident_phys = crate::net::virt_to_phys(drv.admin_mem.ident.as_ptr() as u64);
         if drv.admin_cmd(ADM_IDENTIFY, 0, ident_phys, 1, 0).is_err() {
             crate::serial_println!("[nvme] IDENTIFY controller failed");
             return None;
         }
         let mut n = 0usize;
-        for &b in &drv.mem.ident[24..64] {
+        for &b in &drv.admin_mem.ident[24..64] {
             if n < drv.model.len() { drv.model[n] = b; n += 1; }
         }
         while n > 0 && (drv.model[n - 1] == b' ' || drv.model[n - 1] == 0) { n -= 1; }
@@ -232,7 +256,7 @@ impl Nvme {
 
         // Optional NVM command support (ONCS, bytes 520-521):
         // bit 2 = DSM (discard), bit 3 = Write Zeroes
-        let oncs = u16::from_le_bytes([drv.mem.ident[520], drv.mem.ident[521]]);
+        let oncs = u16::from_le_bytes([drv.admin_mem.ident[520], drv.admin_mem.ident[521]]);
         drv.has_dsm = oncs & (1 << 2) != 0;
         drv.has_wz  = oncs & (1 << 3) != 0;
 
@@ -241,10 +265,10 @@ impl Nvme {
             crate::serial_println!("[nvme] IDENTIFY namespace failed");
             return None;
         }
-        let nsze = u64::from_le_bytes(drv.mem.ident[0..8].try_into().ok()?);
-        let flbas = drv.mem.ident[26] & 0x0F;
+        let nsze = u64::from_le_bytes(drv.admin_mem.ident[0..8].try_into().ok()?);
+        let flbas = drv.admin_mem.ident[26] & 0x0F;
         let lbaf_off = 128 + flbas as usize * 4;
-        let lbads = drv.mem.ident[lbaf_off + 2];
+        let lbads = drv.admin_mem.ident[lbaf_off + 2];
         if lbads != 9 {
             crate::serial_println!(
                 "[nvme] namespace LBA size 2^{} unsupported (need 512 B)", lbads
@@ -253,33 +277,47 @@ impl Nvme {
         }
         drv.capacity = nsze;
 
-        // I/O completion queue first, then the submission queue tied to it
-        let io_cq = crate::net::virt_to_phys(drv.mem.io_cq.as_ptr() as u64);
-        let io_sq = crate::net::virt_to_phys(drv.mem.io_sq.as_ptr() as u64);
-        let qsize = (drv.io.depth as u32 - 1) << 16;
-        if drv.admin_cmd(ADM_CREATE_IO_CQ, 0, io_cq, qsize | 1, 1).is_err() {
-            crate::serial_println!("[nvme] create IO CQ failed");
-            return None;
-        }
-        if drv.admin_cmd(ADM_CREATE_IO_SQ, 0, io_sq, qsize | 1, (1 << 16) | 1).is_err() {
-            crate::serial_println!("[nvme] create IO SQ failed");
-            return None;
-        }
+        // Create NUM_IO_QUEUES independent I/O queue pairs (qid 1..=N). Each
+        // gets its own CQ then SQ; a per-queue PRP list is filled once
+        let qsize = (io_depth as u32 - 1) << 16;
+        for i in 0..NUM_IO_QUEUES {
+            let qid = (i + 1) as u32;
+            let mut mem = Box::new(IoQueueMem {
+                sq:     [0u8; 4096],
+                cq:     [0u8; 4096],
+                prp:    [0u8; 4096],
+                bounce: [0u8; BOUNCE_SIZE],
+            });
 
-        // PRP list for bounce pages 1.. (page 0 goes in PRP1); the bounce is
-        // physically contiguous, so the list never changes
-        let bounce_phys = crate::net::virt_to_phys(drv.mem.bounce.as_ptr() as u64);
-        for i in 1..(BOUNCE_SIZE / 4096) {
-            let entry = bounce_phys + i as u64 * 4096;
-            let off = (i - 1) * 8;
-            drv.mem.prp_list[off..off + 8].copy_from_slice(&entry.to_le_bytes());
+            let cq_phys = crate::net::virt_to_phys(mem.cq.as_ptr() as u64);
+            let sq_phys = crate::net::virt_to_phys(mem.sq.as_ptr() as u64);
+            // CREATE_IO_CQ: cdw10 = qsize|qid, cdw11 = PC (no interrupts: poll)
+            if drv.admin_cmd(ADM_CREATE_IO_CQ, 0, cq_phys, qsize | qid, 1).is_err() {
+                crate::serial_println!("[nvme] create IO CQ {} failed", qid);
+                return None;
+            }
+            // CREATE_IO_SQ: cdw10 = qsize|qid, cdw11 = (cqid<<16)|PC
+            if drv.admin_cmd(ADM_CREATE_IO_SQ, 0, sq_phys, qsize | qid, (qid << 16) | 1).is_err() {
+                crate::serial_println!("[nvme] create IO SQ {} failed", qid);
+                return None;
+            }
+
+            // PRP list for bounce pages 1.. (page 0 goes in PRP1)
+            let bounce_phys = crate::net::virt_to_phys(mem.bounce.as_ptr() as u64);
+            for p in 1..(BOUNCE_SIZE / 4096) {
+                let entry = bounce_phys + p as u64 * 4096;
+                let off = (p - 1) * 8;
+                mem.prp[off..off + 8].copy_from_slice(&entry.to_le_bytes());
+            }
+
+            drv.io.push(IoQueue { qid: qid as u16, mem, st: SpinMutex::new(QState::new()) });
         }
 
         crate::serial_println!(
-            "[nvme] '{}' ns{} {} sectors ({} MB) qd={} dsm={} wz={}",
+            "[nvme] '{}' ns{} {} sectors ({} MB) {} io-queues x qd={} dsm={} wz={}",
             core::str::from_utf8(&drv.model[..drv.model_len as usize]).unwrap_or("?"),
-            drv.nsid, drv.capacity, drv.capacity * 512 / (1024 * 1024), drv.io.depth,
-            drv.has_dsm, drv.has_wz
+            drv.nsid, drv.capacity, drv.capacity * 512 / (1024 * 1024),
+            NUM_IO_QUEUES, io_depth, drv.has_dsm, drv.has_wz
         );
         Some(drv)
     }
@@ -308,54 +346,60 @@ impl Nvme {
         self.mmio + DOORBELLS + (2 * qid + 1) * self.db_stride
     }
 
-    /// Submit one command on the given queue and poll its completion.
-    /// Returns the completion status field (0 = success)
-    fn submit(&mut self, qid: u64, entry: &[u8; 64]) -> Result<(), BlkError> {
-        self.cid = self.cid.wrapping_add(1);
-        let cid = self.cid;
+    /// Submit one command on a specific queue and poll its completion. The
+    /// queue's cursor lock is held for the whole submit/poll, so concurrent
+    /// callers on the *same* queue serialize while *different* queues run in
+    /// parallel. Takes '&self' - the per-queue lock provides the mutability,
+    /// and each queue owns disjoint SQ/CQ memory
+    fn submit_on(
+        &self,
+        sq: *mut u8,
+        cq: *const u8,
+        st: &SpinMutex<QState>,
+        qid: u64,
+        depth: u16,
+        entry: &[u8; 64],
+    ) -> Result<(), BlkError> {
+        let mut q = st.lock();
+        self.submit_locked(sq, cq, &mut q, qid, depth, entry)
+    }
 
-        let (sq, cq, q) = if qid == 0 {
-            (
-                self.mem.admin_sq.as_mut_ptr(),
-                self.mem.admin_cq.as_ptr(),
-                &mut self.admin,
-            )
-        } else {
-            (
-                self.mem.io_sq.as_mut_ptr(),
-                self.mem.io_cq.as_ptr(),
-                &mut self.io,
-            )
-        };
-
+    /// Core submit+poll with the queue's cursor lock already held by the
+    /// caller (read/write hold it across the bounce-buffer copy, so the
+    /// whole transfer is exclusive on that queue)
+    fn submit_locked(
+        &self,
+        sq: *mut u8,
+        cq: *const u8,
+        q: &mut QState,
+        qid: u64,
+        depth: u16,
+        entry: &[u8; 64],
+    ) -> Result<(), BlkError> {
+        q.cid = q.cid.wrapping_add(1);
+        let cid = q.cid;
         unsafe {
             let slot = sq.add(q.sq_tail as usize * 64);
             core::ptr::copy_nonoverlapping(entry.as_ptr(), slot, 64);
             // Patch the command id into dw0 bits 31:16
-            core::ptr::write_volatile(
-                (slot as *mut u16).add(1),
-                cid,
-            );
+            core::ptr::write_volatile((slot as *mut u16).add(1), cid);
         }
 
-        q.sq_tail = (q.sq_tail + 1) % q.depth;
+        q.sq_tail = (q.sq_tail + 1) % depth;
         let tail = q.sq_tail;
         let head = q.cq_head;
         let phase = q.phase;
-        let depth = q.depth;
 
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         wr32(self.sq_doorbell(qid), tail as u32);
 
-        // Poll the completion entry's phase bit
+        // Poll this queue's completion entry phase bit
         let cqe = unsafe { cq.add(head as usize * 16) };
         let mut spins = 0u64;
         let status: u16 = loop {
-            let dw3 = unsafe {
-                core::ptr::read_volatile((cqe as *const u32).add(3))
-            };
+            let dw3 = unsafe { core::ptr::read_volatile((cqe as *const u32).add(3)) };
             if ((dw3 >> 16) & 1) as u8 == phase {
-                break (dw3 >> 17) as u16; // status field sans phase bit
+                break (dw3 >> 17) as u16;
             }
             super::io_relax(spins);
             spins += 1;
@@ -364,8 +408,6 @@ impl Nvme {
             }
         };
 
-        // Advance CQ head (flip phase on wrap) and ring the head doorbell
-        let q = if qid == 0 { &mut self.admin } else { &mut self.io };
         q.cq_head = (head + 1) % depth;
         if q.cq_head == 0 {
             q.phase ^= 1;
@@ -381,7 +423,8 @@ impl Nvme {
         }
     }
 
-    fn admin_cmd(&mut self, opcode: u8, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32)
+    /// Admin command on queue 0 (serialized; admin traffic is rare)
+    fn admin_cmd(&self, opcode: u8, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32)
         -> Result<(), BlkError>
     {
         let mut e = [0u8; 64];
@@ -390,75 +433,138 @@ impl Nvme {
         e[24..32].copy_from_slice(&prp1.to_le_bytes());
         e[40..44].copy_from_slice(&cdw10.to_le_bytes());
         e[44..48].copy_from_slice(&cdw11.to_le_bytes());
-        self.submit(0, &e)
+        let sq = self.admin_mem.sq.as_ptr() as *mut u8;
+        let cq = self.admin_mem.cq.as_ptr();
+        self.submit_on(sq, cq, &self.admin, 0, self.admin_depth, &e)
     }
 
-    /// One READ/WRITE of up to 128 sectors through the bounce buffer
-    fn rw(&mut self, opcode: u8, lba: u64, sectors: u32) -> Result<(), BlkError> {
-        let bytes = sectors as usize * 512;
-        let bounce_phys = crate::net::virt_to_phys(self.mem.bounce.as_ptr() as u64);
-
-        let mut e = [0u8; 64];
-        e[0] = opcode;
-        e[4..8].copy_from_slice(&self.nsid.to_le_bytes());
-        e[24..32].copy_from_slice(&bounce_phys.to_le_bytes());
-        // PRP2: second page directly, or the PRP list for longer transfers
-        if bytes > 4096 {
-            let prp2 = if bytes <= 8192 {
-                bounce_phys + 4096
-            } else {
-                crate::net::virt_to_phys(self.mem.prp_list.as_ptr() as u64)
-            };
-            e[32..40].copy_from_slice(&prp2.to_le_bytes());
+    /// Pick an I/O queue for the current CPU (falls back to round-robin)
+    fn pick_queue(&self) -> usize {
+        let cpu = crate::percpu::current_index();
+        if cpu < self.io.len() {
+            cpu
+        } else {
+            self.rr.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % self.io.len()
         }
-        e[40..44].copy_from_slice(&(lba as u32).to_le_bytes());
-        e[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes());
-        e[48..52].copy_from_slice(&(sectors - 1).to_le_bytes()); // 0-based
-        self.submit(1, &e)
+    }
+
+
+    /// One read chunk into 'out' through queue qi's bounce buffer, the
+    /// queue lock held across the whole transfer so the bounce is exclusive
+    fn read_chunk(&self, qi: usize, lba: u64, sectors: u32, out: &mut [u8]) -> Result<(), BlkError> {
+        let q = &self.io[qi];
+        let bytes = sectors as usize * 512;
+        let bounce_phys = crate::net::virt_to_phys(q.mem.bounce.as_ptr() as u64);
+        let prp_phys = crate::net::virt_to_phys(q.mem.prp.as_ptr() as u64);
+        let e = build_rw(NVM_READ, self.nsid, bounce_phys, prp_phys, lba, sectors, false);
+        let sq = q.mem.sq.as_ptr() as *mut u8;
+        let cq = q.mem.cq.as_ptr();
+        let mut g = q.st.lock();
+        self.submit_locked(sq, cq, &mut g, q.qid as u64, self.io_depth, &e)?;
+        out[..bytes].copy_from_slice(&q.mem.bounce[..bytes]);
+        Ok(())
+    }
+
+    /// One write chunk from 'data' through queue qi's bounce buffer
+    fn write_chunk(&self, qi: usize, lba: u64, sectors: u32, data: &[u8], fua: bool) -> Result<(), BlkError> {
+        let q = &self.io[qi];
+        let bytes = sectors as usize * 512;
+        let bounce_phys = crate::net::virt_to_phys(q.mem.bounce.as_ptr() as u64);
+        let prp_phys = crate::net::virt_to_phys(q.mem.prp.as_ptr() as u64);
+        let e = build_rw(NVM_WRITE, self.nsid, bounce_phys, prp_phys, lba, sectors, fua);
+        let sq = q.mem.sq.as_ptr() as *mut u8;
+        let cq = q.mem.cq.as_ptr();
+        let mut g = q.st.lock();
+        // Stage the data into the bounce under the queue lock
+        unsafe {
+            let dst = q.mem.bounce.as_ptr() as *mut u8;
+            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, bytes);
+        }
+        self.submit_locked(sq, cq, &mut g, q.qid as u64, self.io_depth, &e)
     }
 }
 
+/// Build an NVM READ/WRITE command entry. The bounce buffer holds the data;
+/// PRP2 is the second page directly (<= 8 KiB) or the queue's PRP list
+fn build_rw(opcode: u8, nsid: u32, bounce_phys: u64, prp_phys: u64,
+            lba: u64, sectors: u32, fua: bool) -> [u8; 64] {
+    let bytes = sectors as usize * 512;
+    let mut e = [0u8; 64];
+    e[0] = opcode;
+    e[4..8].copy_from_slice(&nsid.to_le_bytes());
+    e[24..32].copy_from_slice(&bounce_phys.to_le_bytes());
+    if bytes > 4096 {
+        let prp2 = if bytes <= 8192 { bounce_phys + 4096 } else { prp_phys };
+        e[32..40].copy_from_slice(&prp2.to_le_bytes());
+    }
+    e[40..44].copy_from_slice(&(lba as u32).to_le_bytes());
+    e[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes());
+    // CDW12: NLB in bits 15:0 (0-based), FUA in bit 30
+    let cdw12 = (sectors - 1) | if fua { 1 << 30 } else { 0 };
+    e[48..52].copy_from_slice(&cdw12.to_le_bytes());
+    e
+}
+
 impl BlockDriver for Nvme {
-    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError> {
+    fn read_blocks(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError> {
         if (count as usize) * 512 > buf.len() {
             return Err(BlkError::BufferTooSmall);
         }
-        let mut done = 0u32;
-        while done < count {
-            let chunk = (count - done).min(MAX_XFER_SECTORS);
-            let bytes = chunk as usize * 512;
-            self.rw(NVM_READ, lba + done as u64, chunk)?;
-            let off = done as usize * 512;
-            buf[off..off + bytes].copy_from_slice(&self.mem.bounce[..bytes]);
-            done += chunk;
-        }
-        Ok(())
-    }
-
-    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
-        if (count as usize) * 512 > buf.len() {
-            return Err(BlkError::BufferTooSmall);
-        }
+        let qi = self.pick_queue();
         let mut done = 0u32;
         while done < count {
             let chunk = (count - done).min(MAX_XFER_SECTORS);
             let bytes = chunk as usize * 512;
             let off = done as usize * 512;
-            self.mem.bounce[..bytes].copy_from_slice(&buf[off..off + bytes]);
-            self.rw(NVM_WRITE, lba + done as u64, chunk)?;
+            self.read_chunk(qi, lba + done as u64, chunk, &mut buf[off..off + bytes])?;
             done += chunk;
         }
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), BlkError> {
+    fn write_blocks(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
+        if (count as usize) * 512 > buf.len() {
+            return Err(BlkError::BufferTooSmall);
+        }
+        let qi = self.pick_queue();
+        let mut done = 0u32;
+        while done < count {
+            let chunk = (count - done).min(MAX_XFER_SECTORS);
+            let bytes = chunk as usize * 512;
+            let off = done as usize * 512;
+            self.write_chunk(qi, lba + done as u64, chunk, &buf[off..off + bytes], false)?;
+            done += chunk;
+        }
+        Ok(())
+    }
+
+    fn write_blocks_fua(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
+        if (count as usize) * 512 > buf.len() {
+            return Err(BlkError::BufferTooSmall);
+        }
+        let qi = self.pick_queue();
+        let mut done = 0u32;
+        while done < count {
+            let chunk = (count - done).min(MAX_XFER_SECTORS);
+            let bytes = chunk as usize * 512;
+            let off = done as usize * 512;
+            self.write_chunk(qi, lba + done as u64, chunk, &buf[off..off + bytes], true)?;
+            done += chunk;
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), BlkError> {
         let mut e = [0u8; 64];
         e[0] = NVM_FLUSH;
         e[4..8].copy_from_slice(&self.nsid.to_le_bytes());
-        self.submit(1, &e)
+        let q = &self.io[self.pick_queue()];
+        let sq = q.mem.sq.as_ptr() as *mut u8;
+        let cq = q.mem.cq.as_ptr();
+        self.submit_on(sq, cq, &q.st, q.qid as u64, self.io_depth, &e)
     }
 
-    fn info(&mut self) -> BlockDevInfo {
+    fn info(&self) -> BlockDevInfo {
         let mut out = BlockDevInfo::unknown();
         out.total_sectors = self.capacity;
         out.lba48 = true;
@@ -469,35 +575,42 @@ impl BlockDriver for Nvme {
     }
 
     /// Dataset Management with the deallocate attribute - NVMe's discard.
-    /// A range descriptor is 16 bytes (context attributes, length in LBAs,
-    /// starting LBA) and the whole request fits one descriptor, since
-    /// 'count' is itself a u32 length in LBAs
-    fn discard(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
+    /// The 16-byte range descriptor is staged in queue 0's bounce buffer
+    /// (exclusive under its lock; the bounce is rewritten by the next I/O)
+    fn discard(&self, lba: u64, count: u32) -> Result<(), BlkError> {
         if !self.has_dsm {
             return Err(BlkError::Unsupported);
         }
-        // The ident page doubles as scratch for admin-sized payloads
-        // (health() does the same); a DSM range list reads only 16 bytes
-        self.mem.ident[..4].fill(0);
-        self.mem.ident[4..8].copy_from_slice(&count.to_le_bytes());
-        self.mem.ident[8..16].copy_from_slice(&lba.to_le_bytes());
-        let prp1 = crate::net::virt_to_phys(self.mem.ident.as_ptr() as u64);
-
+        let q = &self.io[0];
+        let bounce_phys = crate::net::virt_to_phys(q.mem.bounce.as_ptr() as u64);
+        let sq = q.mem.sq.as_ptr() as *mut u8;
+        let cq = q.mem.cq.as_ptr();
+        let mut g = q.st.lock();
+        unsafe {
+            let b = q.mem.bounce.as_ptr() as *mut u8;
+            core::ptr::write_bytes(b, 0, 16);
+            // ctx attrs (4) = 0; length in LBAs (4); starting LBA (8)
+            core::ptr::copy_nonoverlapping(count.to_le_bytes().as_ptr(), b.add(4), 4);
+            core::ptr::copy_nonoverlapping(lba.to_le_bytes().as_ptr(), b.add(8), 8);
+        }
         let mut e = [0u8; 64];
         e[0] = NVM_DSM;
         e[4..8].copy_from_slice(&self.nsid.to_le_bytes());
-        e[24..32].copy_from_slice(&prp1.to_le_bytes());
+        e[24..32].copy_from_slice(&bounce_phys.to_le_bytes());
         // cdw10 = number of ranges - 1 = 0; cdw11 bit 2 (AD) = deallocate
         e[44..48].copy_from_slice(&(1u32 << 2).to_le_bytes());
-        self.submit(1, &e)
+        self.submit_locked(sq, cq, &mut g, q.qid as u64, self.io_depth, &e)
     }
 
     /// Write Zeroes: zeroes the range on the device without moving data.
     /// NLB is a 16-bit 0-based count, so up to 65536 sectors per command
-    fn write_zeroes(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
+    fn write_zeroes(&self, lba: u64, count: u32) -> Result<(), BlkError> {
         if !self.has_wz {
             return Err(BlkError::Unsupported);
         }
+        let q = &self.io[self.pick_queue()];
+        let sq = q.mem.sq.as_ptr() as *mut u8;
+        let cq = q.mem.cq.as_ptr();
         let mut done = 0u32;
         while done < count {
             let n = (count - done).min(65536);
@@ -508,35 +621,30 @@ impl BlockDriver for Nvme {
             e[40..44].copy_from_slice(&(cur as u32).to_le_bytes());
             e[44..48].copy_from_slice(&((cur >> 32) as u32).to_le_bytes());
             e[48..52].copy_from_slice(&(n - 1).to_le_bytes());
-            self.submit(1, &e)?;
+            self.submit_on(sq, cq, &q.st, q.qid as u64, self.io_depth, &e)?;
             done += n;
         }
         Ok(())
     }
 
-    /// SMART / Health Information log page (LID 0x02, 512 bytes)
-    fn health(&mut self) -> Option<HealthInfo> {
-        let prp1 = crate::net::virt_to_phys(self.mem.ident.as_ptr() as u64);
-        // cdw10: NUMD (dwords - 1) in bits 27:16, LID in bits 7:0
+    /// SMART / Health Information log page (LID 0x02, 512 bytes). Uses the
+    /// admin queue's scratch page
+    fn health(&self) -> Option<HealthInfo> {
+        let prp1 = crate::net::virt_to_phys(self.admin_mem.ident.as_ptr() as u64);
         let numd = (512 / 4 - 1) as u32;
         if self.admin_cmd(ADM_GET_LOG_PAGE, 0xFFFF_FFFF, prp1, (numd << 16) | 0x02, 0).is_err() {
             return None;
         }
-        let log = &self.mem.ident;
-
+        let log = &self.admin_mem.ident;
         let crit_warning = log[0];
-        // Composite temperature, Kelvin, LE u16
         let temp_k = u16::from_le_bytes([log[1], log[2]]);
         let pct_used = log[5];
         let u128le = |off: usize| -> u64 {
-            // 16-byte LE counters; the low 8 bytes are plenty here
             u64::from_le_bytes(log[off..off + 8].try_into().unwrap_or([0; 8]))
         };
-        // Data units are 1000 x 512 B
         let read_mb    = u128le(32).saturating_mul(512_000) / (1024 * 1024);
         let written_mb = u128le(48).saturating_mul(512_000) / (1024 * 1024);
         let poh        = u128le(128);
-
         Some(HealthInfo {
             healthy: crit_warning == 0,
             temp_c: if temp_k == 0 { i16::MIN } else { temp_k as i16 - 273 },

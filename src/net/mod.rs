@@ -40,9 +40,9 @@ pub use crate::grub::phys_to_virt;
 // Net drivers allocate descriptor rings and packet buffers on the kernel
 // heap (Box::new), whose virtual addresses live in HHDM (0xFFFF8000_…),
 // not in the kernel image (0xFFFFFFFF_8000…). Use the range-aware
-// translator so `virt_to_phys` returns a usable DMA address for both heap
+// translator so 'virt_to_phys' returns a usable DMA address for both heap
 // and kernel-image pointers - feeding the chip a kernel-image-only
-// `virt_to_phys` of a HHDM heap address gives garbage and the chip then
+// 'virt_to_phys' of a HHDM heap address gives garbage and the chip then
 // DMAs into nowhere (TX appears "ok" because send() only checks the OWN
 // bit it set itself; RX is silently dead - exactly the "tx: N rx: 0"
 // symptom on RTL8168).
@@ -466,7 +466,7 @@ pub fn netd_thread() -> ! {
         }
     }
     if !got_lease {
-        crate::serial_println!("[netd] no DHCP response - run `dhcp` manually once a server is reachable");
+        crate::serial_println!("[netd] no DHCP response - run 'dhcp' manually once a server is reachable");
     }
 
     // Stay alive; lease renewal can be added here later (every leasetime/2)

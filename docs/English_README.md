@@ -560,7 +560,8 @@ Use `_start_main`, not `_start`. `miku.rs` contains a `global_asm!` trampoline t
 | **MMAP range** | 0x100000000 ~ 0x7F0000000000 |
 | **BRK range** | 0x6000000000 ~ |
 | **Max VMAs** | 256 entries |
-| **Features** | mmap, munmap, mprotect, brk |
+| **Features** | mmap, munmap, mprotect, brk, file-backed mmap, msync |
+| **File-backed** | `sys_mmap_file` maps a file lazily (page-fault fill); MAP_SHARED dirty pages write back on munmap/msync |
 | **MAP_FIXED** | Unmaps existing mappings + removes overlapping VMAs |
 | **VMA validation** | Rollback on insert failure |
 
@@ -996,6 +997,9 @@ The block layer is the single routing point between filesystems and storage driv
 | **I/O accounting** | BIO queue with submitted / completed / error counters |
 | **Locking** | Per-device slot mutex; ATA slots share a bus lock; PCI devices are fully parallel |
 | **Retries** | Transient errors (timeout/fault) get up to 2 transparent re-issues; per-device error/retry counters |
+| **Failfast state** | Per-device Online/Degraded/Offline (SCSI-style); 8 consecutive post-retry failures take a device Offline and it fails fast instead of hanging on timeouts. `blkonline <drive>` resets it; state shown in `blkstat` and `/proc/diskstats` |
+| **FUA barriers** | `block::write_barrier` commits with Force Unit Access (NVMe FUA bit, ATA WRITE DMA FUA EXT) for the ext3/4 journal commit; non-FUA backends fall back to write-plus-flush |
+| **partprobe** | `/dev/blkNpM` partition nodes are rescannable from the GPT at runtime (`partprobe`), no reboot needed |
 | **Latency** | Per-request TSC timing; `blkstat` shows average I/O latency (iostat `await`) |
 
 #### API
@@ -1051,7 +1055,7 @@ The block layer is the single routing point between filesystems and storage driv
 
 | Parameter | Value |
 |:--|:--|
-| **Queues** | 1 admin queue pair (depth 16) + 1 I/O queue pair (depth 64) |
+| **Queues** | 1 admin queue pair (depth 16) + **4 I/O queue pairs (depth 64)** routed per-CPU with per-queue locks - several CPUs submit/poll in parallel (blk-mq) |
 | **Transfer** | Up to 128 sectors (64 KiB) per command via PRP1 + PRP list page |
 | **Completion** | Polled CQ phase bit |
 | **Memory** | One page-aligned allocation: admin SQ/CQ, I/O SQ/CQ, PRP list, IDENTIFY buffer, bounce |
@@ -1201,6 +1205,7 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
 | `touch <path>` | Create file (RAM) |
 | `cat <path>` | File contents |
 | `write <path> <text>` | Write to file (RAM) |
+| `dd if= of= [bs= count= skip= seek= conv=notrunc,fsync]` | Copy blocks between files, `/dev/zero` and raw `/dev/blkN` nodes |
 | `rm [-rf] <path>` | Delete file/directory |
 | `rmdir <path>` | Delete directory (ext compatible) |
 | `mv <old> <new>` | Rename |
@@ -1281,12 +1286,14 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
 | `blkdiscard <drive> [lba count]` | Discard/TRIM a sector range (whole device when no range given); blkdiscard(8) analogue |
 | `blkzero <drive> <lba> <count>` | Zero a sector range (NVMe/virtio Write Zeroes, zero-filled-write fallback) |
 | `fstrim` | Discard all free blocks of the active mounted ext filesystem by walking the group bitmaps; fstrim(8) analogue |
+| `blkonline <drive>` | Bring a device taken offline by failfast back online (clears the error run) |
 | `smart <drive>` | SMART / NVMe health report: status, temperature, wear, power-on hours, lifetime R/W |
 | `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run format (layout only) |
 | `gpt <drive>` | Show GPT partition table |
 | `gpt.init <drive>` | Initialize empty GPT |
 | `gpt.add <drive> <partition spec>` | Add partition |
 | `gpt.del <drive> <partition>` | Delete partition |
+| `partprobe [drive]` | Re-read GPT and refresh `/dev/blkNpM` nodes at runtime (partprobe(8)) |
 | `mkswap <drive> <partition>` | Create swap area on partition |
 | `swapon <drive> <partition>` | Activate swap |
 | `swapon.raw <drive> <start> <size>` | Activate raw-range swap |

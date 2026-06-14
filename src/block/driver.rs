@@ -19,6 +19,9 @@ pub enum BlkError {
     /// Operation not implemented by this device (e.g. discard on a
     /// drive without TRIM)
     Unsupported,
+    /// Device has been taken offline after too many failures; requests
+    /// fail fast instead of waiting out hardware timeouts
+    Offline,
 }
 
 /// Geometry / identity reported by a device (filled from ATA IDENTIFY etc.)
@@ -84,27 +87,42 @@ impl HealthInfo {
 }
 
 /// The contract every storage backend must satisfy. Units are 512-byte sectors;
-/// 'lba' is 48-bit-capable ('u64') and 'count' is a full request length
-pub trait BlockDriver: Send {
-    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError>;
-    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError>;
-    fn flush(&mut self) -> Result<(), BlkError>;
-    fn info(&mut self) -> BlockDevInfo;
+/// 'lba' is 48-bit-capable ('u64') and 'count' is a full request length.
+///
+/// Methods take '&self': the block layer dispatches I/O concurrently without
+/// holding a device-wide lock, so a driver must be internally synchronized.
+/// Single-queue backends (ATA/AHCI/virtio) serialize on an internal lock;
+/// NVMe spreads requests across several independent queues for real
+/// parallelism. 'Sync' is therefore required as well as 'Send'
+pub trait BlockDriver: Send + Sync {
+    fn read_blocks(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError>;
+    fn write_blocks(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError>;
+    fn flush(&self) -> Result<(), BlkError>;
+    fn info(&self) -> BlockDevInfo;
     /// SMART-style health report; None when the backend has no health source
-    fn health(&mut self) -> Option<HealthInfo> {
+    fn health(&self) -> Option<HealthInfo> {
         None
     }
     /// Tell the device the sector range no longer holds useful data
     /// (TRIM / deallocate). Contents of the range become indeterminate;
     /// the device may unmap it. Advisory - failure must not corrupt data
-    fn discard(&mut self, _lba: u64, _count: u32) -> Result<(), BlkError> {
+    fn discard(&self, _lba: u64, _count: u32) -> Result<(), BlkError> {
         Err(BlkError::Unsupported)
     }
     /// Zero the sector range without transferring data (NVMe Write Zeroes,
     /// virtio WRITE_ZEROES). Unlike 'discard', the range must read back as
     /// zeros afterwards. The block layer falls back to writing zero-filled
     /// buffers when the backend reports 'Unsupported'
-    fn write_zeroes(&mut self, _lba: u64, _count: u32) -> Result<(), BlkError> {
+    fn write_zeroes(&self, _lba: u64, _count: u32) -> Result<(), BlkError> {
         Err(BlkError::Unsupported)
+    }
+    /// Write sectors with Force Unit Access: the data is on stable media
+    /// before the command completes, without flushing the whole device
+    /// cache. Used for journal commit / barrier writes. The default is a
+    /// correct (if heavier) fallback - a normal write followed by a full
+    /// cache flush - which backends with a real FUA bit override
+    fn write_blocks_fua(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
+        self.write_blocks(lba, count, buf)?;
+        self.flush()
     }
 }
