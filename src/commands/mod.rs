@@ -23,34 +23,6 @@ macro_rules! ext_dispatch {
     };
 }
 
-/// Embedded file-backed mmap test program. Built from
-/// src/lib/userspace/src/mmaptest.rs; staged into tmpfs and exec'd by the
-/// 'mmaptest' command so the feature can be exercised without a disk image
-static MMAPTEST_ELF: &[u8] =
-    include_bytes!("../lib/userspace/target/x86_64-miku-app/release/mmaptest");
-
-fn cmd_mmaptest() {
-    use crate::vfs::{with_vfs, OpenFlags, FileMode};
-    let path = "/mmaptest.elf";
-    let cwd = crate::shell::SESSION.lock().cwd;
-    let wrote = with_vfs(|v| {
-        let fl = OpenFlags(OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE);
-        match v.open(cwd, path, fl, FileMode::default_file()) {
-            Ok(fd) => {
-                let r = v.write(fd, MMAPTEST_ELF);
-                let _ = v.close(fd);
-                r.is_ok()
-            }
-            Err(_) => false,
-        }
-    });
-    if !wrote {
-        crate::print_error!("  mmaptest: could not stage ELF");
-        return;
-    }
-    cmd_exec(path, &[path]);
-}
-
 fn cmd_exec(path: &str, args: &[&str]) {
     match crate::exec_elf::exec(path, args) {
         Ok(pid) => {
@@ -460,7 +432,6 @@ pub fn execute(input: &str) {
         }
         "partprobe"  => disk_cmds::cmd_partprobe(rest),
         "nvmestress" => disk_cmds::cmd_nvmestress(),
-        "mmaptest"   => cmd_mmaptest(),
         "blkzero"    => {
             if a1.is_empty() { println!("Usage: blkzero <drive 0-7> <lba> <count>"); }
             else { disk_cmds::cmd_blkzero(rest); }

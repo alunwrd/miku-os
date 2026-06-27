@@ -30,6 +30,7 @@ pub fn cmd_nvidia(arg: &str) {
         "gsp-rm-load" | "gsprm-load"     => cmd_nvidia_gsprm_load(),
         "gsp-rm-boot" | "gsprm-boot"     => cmd_nvidia_gsprm_boot(),
         "gsp-rm-boot-full" | "gsprm-boot-full" | "gsp-boot" => cmd_nvidia_gsprm_boot_full(),
+        "gsp-bootargs" | "bootargs"      => cmd_nvidia_gsp_bootargs(),
         "nvdec-scrub" | "scrub" | "scrubber" => cmd_nvidia_nvdec_scrub(),
         "sec2-acr" | "sec2acr" | "acr-boot" => cmd_nvidia_sec2_acr(),
         "sec2-acr-v2" | "sec2acrv2" | "acr-boot-v2" => cmd_nvidia_sec2_acr_v2(),
@@ -72,6 +73,7 @@ fn cmd_nvidia_help_local() {
     crate::println!("    gsp-rm (gsprm)      - VRAM size + WPR2 layout + GSP ABI scaffolding");
     crate::println!("    gsp-rm-dryrun       - self-test radix3 + WPR-meta path with a synthetic ELF");
     crate::println!("    gsp-rm-load         - parse embedded GSP-RM ELF, stage .fwimage, build radix3 + meta (pins state)");
+    crate::println!("    gsp-bootargs        - build + verify libos/rmargs/CMDQ-MSGQ boot args in sysmem (no Falcon kick)");
     crate::println!("    gsp-rm-boot         - hand the pinned WPR-meta to the GSP booter and kick booter_load");
     crate::println!("    gsp-rm-boot-full    - drive the entire boot pipeline (scrub->load->ACR->WPR2->booter->handshake)");
     crate::println!("    sec2-acr            - first-contact SEC2 ACR boot: stage ahesasc in sysmem,");
@@ -1502,6 +1504,46 @@ fn cmd_nvidia_gsprm_boot() {
     }
 }
 
+// nvidia gsp-bootargs - build + verify the GSP-RM boot arguments in sysmem
+//
+// Allocates the libos init args, GSP_ARGUMENTS_CACHED and the CMDQ/MSGQ
+// shared region exactly as the boot pipeline does, reads every field back
+// out of sysmem, and checks it against the firmware ABI. No Falcon is
+// started, so this is safe to run on a live card to confirm the byte layout
+// is correct before attempting the full boot. All buffers are freed on exit
+fn cmd_nvidia_gsp_bootargs() {
+    use crate::nvidia::gtx1650::bootargs::GspBootArgs;
+
+    cprintln!(118, 185, 0, "  GSP-RM boot-args layout self-test");
+    match GspBootArgs::self_test() {
+        Ok(r) => {
+            crate::println!(
+                "    shared @ {:#x} ({} pages, {} PTEs)  cmdq@{:#x} msgq@{:#x} depth={}",
+                r.shared_phys, r.shared_pages, r.pte_count, r.cmdq_off, r.msgq_off, r.msg_count
+            );
+            crate::println!(
+                "    libos @ {:#x}  rmargs @ {:#x}  loginit @ {:#x}",
+                r.libos_phys, r.rmargs_phys, r.loginit_phys
+            );
+            let line = |name: &str, ok: bool| {
+                if ok { cprintln!(100, 220, 150, "    [ok]   {}", name); }
+                else  { crate::print_warn!("    [FAIL] {}", name); }
+            };
+            line("PTE array (identity-maps shared region)", r.ptes_ok);
+            line("CMDQ tx header (size/msgSize/msgCount/flags/rxHdrOff/entryOff)", r.cmdq_ok);
+            line("rmargs messageQueueInitArguments", r.rmargs_ok);
+            line("libos init args (4 named regions, kind/loc)", r.libos_ok);
+            line("log region embedded PTE arrays", r.log_ok);
+            if r.ok {
+                cprintln!(100, 220, 150, "  all boot-arg structures match the 570.144 ABI");
+            } else {
+                crate::print_warn!("  one or more structures FAILED - see serial log");
+            }
+        }
+        Err(e) => crate::print_warn!("  boot-args alloc failed: {:?}", e),
+    }
+}
+
 // nvidia gsp-rm-boot-full - drive the entire GSP-RM boot pipeline end to end
 //
 // Runs scrubber -> load -> SEC2 ACR -> WPR2 verify -> booter_load -> MSGQ
@@ -1540,9 +1582,9 @@ fn cmd_nvidia_gsprm_boot_full() {
                 "    GSP-RM responded: function={:#x} result={:#x}",
                 rep.gsp_msg_function, rep.gsp_msg_result),
             BootStage::Booter => {
-                crate::println!("    booter ran (mb1={:#010x}) but GSP-RM has not posted to our queue;",
+                crate::println!("    booter ran (mb1={:#010x}); libos boot args handed to GSP, FALCON_OS set,",
                     rep.booter_mb1);
-                crate::println!("    next step: pass the CMDQ/MSGQ phys to GSP-RM via the boot args (libos)");
+                crate::println!("    but GSP-RM has not posted to the MSGQ yet (see serial log for the poll result)");
             }
             _ => {}
         }

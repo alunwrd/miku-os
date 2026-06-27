@@ -912,6 +912,14 @@ pipeline stays gated behind a per-chip firmware bundle, which only TU116 ships.
 | **fb.rs** | Framebuffer: boot scanout detection, BAR index and offset |
 | **gtx1650/** | Full driver for GTX 1650 / 1660 (TU117 + TU116), the one chip with embedded firmware |
 
+#### GTX 1650 Driver (nvidia/gtx1650/)
+
+| Module | Description |
+|:--|:--|
+| **gsprm.rs** | GSP-RM staging: VRAM probe, WPR2 layout, radix3 page table, sysmem alloc |
+| **bootargs.rs** | GSP-RM boot arguments: libos init args, GSP_ARGUMENTS_CACHED, CMDQ/MSGQ shared region, FALCON_OS handoff |
+| **msgq.rs** | CMDQ/MSGQ ring buffer framing (host-producer + gsp-producer pages) |
+
 #### Chip architectures
 
 | Arch code | Family | Examples | Driver tier |
@@ -973,7 +981,7 @@ The GSP-RM image (gsp_t.bin) is NOT included - requires NVIDIA open-kernel-modul
 | 6 | done | DMA loopback (DMEM + IMEM) |
 | 7 | wip | SEC2 ACR first-contact (`sec2::attempt_acr` / `_v2`); full WPR2 lock pending |
 | 8 | wip | NVDEC scrubber first-contact (`nvdec::attempt_scrub`); full scrub-descriptor staging pending |
-| 9 | wip | GSP-RM staging (`gsprm`) + full boot orchestrator (`gsprm::boot`, `nvidia gsp-rm-boot-full`): scrub->load->ACR->WPR2->booter->MSGQ handshake. GSP-RM blob embedded. Two gates remain: ACR WPR2 lock (needs `RM_FLCN_ACR_DESC` in SEC2 DMEM) and GSP boot-args queue handoff |
+| 9 | wip | GSP-RM staging (`gsprm`) + full boot orchestrator (`gsprm::boot`, `nvidia gsp-rm-boot-full`): scrub->load->ACR->WPR2->booter->MSGQ handshake. GSP-RM blob embedded. Boot args wired (`bootargs::GspBootArgs`): libos table, CMDQ/MSGQ shared region, MAILBOX0/1 handoff, FALCON_OS set to app_version. One gate remains: ACR WPR2 lock (needs `RM_FLCN_ACR_DESC` in SEC2 DMEM) |
 | 10 | - | FECS/GPCCS contexts, PGRAPH usable |
 | - | done | PTHERM on-die temperature read-out (`nvidia temp`) |
 
@@ -1253,6 +1261,7 @@ Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/M
 | `nvidia gsp-rm-dryrun` | Build the radix3 page table and verify chain integrity |
 | `nvidia gsp-rm-load` | Stage signed GSP-RM blob into WPR2 (MissingFirmware if absent) |
 | `nvidia gsp-rm-boot` | Kick the GSP booter HS image and watch the result |
+| `nvidia gsp-bootargs` / `bootargs` | Build + verify libos/rmargs/CMDQ-MSGQ boot args in sysmem (no Falcon kick) |
 | `nvidia sec2-acr` / `sec2-acr-v2` | SEC2 ACR first-contact boot (ahesasc upload + bl kick) |
 | `nvidia wpr-state` | Dump current WPR / WPR2 register state |
 | `nvidia msgq` | CMDQ/MSGQ ring self-test (host-side framing only) |

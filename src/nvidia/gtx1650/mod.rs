@@ -28,6 +28,7 @@ pub mod fbif;
 pub mod dma_buf;
 pub mod gsp;
 pub mod gsprm;
+pub mod bootargs;
 pub mod msgq;
 pub mod rpc;
 pub mod sec2;

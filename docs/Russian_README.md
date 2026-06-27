@@ -1039,6 +1039,7 @@ bits 12.. = номер swap слота
 | `nvidia gsp-rm-dryrun` | Сборка radix3 таблицы и проверка целостности цепочки |
 | `nvidia gsp-rm-load` | Загрузка подписанного GSP-RM blob в WPR2 (MissingFirmware если отсутствует) |
 | `nvidia gsp-rm-boot` | Запуск GSP booter HS-образа и наблюдение результата |
+| `nvidia gsp-bootargs` / `bootargs` | Сборка + проверка libos/rmargs/CMDQ-MSGQ boot-args в sysmem (без запуска Falcon) |
 | `nvidia sec2-acr` / `sec2-acr-v2` | SEC2 ACR first-contact (загрузка ahesasc + запуск bl) |
 | `nvidia wpr-state` | Дамп состояния регистров WPR / WPR2 |
 | `nvidia msgq` | Self-test колец CMDQ/MSGQ (только host-side framing) |
@@ -1162,6 +1163,14 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | **fb.rs** | Фреймбуфер: определение boot scanout, BAR-индекс и смещение |
 | **gtx1650/** | Полный драйвер GTX 1650 / 1660 (TU117 + TU116), единственный чип со встроенным firmware |
 
+#### Модули GTX 1650 (nvidia/gtx1650/)
+
+| Модуль | Описание |
+|:--|:--|
+| **gsprm.rs** | Staging GSP-RM: VRAM probe, WPR2 layout, radix3 page table, sysmem alloc |
+| **bootargs.rs** | Boot-args GSP-RM: libos init args, GSP_ARGUMENTS_CACHED, shared CMDQ/MSGQ, передача FALCON_OS |
+| **msgq.rs** | Framing кольцевых буферов CMDQ/MSGQ (host-producer + gsp-producer страницы) |
+
 #### Архитектуры чипов
 
 | Код arch | Семейство | Примеры | Уровень драйвера |
@@ -1223,7 +1232,7 @@ MSI/VBIOS и живучесть Falcon, затем регистрируется 
 | 6 | готово | DMA loopback (DMEM + IMEM) |
 | 7 | - | Загрузка ACR через SEC2 (установка WPR) |
 | 8 | wip | Первый контакт скруббера NVDEC (`nvdec::attempt_scrub`); полная подготовка дескриптора скраба ожидается |
-| 9 | wip | Подготовка GSP-RM (`gsprm`) + полный orchestrator загрузки (`gsprm::boot`, `nvidia gsp-rm-boot-full`): scrub->load->ACR->WPR2->booter->MSGQ handshake. Blob GSP-RM встроен. Осталось 2 гейта: lock WPR2 в ACR (нужен `RM_FLCN_ACR_DESC` в SEC2 DMEM) и передача адреса очереди через GSP boot-args |
+| 9 | wip | Подготовка GSP-RM (`gsprm`) + полный orchestrator загрузки (`gsprm::boot`, `nvidia gsp-rm-boot-full`): scrub->load->ACR->WPR2->booter->MSGQ handshake. Blob GSP-RM встроен. Boot-args подключены (`bootargs::GspBootArgs`): libos table, shared CMDQ/MSGQ, handoff MAILBOX0/1, FALCON_OS = app_version. Остался один гейт: lock WPR2 в ACR (нужен `RM_FLCN_ACR_DESC` в SEC2 DMEM) |
 | 10 | - | Контексты FECS/GPCCS, доступ к PGRAPH |
 
 </details>

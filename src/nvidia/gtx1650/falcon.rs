@@ -49,6 +49,11 @@ pub const FALCON_IRQDEST:      u32 = 0x01c;
 pub const FALCON_MAILBOX0:     u32 = 0x040;
 pub const FALCON_MAILBOX1:     u32 = 0x044;
 
+/// NV_PFALCON_FALCON_OS. nouveau's r535_gsp_booter_load writes the GSP
+/// bootloader app version here (PGSP+0x080) right after the SEC2 booter
+/// hands control to the GSP RISC-V core; GSP-RM reads it during init
+pub const FALCON_OS:           u32 = 0x080;
+
 pub const FALCON_RM:           u32 = 0x084;
 
 /// Falcon engine reset register. Source: open-gpu-kernel-modules

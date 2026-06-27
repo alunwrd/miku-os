@@ -979,6 +979,7 @@ The immutable flag prevents unlink / write / rename.
 | `nvidia gsp-rm-dryrun` | Build the radix3 page table and verify chain integrity |
 | `nvidia gsp-rm-load` | Stage signed GSP-RM blob into WPR2 (fails with MissingFirmware if absent) |
 | `nvidia gsp-rm-boot` | Kick the GSP booter HS image and watch the result |
+| `nvidia gsp-bootargs` / `bootargs` | Build + verify libos/rmargs/CMDQ-MSGQ boot args in sysmem (no Falcon kick) |
 | `nvidia sec2-acr` / `sec2-acr-v2` | SEC2 ACR first-contact boot (ahesasc upload + bl kick) |
 | `nvidia wpr-state` | Dump current WPR / WPR2 register state |
 | `nvidia msgq` | CMDQ/MSGQ ring self-test (host-side framing only) |
@@ -1193,6 +1194,7 @@ per-chip firmware bundle, which only TU116 ships today.
 | **dma_buf.rs** | `DmaBuffer`: physically contiguous buffer from PMM, write barrier |
 | **gsp.rs** | GSP first-contact boot (`attempt_boot`) |
 | **gsprm.rs** | GSP-RM staging: VRAM probe, WPR2 layout, radix3 page table, sysmem alloc |
+| **bootargs.rs** | GSP-RM boot arguments: libos init args, GSP_ARGUMENTS_CACHED, CMDQ/MSGQ shared region, FALCON_OS handoff |
 | **msgq.rs** | CMDQ/MSGQ ring buffer framing (host-producer + gsp-producer pages) |
 | **rpc.rs** | GSP-RM RPC header (r535: version 0x03000000) + function dispatch |
 | **sec2.rs** | SEC2 ACR first-contact boot (`attempt_acr`, `attempt_acr_v2`) |
@@ -1268,7 +1270,7 @@ The GSP-RM image (`gsp_t.bin`) is **not** included - it requires nvidia-open-ker
 | 6 | done | DMA loopback (DMEM + IMEM) |
 | 7 | wip | SEC2 ACR first-contact (`sec2::attempt_acr` / `_v2`); full WPR2 lock pending |
 | 8 | wip | NVDEC scrubber first-contact (`nvdec::attempt_scrub`); full scrub-descriptor staging pending |
-| 9 | wip | GSP-RM staging (`gsprm`) + full boot orchestrator (`gsprm::boot`, `nvidia gsp-rm-boot-full`): scrub->load->ACR->WPR2->booter->MSGQ handshake. GSP-RM blob embedded. Two gates remain: ACR WPR2 lock (needs `RM_FLCN_ACR_DESC` in SEC2 DMEM) and GSP boot-args queue handoff |
+| 9 | wip | GSP-RM staging (`gsprm`) + full boot orchestrator (`gsprm::boot`, `nvidia gsp-rm-boot-full`): scrub->load->ACR->WPR2->booter->MSGQ handshake. GSP-RM blob embedded. Boot args wired (`bootargs::GspBootArgs`): libos table, CMDQ/MSGQ shared region, MAILBOX0/1 handoff, FALCON_OS set to app_version. One gate remains: ACR WPR2 lock (needs `RM_FLCN_ACR_DESC` in SEC2 DMEM) |
 | 10 | - | FECS/GPCCS contexts, PGRAPH usable |
 | - | done | PTHERM on-die temperature read-out (`nvidia temp`) |
 

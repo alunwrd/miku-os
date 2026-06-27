@@ -960,6 +960,7 @@ pub fn load(bar0: &MmioRegion, blob: &[u8]) -> Result<LoadReport, LoadError> {
         version,
         bootloader: bl_buf,
         signature: sig_buf,
+        app_version: blf.app_version,
     });
 
     Ok(report)
@@ -985,6 +986,9 @@ pub struct GspRmState {
     pub bootloader: DmaBuffer,
     /// GSP-RM production signature staged in sysmem
     pub signature: DmaBuffer,
+    /// RM_RISCV_UCODE_DESC.appVersion from the bootloader. Written to the GSP
+    /// FALCON_OS register after the booter hands off to the RISC-V core
+    pub app_version: u32,
 }
 
 impl GspRmState {
@@ -1041,15 +1045,20 @@ pub fn boot_booter(bar0: &MmioRegion) -> Result<super::gsp::BootStatus, BooterEr
 //   4) verify WPR2 lock   read PFB WPR2 LO/HI; GATE: no lock -> stop
 //   5) booter_load        hand WPR-meta to GSP; booter DMAs the radix3
 //                         image into WPR2 and starts GSP-RM
-//   6) GSP handshake      allocate the CMDQ/MSGQ pair and poll MSGQ for the
-//                         first GSP-RM message (the init/ready event)
+//   5) boot args + booter build the libos init args + GSP_ARGUMENTS_CACHED +
+//                         CMDQ/MSGQ shared region (bootargs.rs), hand the
+//                         libos address to GSP MAILBOX0/1, run the SEC2 booter
+//                         (DMAs the radix3 image into WPR2 and starts GSP-RM),
+//                         then set GSP FALCON_OS to the bootloader app version
+//   6) GSP handshake      poll the GSP-owned MSGQ in the shared region for
+//                         GSP-RM's first message (the GSP_INIT_DONE event)
 //
-// The two stages the host cannot yet fully satisfy are called out inline:
-//     stage 4 needs the RM_FLCN_ACR_DESC region descriptor staged in SEC2
-//     DMEM so AHESASC knows which region to lock (the WPR2-lock gate);
-//     stage 6 needs GSP-RM to know our queue address, which travels in the
-//     GSP boot arguments (libos / GSP_ARGUMENTS_CACHED) placed in the
-//     non-WPR heap. Until that is wired the poll will time out cleanly.
+// The boot arguments are now wired (bootargs::GspBootArgs), so GSP-RM knows
+// where our queue lives and can post to it. The remaining hard gate is
+// upstream at stage 4: AHESASC needs the RM_FLCN_ACR_DESC region descriptor
+// staged in SEC2 DMEM to lock WPR2. If WPR2 never locks, the booter has no
+// protected region to DMA into and the pipeline stops there with a precise
+// diagnostic before any GSP register is touched.
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BootStage {
@@ -1103,6 +1112,16 @@ static RPC: Mutex<Option<super::rpc::RpcDriver>> = Mutex::new(None);
 /// Run a closure with the pinned RPC driver, if GSP-RM handshake set one up
 pub fn with_rpc<R>(f: impl FnOnce(&super::rpc::RpcDriver) -> R) -> Option<R> {
     RPC.lock().as_ref().map(f)
+}
+
+/// Pinned GSP-RM boot arguments (libos table + CMDQ/MSGQ shared region + log
+/// buffers). GSP-RM reads these from sysmem for the life of the session, so
+/// they must stay allocated after 'boot' returns
+static BOOT_ARGS: Mutex<Option<super::bootargs::GspBootArgs>> = Mutex::new(None);
+
+/// Run a closure with the pinned GSP boot args, if a boot has set them up
+pub fn with_boot_args<R>(f: impl FnOnce(&super::bootargs::GspBootArgs) -> R) -> Option<R> {
+    BOOT_ARGS.lock().as_ref().map(f)
 }
 
 /// Read PFB and decode the WPR2 lock window. Returns (locked, lo, hi)
@@ -1274,13 +1293,47 @@ pub fn boot(bar0: &MmioRegion, gpu: &crate::nvidia::pci::GpuDevice) -> FullBootR
         return report;
     }
 
-    // Stage 5: booter_load on SEC2. Per ogkm kgspExecuteBooterLoad_TU102 the
-    // GSP booter runs on SEC2, DMAs the radix3 GSP-RM image into the now-locked
-    // WPR2, and starts GSP-RM. WPR-meta phys is handed in SEC2 MAILBOX0/1.
-    // NOTE: nouveau also resets the GSP into RISC-V mode and programs the libos
-    // boot args before this; those stages are not wired yet, so the booter may
-    // still halt early - but WPR2 is now correctly locked.
-    serial_println!("[gsprm] boot stage 5/6: booter_load on SEC2 (DMAs GSP-RM into WPR2)");
+    // Stage 5: boot-arg handoff + booter_load on SEC2. Per nouveau
+    // r535_gsp_init the host first builds the libos boot args (CMDQ/MSGQ
+    // shared region + GSP_ARGUMENTS_CACHED + the three log regions), writes
+    // the libos table address into the GSP falcon MAILBOX0/1, then runs the
+    // SEC2 booter (kgspExecuteBooterLoad_TU102): it DMAs the radix3 GSP-RM
+    // image into the now-locked WPR2 and starts the GSP RISC-V core. The
+    // WPR-meta phys is handed in SEC2 MAILBOX0/1. Finally the GSP FALCON_OS
+    // register gets the bootloader app version so GSP-RM can complete init.
+    serial_println!("[gsprm] boot stage 5/6: build boot args + booter_load on SEC2");
+
+    // Build and pin the GSP-RM boot arguments. GSP-RM reads these from sysmem
+    // once it is running, so they must outlive the boot; stash them statically.
+    let (libos_phys, shared_phys) = match super::bootargs::GspBootArgs::build() {
+        Ok(ba) => {
+            let lp = ba.libos_phys();
+            let sp = ba.shared_phys();
+            *BOOT_ARGS.lock() = Some(ba);
+            serial_println!(
+                "[gsprm]   boot args built: libos @ {:#x} shared @ {:#x}", lp, sp
+            );
+            (lp, sp)
+        }
+        Err(e) => {
+            serial_println!("[gsprm]   boot args alloc failed: {:?} - STOP", e);
+            return report;
+        }
+    };
+
+    // Hand the libos table address to the GSP falcon BEFORE the booter runs
+    // (r535_gsp_oneinit: PGSP MAILBOX0 = lo32, MAILBOX1 = hi32 of libos.addr).
+    {
+        use super::falcon::{Engine, FALCON_MAILBOX0, FALCON_MAILBOX1, PGSP_BASE};
+        let gsp = Engine::new(bar0, PGSP_BASE, "gsp");
+        gsp.write(FALCON_MAILBOX0, libos_phys as u32);
+        gsp.write(FALCON_MAILBOX1, (libos_phys >> 32) as u32);
+        serial_println!(
+            "[gsprm]   GSP MAILBOX0/1 <- libos @ {:#x} (MB0={:#010x} MB1={:#010x})",
+            libos_phys, libos_phys as u32, (libos_phys >> 32) as u32
+        );
+    }
+
     let meta_phys = with_state(|s| s.meta_phys()).unwrap_or(0);
     match super::sec2::attempt_booter_load(bar0, meta_phys) {
         Ok(st) => {
@@ -1298,17 +1351,51 @@ pub fn boot(bar0: &MmioRegion, gpu: &crate::nvidia::pci::GpuDevice) -> FullBootR
         }
     }
 
-    // Stage 6: post-boot handshake - poll MSGQ for the GSP-RM init message
-    serial_println!("[gsprm] boot stage 6/6: GSP-RM MSGQ handshake");
-    if let Some((function, result)) = gsp_handshake(bar0) {
-        report.reached = BootStage::GspHandshake;
-        report.gsp_msg_function = function;
-        report.gsp_msg_result = result;
-        serial_println!("[gsprm] FULL BOOT: GSP-RM responded (function={:#x} result={:#x})", function, result);
-    } else {
+    // After the booter hands off, set the GSP FALCON_OS register to the
+    // bootloader app version (r535_gsp_booter_load: PGSP+0x080 = app_version).
+    // GSP-RM reads this during its own init handshake.
+    {
+        use super::falcon::{Engine, FALCON_CPUCTL, FALCON_OS, PGSP_BASE};
+        let app_version = with_state(|s| s.app_version).unwrap_or(0);
+        let gsp = Engine::new(bar0, PGSP_BASE, "gsp");
+        gsp.write(FALCON_OS, app_version);
         serial_println!(
-            "[gsprm]   no GSP message yet - booter ran but GSP-RM has not posted to our queue"
+            "[gsprm]   GSP FALCON_OS <- app_version={:#x}; GSP cpuctl={:#010x}",
+            app_version, gsp.read(FALCON_CPUCTL)
         );
+    }
+
+    // Stage 6: post-boot handshake. Poll the GSP-owned MSGQ in the shared
+    // region (the one whose address we passed through the boot args) for
+    // GSP-RM's first posted message - the GSP_INIT_DONE event.
+    serial_println!("[gsprm] boot stage 6/6: GSP-RM MSGQ handshake (shared @ {:#x})", shared_phys);
+    let msg = BOOT_ARGS.lock().as_ref().and_then(|ba| {
+        ba.poll_first_message(
+            || bar0.read32(PTIMER_TIME_0),
+            GSP_HANDSHAKE_TIMEOUT_NS,
+        )
+    });
+    match msg {
+        Some((function, signature)) => {
+            report.reached = BootStage::GspHandshake;
+            report.gsp_msg_function = function;
+            report.gsp_msg_result = signature;
+            let init_done = function == super::bootargs::NV_VGPU_MSG_EVENT_GSP_INIT_DONE;
+            serial_println!(
+                "[gsprm] FULL BOOT: GSP-RM posted a message (function={:#x} signature={:#010x}{})",
+                function, signature,
+                if init_done { " = GSP_INIT_DONE" } else { "" }
+            );
+            if signature != super::bootargs::GSP_RPC_SIGNATURE {
+                serial_println!(
+                    "[gsprm]   note: rpc signature {:#010x} != 'VGPU' - element may not be a real RPC yet",
+                    signature
+                );
+            }
+        }
+        None => serial_println!(
+            "[gsprm]   no GSP message within budget - booter ran but GSP-RM has not posted to the MSGQ"
+        ),
     }
 
     report
