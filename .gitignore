@@ -13,3 +13,11 @@ logs/
 *.bash
 all_code.txt
 WIKI.md
+kernel/drivers/gpu/nvidia/firmware/*/
+src/nvidia/firmware/
+src/nvidia/gtx1650/tu116/
+*.bin
+!src/lib/ld_miku/ld-miku.bin
+firmware.img
+iso_root/
+/refsrc/

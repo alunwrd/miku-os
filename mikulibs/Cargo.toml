@@ -1,0 +1,51 @@
+[package]
+name    = "mikulibs"
+version = "0.1.0"
+edition = "2021"
+build   = "build.rs"
+
+[workspace]
+
+[profile.release]
+opt-level = 1
+lto = false
+
+[[bin]]
+name = "core_miku"
+path = "../src/lib/mikulibs/core_miku.rs"
+
+[[bin]]
+name = "sys_miku"
+path = "../src/lib/mikulibs/sys_miku.rs"
+
+[[bin]]
+name = "text_miku"
+path = "../src/lib/mikulibs/text_miku.rs"
+
+[[bin]]
+name = "ds_miku"
+path = "../src/lib/mikulibs/ds_miku.rs"
+
+[[bin]]
+name = "algo_miku"
+path = "../src/lib/mikulibs/algo_miku.rs"
+
+[[bin]]
+name = "codec_miku"
+path = "../src/lib/mikulibs/codec_miku.rs"
+
+[[bin]]
+name = "fs_miku"
+path = "../src/lib/mikulibs/fs_miku.rs"
+
+[[bin]]
+name = "net_miku"
+path = "../src/lib/mikulibs/net_miku.rs"
+
+[[bin]]
+name = "parse_miku"
+path = "../src/lib/mikulibs/parse_miku.rs"
+
+[[bin]]
+name = "libc_miku"
+path = "../src/lib/mikulibs/libc_miku.rs"

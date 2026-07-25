@@ -78,6 +78,11 @@ fn build_kernel(root: &Path, low_ram: bool) {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(root)
         .arg("build")
+        // The ISO used to ship a debug build. Unoptimized kernel code has far
+        // fatter stack frames (a single 0.5 MiB VFS temporary was enough to
+        // run off the 512 KiB boot stack), and every release image was slower
+        // and ~6x larger than it needed to be
+        .arg("--release")
         .arg("-p").arg("miku-os-release")
         .arg("--target").arg("x86_64-unknown-none")
         .arg("-Z").arg("build-std=core,compiler_builtins,alloc")
@@ -101,10 +106,69 @@ fn build_kernel(root: &Path, low_ram: bool) {
     println!("[ok] Kernel built");
 }
 
+
+/// Userspace programs (src/lib/userspace). These were never built by the
+/// builder, so ring-3 binaries only ever existed if someone ran build.sh by
+/// hand - which is why the syscall ABI had no real users. Binaries land in
+/// /bin on the root filesystem.
+fn build_userspace(root: &Path, low_ram: bool) -> Vec<(String, PathBuf)> {
+    let us_dir = root.join("src/lib/userspace");
+    if !us_dir.exists() {
+        println!("[!] src/lib/userspace not found - skipping userspace programs");
+        return Vec::new();
+    }
+
+    println!("\nBuilding userspace programs  (src/lib/userspace/)...");
+
+    let rustflags = [
+        "-C relocation-model=pic",
+        "-C link-arg=-pie",
+        "-C link-arg=-z",  "-C link-arg=noexecstack",
+        "-C no-redzone=y",
+    ].join(" ");
+
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&us_dir)
+        .env("RUSTFLAGS", &rustflags)
+        .arg("+nightly")
+        .arg("build")
+        .arg("--release")
+        .arg("--target").arg("x86_64-miku-app.json")
+        .arg("-Z").arg("json-target-spec")
+        .arg("-Z").arg("build-std=core")
+        .arg("-Z").arg("build-std-features=compiler-builtins-mem");
+    for b in USERSPACE_BINS {
+        cmd.arg("--bin").arg(b);
+    }
+    if low_ram { cmd.arg("--jobs").arg("1"); }
+
+    if !cmd.status().expect("cargo build userspace failed").success() {
+        println!("[!] userspace build failed - continuing without ring-3 programs");
+        return Vec::new();
+    }
+
+    let bin_dir = us_dir.join("target/x86_64-miku-app/release");
+    let mut out = Vec::new();
+    for b in USERSPACE_BINS {
+        let p = bin_dir.join(b);
+        if p.exists() {
+            println!("[ok] {} ({} KB)", b, fs::metadata(&p).unwrap().len() / 1024);
+            out.push((b.to_string(), p));
+        } else {
+            println!("[!] {} not produced", b);
+        }
+    }
+    out
+}
+
+/// Ring-3 programs staged into /bin. msh is the userspace shell; the rest are
+/// ABI smoke tests that are handy to have on the image.
+const USERSPACE_BINS: &[&str] = &["msh", "hello"];
+
 fn build_ldmiku(root: &Path, low_ram: bool) {
     let ldmiku_dir = root.join("ld-miku");
     if !ldmiku_dir.exists() {
-        panic!("[!] ld-miku/ not found at {} — run builder from miku-os/builder/", ldmiku_dir.display());
+        panic!("[!] ld-miku/ not found at {} - run builder from miku-os/builder/", ldmiku_dir.display());
     }
 
     println!("\nBuilding ld-miku.so  (src/lib/ld_miku/)...");
@@ -150,13 +214,27 @@ fn build_ldmiku(root: &Path, low_ram: bool) {
         fs::metadata(&bin_dst).unwrap().len() / 1024);
 }
 
-fn build_libmiku(root: &Path, low_ram: bool) {
-    let libmiku_dir = root.join("libmiku");
-    if !libmiku_dir.exists() {
-        panic!("[!] libmiku/ not found at {} - run builder from miku-os/builder/", libmiku_dir.display());
+/// Library names come from the shared manifest src/lib/mikulibs/libs.list
+/// (also consumed by mikulibs/build.rs, userspace/build.rs and the kernel
+/// root build.rs, which generates the ldso preload table from it).
+fn miku_libs(root: &Path) -> Vec<String> {
+    let list = root.join("src/lib/mikulibs/libs.list");
+    let src = fs::read_to_string(&list)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", list.display(), e));
+    src.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.split(':').next().unwrap().trim().to_string())
+        .collect()
+}
+
+fn build_mikulibs(root: &Path, low_ram: bool) {
+    let mikulibs_dir = root.join("mikulibs");
+    if !mikulibs_dir.exists() {
+        panic!("[!] mikulibs/ not found at {} - run builder from miku-os/builder/", mikulibs_dir.display());
     }
 
-    println!("\nBuilding libmiku.so  (src/lib/libmiku/)...");
+    println!("\nBuilding miku libraries  (src/lib/mikulibs/)...");
 
     let rustflags = [
         "-C relocation-model=pic",
@@ -164,13 +242,12 @@ fn build_libmiku(root: &Path, low_ram: bool) {
         "-C link-arg=-z",  "-C link-arg=noexecstack",
         "-C link-arg=-z",  "-C link-arg=now",
         "-C link-arg=--no-dynamic-linker",
-        "-C link-arg=--export-dynamic",
         "-C link-arg=--hash-style=both",
         "-C no-redzone=y",
     ].join(" ");
 
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(&libmiku_dir)
+    cmd.current_dir(&mikulibs_dir)
         .env("RUSTFLAGS", &rustflags)
         .arg("+nightly")
         .arg("build")
@@ -182,20 +259,25 @@ fn build_libmiku(root: &Path, low_ram: bool) {
 
     if low_ram { cmd.arg("--jobs").arg("1"); }
 
-    if !cmd.status().expect("cargo build libmiku failed").success() {
-        panic!("libmiku compilation failed");
+    if !cmd.status().expect("cargo build mikulibs failed").success() {
+        panic!("mikulibs compilation failed");
     }
-    println!("[ok] libmiku.so built");
+    println!("[ok] miku libraries built");
 
-    let bin_src = libmiku_dir.join("target/x86_64-miku-lib/release/libmiku");
-    let bin_dst = root.join("src/lib/libmiku/libmiku.so");
-    if !bin_src.exists() {
-        panic!("libmiku binary not found at {}", bin_src.display());
+    let libs_dir = root.join("src/lib/mikulibs/libs");
+    fs::create_dir_all(&libs_dir)
+        .unwrap_or_else(|e| panic!("Cannot create {}: {}", libs_dir.display(), e));
+    for lib in miku_libs(root) {
+        let bin_src = mikulibs_dir.join(format!("target/x86_64-miku-lib/release/{}", lib));
+        let bin_dst = libs_dir.join(format!("{}.so", lib));
+        if !bin_src.exists() {
+            panic!("{} binary not found at {}", lib, bin_src.display());
+        }
+        fs::copy(&bin_src, &bin_dst)
+            .unwrap_or_else(|e| panic!("Cannot copy {}.so: {}", lib, e));
+        println!("[ok] {}.so → src/lib/mikulibs/libs/{}.so ({} KB)",
+            lib, lib, fs::metadata(&bin_dst).unwrap().len() / 1024);
     }
-    fs::copy(&bin_src, &bin_dst)
-        .unwrap_or_else(|e| panic!("Cannot copy libmiku.so: {}", e));
-    println!("[ok] libmiku.so → src/lib/libmiku/libmiku.so ({} KB)",
-        fs::metadata(&bin_dst).unwrap().len() / 1024);
 }
 
 fn create_iso(root: &Path) {
@@ -206,10 +288,14 @@ fn create_iso(root: &Path) {
     if iso_root.exists() { fs::remove_dir_all(&iso_root).unwrap(); }
     fs::create_dir_all(iso_root.join("boot/grub")).unwrap();
 
-    let kernel_src = root.join("target/x86_64-unknown-none/debug/miku-os-release");
+    let kernel_src = root.join("target/x86_64-unknown-none/release/miku-os-release");
     let kernel_dst = iso_root.join("boot/kernel.elf");
     fs::copy(&kernel_src, &kernel_dst)
         .unwrap_or_else(|e| panic!("Cannot copy kernel: {}", e));
+
+    // Stage /lib/firmware into the ISO as a GRUB module so the boot medium
+    // carries firmware on its own (no second disk needed on real hardware).
+    let have_fw = build_firmware_module(root, &iso_root);
 
     let grub_cfg_src = root.join("grub.cfg");
     let grub_cfg_dst = iso_root.join("boot/grub/grub.cfg");
@@ -218,9 +304,17 @@ fn create_iso(root: &Path) {
     let mut new_cfg = String::from("set timeout=-1\n");
     for line in cfg.lines() {
         let t = line.trim();
-        if !t.starts_with("set timeout=") && !t.starts_with("timeout=") {
-            new_cfg.push_str(line);
-            new_cfg.push('\n');
+        if t.starts_with("set timeout=") || t.starts_with("timeout=") {
+            continue;
+        }
+        new_cfg.push_str(line);
+        new_cfg.push('\n');
+        // Load the firmware image right after the kernel so GRUB hands it to
+        // the kernel as a multiboot2 module tagged "firmware".
+        if have_fw && t.starts_with("multiboot2") {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            new_cfg.push_str(indent);
+            new_cfg.push_str("module2 /boot/firmware.img firmware\n");
         }
     }
     fs::write(&grub_cfg_dst, new_cfg)
@@ -282,35 +376,148 @@ fn dir_size(dir: &Path) -> u64 {
     total
 }
 
-/// Stage src/nvidia/gtx1650/tu116/ into a Linux /lib/firmware-style tree
-/// Returns the staging root holding lib/firmware/nvidia/tu116/...
-fn stage_firmware_tree(root: &Path) -> Option<PathBuf> {
-    let src_tu116 = root.join("src/nvidia/gtx1650/tu116");
-    if !src_tu116.exists() {
-        println!("[!] {} not found - skipping firmware staging", src_tu116.display());
-        return None;
-    }
+/// NVIDIA firmware home: kernel/drivers/gpu/nvidia/firmware/<card>/, one folder per card.
+/// Each folder is staged to /lib/firmware/<chip path> (the path the kernel's
+/// fwload requests, same layout as linux-firmware). A folder not in this
+/// table is staged verbatim to /lib/firmware/nvidia/<folder name>.
+const NVIDIA_FW_CARDS: &[(&str, &str)] = &[
+    ("gtx1650",   "nvidia/tu116"),   // GTX 1650 / 1660 (TU116/TU117)
+    ("rtx5060ti", "nvidia/gb206"),   // RTX 5060 Ti / 5060 (GB206)
+];
+
+/// Stage a Linux /lib/firmware-style tree from
+/// kernel/drivers/gpu/nvidia/firmware/<card>/ folders. Returns the staging
+/// root holding lib/firmware/...
+/// Stage everything that belongs on the root image: NVIDIA firmware (when it
+/// is present) and the ring-3 programs.
+///
+/// Returns the staging root and whether any firmware was found. Missing
+/// firmware is the normal case for a fresh clone - the blobs are NVIDIA's
+/// proprietary microcode and are not kept in git - so it is reported as
+/// information, never as a warning, and never fails the build.
+fn stage_root_tree(root: &Path) -> Option<(PathBuf, bool)> {
+    let fw_home = root.join("kernel/drivers/gpu/nvidia/firmware");
     let staging = root.join("target/fw_root");
     if staging.exists() {
         fs::remove_dir_all(&staging).ok();
     }
-    let dst = staging.join("lib/firmware/nvidia/tu116");
-    copy_dir_recursive(&src_tu116, &dst);
-    Some(staging)
+    let mut staged_any = false;
+
+    let mut cards: Vec<_> = match fs::read_dir(&fw_home) {
+        Ok(rd) => rd.flatten().filter(|e| e.path().is_dir()).collect(),
+        Err(_) => Vec::new(),
+    };
+    cards.sort_by_key(|e| e.file_name());
+    let mut have_firmware = false;
+    for card in cards {
+        let name = card.file_name().into_string().unwrap();
+        let dest_rel = NVIDIA_FW_CARDS.iter()
+            .find(|(folder, _)| *folder == name)
+            .map(|(_, chip)| (*chip).to_string())
+            .unwrap_or_else(|| format!("nvidia/{}", name));
+        let kb = dir_size(&card.path()) / 1024;
+        if kb == 0 { continue; }
+        copy_dir_recursive(&card.path(), &staging.join("lib/firmware").join(&dest_rel));
+        println!("[ok] firmware {} -> /lib/firmware/{} ({} KB)", name, dest_rel, kb);
+        staged_any = true;
+        have_firmware = true;
+    }
+
+    // /bin: ring-3 programs. Staged into the same tree so both the fresh
+    // mke2fs path and the debugfs refresh path pick them up
+    let apps = root.join("src/lib/userspace/target/x86_64-miku-app/release");
+    if apps.is_dir() {
+        for b in USERSPACE_BINS {
+            let src = apps.join(b);
+            if !src.exists() { continue; }
+            let dst_dir = staging.join("bin");
+            fs::create_dir_all(&dst_dir).ok();
+            if fs::copy(&src, dst_dir.join(b)).is_ok() {
+                println!("[ok] {} -> /bin/{}", b, b);
+                staged_any = true;
+            }
+        }
+    }
+
+    if !have_firmware {
+        // Both the ISO module and the root disk stage from here, so without
+        // this the same notice would print twice per build
+        static NOTICE: std::sync::Once = std::sync::Once::new();
+        NOTICE.call_once(|| {
+            println!("[i] no NVIDIA firmware in {} - image will boot without GPU firmware",
+                fw_home.display());
+            println!("[i]   see {}/README.md to add it", fw_home.display());
+        });
+    }
+
+    if staged_any { Some((staging, have_firmware)) } else { None }
+}
+
+/// Build a compact ext2 image holding /lib/firmware and drop it into the ISO
+/// tree as a GRUB multiboot2 module. The kernel exposes the module's RAM span
+/// as a block device and mounts /lib/firmware from it (see fwload::init), so a
+/// single ISO/USB carries kernel + firmware with no second disk and no
+/// QEMU-specific drive layout. Returns true if the module image was created.
+fn build_firmware_module(root: &Path, iso_root: &Path) -> bool {
+    let (staging, have_firmware) = match stage_root_tree(root) {
+        Some(v) => v,
+        None => return false,
+    };
+    // No blobs on this machine: the ISO simply ships without the module and
+    // the kernel reports "firmware unavailable". Nothing to warn about
+    if !have_firmware {
+        return false;
+    }
+    if !check_mke2fs() {
+        println!("[!] mke2fs missing - ISO will NOT carry firmware (GPU firmware unavailable)");
+        return false;
+    }
+    let staged_bytes = dir_size(&staging);
+    // staged payload + 30% slack + 8 MiB for ext metadata/inodes, >= 40 MiB
+    let size_mb = (((staged_bytes + staged_bytes / 3) / (1024 * 1024)) + 8).max(40) as u32;
+
+    let img = iso_root.join("boot/firmware.img");
+    let ok = Command::new("dd")
+        .args(["if=/dev/zero",
+               &format!("of={}", img.display()),
+               "bs=1M", &format!("count={}", size_mb)])
+        .status().expect("dd failed").success();
+    if !ok { panic!("dd failed for firmware.img"); }
+
+    let ok = Command::new("mke2fs")
+        .args([
+            "-q", "-F",
+            "-t", "ext2",
+            "-O", "^resize_inode,^dir_index,^has_journal",
+            "-d", staging.to_str().unwrap(),
+            img.to_str().unwrap(),
+        ])
+        .status().expect("mke2fs failed").success();
+    if !ok { panic!("mke2fs failed to format firmware.img"); }
+
+    println!("[ok] firmware module: boot/firmware.img ({} MB ext2, {} KB staged)",
+        size_mb, staged_bytes / 1024);
+    true
 }
 
 fn provision_root_disk(root: &Path, disk_path: &Path, size_mb: u32) {
-    let staging = match stage_firmware_tree(root) {
-        Some(s) => s,
-        None => return,
+    // Staging carries /bin even when there is no firmware, so the disk is
+    // still worth creating - that is where the ring-3 shell comes from
+    let (staging, have_firmware) = match stage_root_tree(root) {
+        Some(v) => v,
+        None => {
+            println!("[i] nothing to stage onto disk.img (no firmware, no userspace programs)");
+            return;
+        }
     };
     if !check_mke2fs() {
         return;
     }
     let staged_kb = dir_size(&staging) / 1024;
+    let what = if have_firmware { "/lib/firmware + /bin" } else { "/bin" };
 
     if !disk_path.exists() {
-        println!("\nCreating root disk disk.img ({} MB) with /lib/firmware...", size_mb);
+        println!("\nCreating root disk disk.img ({} MB) with {}...", size_mb, what);
         let ok = Command::new("dd")
             .args(["if=/dev/zero",
                    &format!("of={}", disk_path.display()),
@@ -330,9 +537,16 @@ fn provision_root_disk(root: &Path, disk_path: &Path, size_mb: u32) {
         if !ok { panic!("mke2fs failed to format disk.img"); }
         println!("[ok] disk.img formatted ext2 + firmware staged ({} KB)", staged_kb);
     } else {
-        println!("\nRefreshing /lib/firmware on existing disk.img...");
-        inject_firmware_debugfs(disk_path, &staging);
-        println!("[ok] /lib/firmware refreshed on disk.img ({} KB)", staged_kb);
+        // Only push firmware when the image does not already carry it
+        let skip_firmware = !have_firmware || image_has_path(disk_path, "/lib/firmware");
+        let what = if skip_firmware { "/bin" } else { "/lib/firmware + /bin" };
+        println!("\nRefreshing {} on existing disk.img...", what);
+        if inject_firmware_debugfs(disk_path, &staging, skip_firmware) {
+            println!("[ok] {} refreshed on disk.img", what);
+        } else {
+            println!("[i] disk.img not writable by debugfs (MikuOS-formatted ext?); \
+                      leaving it as is");
+        }
     }
 }
 
@@ -340,14 +554,53 @@ fn provision_root_disk(root: &Path, disk_path: &Path, size_mb: u32) {
 /// mkdir every directory (pre-order, parents first), then for each file rm any
 /// stale copy and write the fresh one. debugfs continues past "already exists"
 /// / "not found" errors, so the script is idempotent
-fn inject_firmware_debugfs(img: &Path, staging: &Path) {
+
+/// True if `path` already exists inside the ext image. Used to avoid
+/// rewriting tens of megabytes of firmware on every single build
+fn image_has_path(img: &Path, path: &str) -> bool {
+    let out = Command::new("debugfs")
+        .args(["-R", &format!("stat {}", path), img.to_str().unwrap()])
+        .output();
+    match out {
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let txt = String::from_utf8_lossy(&o.stdout);
+            !err.contains("File not found")
+                && !txt.contains("File not found")
+                && !err.contains("Filesystem not open")
+        }
+        Err(_) => false,
+    }
+}
+
+fn inject_firmware_debugfs(img: &Path, staging: &Path, skip_firmware: bool) -> bool {
     if Command::new("debugfs").arg("-V").output().map(|o| o.status.success()).unwrap_or(false) == false {
-        println!("[!] debugfs not found - cannot refresh firmware on existing disk.img");
-        return;
+        println!("[i] debugfs not found - leaving disk.img contents as they are");
+        return false;
+    }
+    // debugfs exits 0 even when it cannot open the filesystem, so probe first
+    let probe = Command::new("debugfs")
+        .args(["-R", "stats -h", img.to_str().unwrap()])
+        .output().expect("debugfs probe failed");
+    let probe_err = String::from_utf8_lossy(&probe.stderr);
+    if probe_err.contains("Filesystem not open") || probe_err.contains("Couldn't find valid filesystem") {
+        return false;
     }
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     collect_tree(staging, "", &mut dirs, &mut files);
+
+    // Firmware is written once, when the image does not have it yet. Pushing
+    // ~90 MB of unchanged blobs through debugfs on every build is slow and
+    // pointless, and it means an ordinary `cargo run` rewrites vendor
+    // microcode onto the disk for no reason
+    if skip_firmware {
+        dirs.retain(|d| !d.starts_with("lib/firmware"));
+        files.retain(|(rel, _)| !rel.starts_with("lib/firmware"));
+    }
+    if files.is_empty() {
+        return true;
+    }
 
     let mut script = String::new();
     for d in &dirs {
@@ -365,6 +618,7 @@ fn inject_firmware_debugfs(img: &Path, staging: &Path) {
         .args(["-w", "-f", script_path.to_str().unwrap(), img.to_str().unwrap()])
         .status().expect("debugfs failed").success();
     if !ok { panic!("debugfs failed to inject firmware into disk.img"); }
+    true
 }
 
 /// Pre-order walk: relative dir paths (parents before children) and
@@ -448,7 +702,8 @@ fn main() {
 
     check_grub_mkrescue();
     build_ldmiku(&root, low_ram);
-    build_libmiku(&root, low_ram);
+    build_mikulibs(&root, low_ram);
+    build_userspace(&root, low_ram);
     build_kernel(&root, low_ram);
     create_iso(&root);
 
@@ -477,6 +732,10 @@ fn main() {
         "-serial".into(), "stdio".into(),
         "-display".into(), "gtk".into(),
         "-m".into(), ram,
+        // xHCI controller + USB keyboard: exercises the native USB HID
+        // stack (the PS/2 path still works through QEMU's emulated i8042)
+        "-device".into(), "qemu-xhci,id=xhci".into(),
+        "-device".into(), "usb-kbd,bus=xhci.0".into(),
     ];
 
     if cfg.data_mb > 0 && data_path.exists() {
@@ -488,11 +747,18 @@ fn main() {
         println!("[*] data.img attached as drive 2");
     }
 
-    if Command::new("qemu-system-x86_64")
-        .args(["-enable-kvm", "-version"]).output()
-        .map(|o| o.status.success()).unwrap_or(false)
-    {
+    // '-enable-kvm -version' succeeds even without KVM (QEMU does not init
+    // the accelerator for -version), so probe /dev/kvm itself: it exists and
+    // is writable only when the kvm module is loaded and we have access
+    let kvm_ok = fs::OpenOptions::new()
+        .read(true).write(true)
+        .open("/dev/kvm")
+        .is_ok();
+    if kvm_ok {
         args.push("-enable-kvm".into());
+    } else {
+        println!("[!] /dev/kvm unavailable (module not loaded, no BIOS SVM/VT-x, or no permissions)");
+        println!("    falling back to TCG software emulation - expect it to be slow");
     }
 
     println!("\n  drive 1 → disk.img ({} MB)", cfg.main_mb);

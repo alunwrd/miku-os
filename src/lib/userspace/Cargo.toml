@@ -20,3 +20,19 @@ path = "src/hello.rs"
 [[bin]]
 name = "mmaptest"
 path = "src/mmaptest.rs"
+
+[[bin]]
+name = "envtest"
+path = "src/envtest.rs"
+
+[[bin]]
+name = "sigtest"
+path = "src/sigtest.rs"
+
+[[bin]]
+name = "spin"
+path = "src/spin.rs"
+
+[[bin]]
+name = "msh"
+path = "src/msh.rs"

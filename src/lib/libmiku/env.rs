@@ -213,3 +213,43 @@ pub extern "C" fn miku_putenv(s: *const u8) -> bool {
 
     miku_setenv(key_buf.as_ptr(), unsafe { s.add(eq_pos + 1) })
 }
+
+// Seed the store from the kernel-provided envp (NULL-terminated array of
+// "KEY=value" C strings on the initial stack, see MikuOS_ABI.md sec 4.4).
+// Call once from _start_main before anything reads the environment.
+// Entries without '=' or with oversized key/value are skipped.
+// Returns how many variables were imported
+#[no_mangle]
+pub extern "C" fn miku_env_init(envp: *const *const u8) -> usize {
+    if envp.is_null() { return 0; }
+    let mut imported = 0usize;
+    let mut i = 0usize;
+    // hard cap so a corrupt (non-NULL-terminated) envp cannot spin forever
+    while i < MAX_ENV * 2 {
+        let entry = unsafe { *envp.add(i) };
+        if entry.is_null() { break; }
+        i += 1;
+
+        let len = string::miku_strlen(entry);
+        // find '='
+        let mut eq = usize::MAX;
+        for j in 0..len {
+            if unsafe { *entry.add(j) } == b'=' {
+                eq = j;
+                break;
+            }
+        }
+        if eq == usize::MAX || eq == 0 || eq > MAX_KEY_LEN || len - eq - 1 > MAX_VAL_LEN {
+            continue;
+        }
+
+        let mut key = [0u8; MAX_KEY_LEN + 1];
+        unsafe { mem::miku_memcpy(key.as_mut_ptr(), entry, eq); }
+        key[eq] = 0;
+        let val = unsafe { entry.add(eq + 1) };
+        if miku_setenv(key.as_ptr(), val) {
+            imported += 1;
+        }
+    }
+    imported
+}

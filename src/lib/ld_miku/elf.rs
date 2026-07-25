@@ -3,6 +3,7 @@
 pub const ET_DYN:        u16 = 3;
 pub const PT_LOAD:       u32 = 1;
 pub const PT_DYNAMIC:    u32 = 2;
+pub const PT_PHDR:       u32 = 6;
 pub const PT_TLS:        u32 = 7;
 pub const PT_GNU_RELRO:  u32 = 0x6474_E552;
 

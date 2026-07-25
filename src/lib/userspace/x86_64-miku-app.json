@@ -18,7 +18,7 @@
       "--no-as-needed",
       "-rpath",
       "/lib",
-      "-T/home/altushkaso2/miku-os/src/lib/userspace/linker.ld"
+      "-Tlinker.ld"
     ]
   },
   "relocation-model": "static",

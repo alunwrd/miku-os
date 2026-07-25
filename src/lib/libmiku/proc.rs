@@ -81,3 +81,61 @@ pub extern "C" fn miku_get_tls() -> u64 {
 pub extern "C" fn miku_map_lib(name: *const u8, name_len: usize) -> i64 {
     unsafe { sc2(SYS_MAP_LIB, name as u64, name_len as u64) }
 }
+
+// ---------------------------------------------------------------------------
+// Process control: fork / wait / kill / exec
+// ---------------------------------------------------------------------------
+
+/// fork(): 0 in the child, child pid in the parent, negative errno on failure
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn miku_fork() -> i64 {
+    unsafe { sc0(SYS_FORK) }
+}
+
+/// waitpid(pid, *status): blocks until the child exits. pid 0 = any child.
+/// status (if non-null) receives the raw exit code. Returns the reaped pid
+/// or negative errno
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn miku_waitpid(pid: u64, status: *mut i64) -> i64 {
+    unsafe { sc3(SYS_WAIT4, pid, status as u64, 0) }
+}
+
+/// kill(pid, sig). sig 9/15 terminate; see kernel sys_kill for the rest
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn miku_kill(pid: u64, sig: u64) -> i64 {
+    unsafe { sc2(SYS_KILL, pid, sig) }
+}
+
+/// exec(path, argv, argc): replace the current process image. argv is an
+/// array of pointers to NUL-terminated strings (argv[0] = program name).
+/// The kernel supplies a default environment. Does not return on success
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn miku_exec(path: *const u8, argv: *const *const u8, argc: usize) -> i64 {
+    let len = crate::string::miku_strlen(path);
+    unsafe { sc4(SYS_EXEC, path as u64, len as u64, argv as u64, argc as u64) }
+}
+
+/// execve(path, argv, argc, envp, envc): exec with an explicit environment.
+/// envp entries are "KEY=value" C strings, same layout as argv. The six
+/// parameters travel through a u64[6] struct (4-arg syscall ABI)
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn miku_execve(
+    path: *const u8,
+    argv: *const *const u8,
+    argc: usize,
+    envp: *const *const u8,
+    envc: usize,
+) -> i64 {
+    let len = crate::string::miku_strlen(path);
+    let args: [u64; 6] = [
+        path as u64, len as u64,
+        argv as u64, argc as u64,
+        envp as u64, envc as u64,
+    ];
+    unsafe { sc1(SYS_EXECVE, args.as_ptr() as u64) }
+}

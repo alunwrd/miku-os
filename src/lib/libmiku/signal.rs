@@ -8,9 +8,76 @@
 ///////////////////////////////////////////////////////////////////////
 
 use crate::sync::SpinLock;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 const MAX_SIGNALS: usize = 32;
+
+// Kernel delivery glue //
+//
+// The kernel delivers signals by redirecting the sysret of any syscall to
+// __miku_sig_entry with a frame on the user stack:
+//   [rsp+0]  sig     [rsp+8]  saved RIP   [rsp+16] saved RSP
+//   [rsp+24] saved RAX (syscall return)   [rsp+32] saved RFLAGS
+// The stub dispatches through miku_sigaction_dispatch and returns to the
+// interrupted context via sys_sigreturn(frame). Unhandled fatal-default
+// signals (HUP/INT/QUIT) terminate the process with 128+sig, POSIX style.
+//
+// Only caller-saved registers are used here: the interrupted code's
+// callee-saved set is preserved by the handler chain per the C ABI, and
+// libmiku's syscall wrappers declare the entire caller-saved set as
+// clobbered by any syscall (see sys.rs)
+core::arch::global_asm!(
+    ".global __miku_sig_entry",
+    "__miku_sig_entry:",
+    "mov rdi, [rsp]",              // sig
+    "call __miku_sig_dispatch_any", // al = handled
+    "mov rdi, [rsp]",              // sig again (frame is intact)
+    "test al, al",
+    "jnz 2f",
+    "cmp rdi, 1",                  // SIGHUP
+    "je 3f",
+    "cmp rdi, 2",                  // SIGINT
+    "je 3f",
+    "cmp rdi, 3",                  // SIGQUIT
+    "je 3f",
+    "2:",                          // handled (or ignorable): resume
+    "mov rdi, rsp",                // frame ptr
+    "mov rax, 69",                 // SYS_SIGRETURN
+    "syscall",
+    "ud2",
+    "3:",                          // unhandled fatal default
+    "lea rdi, [rdi + 128]",
+    "mov rax, 0",                  // SYS_EXIT
+    "syscall",
+    "ud2",
+);
+
+unsafe extern "C" {
+    fn __miku_sig_entry();
+}
+
+static ENTRY_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Unified dispatch used by the kernel entry stub: sigaction table first
+/// (flags/mask semantics), then the plain miku_signal table
+#[no_mangle]
+pub extern "C" fn __miku_sig_dispatch_any(sig: u32) -> bool {
+    if miku_sigaction_dispatch(sig) {
+        return true;
+    }
+    miku_signal_dispatch(sig)
+}
+
+/// Tell the kernel where to deliver signals. Called automatically the
+/// first time a handler is installed; safe to call repeatedly
+#[no_mangle]
+pub extern "C" fn miku_signal_init() {
+    if !ENTRY_REGISTERED.swap(true, Ordering::Relaxed) {
+        unsafe {
+            crate::sys::sc1(crate::sys::SYS_SIGENTRY, __miku_sig_entry as usize as u64);
+        }
+    }
+}
 
 // signal constants
 pub const SIG_HUP: u32 = 1;
@@ -54,6 +121,9 @@ pub extern "C" fn miku_signal(
     if sig == 0 || sig as usize >= MAX_SIGNALS { return None; }
     if sig == SIG_KILL || sig == SIG_STOP { return None; }
 
+    if handler.is_some() {
+        miku_signal_init();
+    }
     let mut table = SIGNAL_TABLE.lock();
     let prev = table.handlers[sig as usize];
     table.handlers[sig as usize] = handler;
@@ -168,6 +238,13 @@ pub extern "C" fn miku_sigaction(
 ) -> i32 {
     if sig == 0 || sig as usize >= MAX_SIGNALS { return -1; }
     if sig == SIG_KILL || sig == SIG_STOP { return -1; }
+
+    // Register the kernel entry BEFORE taking any lock: init makes a
+    // syscall, and a signal delivered at that boundary re-enters the
+    // dispatch path, which takes these locks
+    if !act.is_null() && unsafe { (*act).handler.is_some() } {
+        miku_signal_init();
+    }
 
     let mut table = SIGACTION_TABLE.lock();
     let idx = sig as usize;

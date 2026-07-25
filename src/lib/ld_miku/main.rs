@@ -102,14 +102,28 @@ pub extern "C" fn dynlinker_main(sp: *const u64) -> ! {
 }
 
 fn find_exe_base(phdr_va: u64, phnum: u16, phent: u16) -> u64 {
+    // The load bias is where the phdr table actually sits minus its
+    // link-time vaddr. PT_PHDR states that vaddr directly, so this yields
+    // the right answer for both ET_EXEC (bias 0) and PIE (random base) -
+    // the same method glibc/musl use
+    for i in 0..phnum as u64 {
+        let ph = (phdr_va + i * phent as u64) as *const u8;
+        let p_type  = unsafe { read_u32_u(ph) };
+        let p_vaddr = unsafe { read_u64_u(ph.add(16)) };
+        if p_type == PT_PHDR {
+            return phdr_va.wrapping_sub(p_vaddr);
+        }
+    }
+    // No PT_PHDR: for the usual headers-in-first-page layout (PT_LOAD at
+    // vaddr 0, offset 0) the phdr table directly follows the 64-byte ehdr,
+    // so the image base is one ehdr below it
     for i in 0..phnum as u64 {
         let ph = (phdr_va + i * phent as u64) as *const u8;
         let p_type   = unsafe { read_u32_u(ph) };
         let p_vaddr  = unsafe { read_u64_u(ph.add(16)) };
         let p_offset = unsafe { read_u64_u(ph.add(8)) };
-
-        if p_type == PT_LOAD && p_vaddr == 0 {
-            return phdr_va - p_offset;
+        if p_type == PT_LOAD && p_vaddr == 0 && p_offset == 0 {
+            return phdr_va.wrapping_sub(64);
         }
     }
     0

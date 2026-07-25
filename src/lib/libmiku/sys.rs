@@ -39,17 +39,39 @@ pub const SYS_READLINK:   u64 = 33;
 pub const SYS_PIPE:       u64 = 34;
 pub const SYS_CHDIR:      u64 = 35;
 
-// Socket syscalls (kernel dispatch 56-59)
+// Process control (kernel dispatch 43-46, 67)
+pub const SYS_FORK:       u64 = 43;
+pub const SYS_WAIT4:      u64 = 44;
+pub const SYS_KILL:       u64 = 45;
+pub const SYS_EXEC:       u64 = 46;
+pub const SYS_EXECVE:     u64 = 67;
+pub const SYS_SIGENTRY:   u64 = 68;
+pub const SYS_SIGRETURN:  u64 = 69;
+
+// Socket syscalls (kernel dispatch 56-59, 62-66)
 pub const SYS_SOCKET:     u64 = 56;
 pub const SYS_CONNECT:    u64 = 57;
 pub const SYS_SEND:       u64 = 58;
 pub const SYS_RECV:       u64 = 59;
 pub const SYS_MMAP_FILE:  u64 = 60;
 pub const SYS_MSYNC:      u64 = 61;
+pub const SYS_BIND:       u64 = 62;
+pub const SYS_LISTEN:     u64 = 63;
+pub const SYS_ACCEPT:     u64 = 64;
+pub const SYS_SENDTO:     u64 = 65;
+pub const SYS_RECVFROM:   u64 = 66;
 
 pub const NR_SYSCALLS: u64 = 36;
 
 // raw syscall wrappers
+
+// Every wrapper declares the full caller-saved set as clobbered
+// (rdi/rsi/rdx/r10/r8/r9 on top of the architectural rax/rcx/r11):
+//   - the kernel's syscall epilogue does not restore rdi/rsi/rdx, and
+//   - a signal handler may run between kernel exit and the instruction
+//     after `syscall`, trashing any caller-saved register (the kernel's
+//     sigreturn restores only RIP/RSP/RAX/RFLAGS; callee-saved registers
+//     are preserved by the handler itself per the C ABI)
 
 #[inline(always)]
 pub unsafe fn sc0(nr: u64) -> i64 {
@@ -59,6 +81,8 @@ pub unsafe fn sc0(nr: u64) -> i64 {
         in("rax") nr,
         lateout("rax") r,
         out("rcx") _, out("r11") _,
+        lateout("rdi") _, lateout("rsi") _, lateout("rdx") _,
+        lateout("r10") _, lateout("r8") _, lateout("r9") _,
         options(nostack)
     );
     r
@@ -69,9 +93,11 @@ pub unsafe fn sc1(nr: u64, a1: u64) -> i64 {
     let r: i64;
     asm!(
         "syscall",
-        in("rax") nr, in("rdi") a1,
+        in("rax") nr, inlateout("rdi") a1 => _,
         lateout("rax") r,
         out("rcx") _, out("r11") _,
+        lateout("rsi") _, lateout("rdx") _,
+        lateout("r10") _, lateout("r8") _, lateout("r9") _,
         options(nostack)
     );
     r
@@ -82,9 +108,11 @@ pub unsafe fn sc2(nr: u64, a1: u64, a2: u64) -> i64 {
     let r: i64;
     asm!(
         "syscall",
-        in("rax") nr, in("rdi") a1, in("rsi") a2,
+        in("rax") nr, inlateout("rdi") a1 => _, inlateout("rsi") a2 => _,
         lateout("rax") r,
         out("rcx") _, out("r11") _,
+        lateout("rdx") _,
+        lateout("r10") _, lateout("r8") _, lateout("r9") _,
         options(nostack)
     );
     r
@@ -95,9 +123,11 @@ pub unsafe fn sc3(nr: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     let r: i64;
     asm!(
         "syscall",
-        in("rax") nr, in("rdi") a1, in("rsi") a2, in("rdx") a3,
+        in("rax") nr, inlateout("rdi") a1 => _, inlateout("rsi") a2 => _,
+        inlateout("rdx") a3 => _,
         lateout("rax") r,
         out("rcx") _, out("r11") _,
+        lateout("r10") _, lateout("r8") _, lateout("r9") _,
         options(nostack)
     );
     r
@@ -108,9 +138,11 @@ pub unsafe fn sc4(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
     let r: i64;
     asm!(
         "syscall",
-        in("rax") nr, in("rdi") a1, in("rsi") a2, in("rdx") a3, in("r10") a4,
+        in("rax") nr, inlateout("rdi") a1 => _, inlateout("rsi") a2 => _,
+        inlateout("rdx") a3 => _, inlateout("r10") a4 => _,
         lateout("rax") r,
         out("rcx") _, out("r11") _,
+        lateout("r8") _, lateout("r9") _,
         options(nostack)
     );
     r

@@ -10,1357 +10,439 @@
 
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Architecture](https://img.shields.io/badge/arch-x86__64-blue.svg)]()
-[![Status](https://img.shields.io/badge/status-release-green.svg)]()
+[![Status](https://img.shields.io/badge/status-experimental-yellow.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
 
 </div>
 
 ---
 
-> **Documentation:** [Russian](Russian_README.md) | [English](English_README.md) | [Japanese](Japanese_README.md)
+> **Translations:** [Russian](Russian_README.md) · [Japanese](Japanese_README.md) · [main README](../README.md)
+> **ABI reference:** [docs/MikuOS_ABI.md](MikuOS_ABI.md)
+> **GPU notes:** [TU116](Nvidia_tu116.md) · [GB206](Nvidia_gb206.md)
 
 ---
 
 ## About
 
-**Miku OS** is an operating system developed from scratch in a `no_std` environment.
-It does not use any standard library (`libc`) and maintains full control over hardware and memory architecture.
-ELF dynamic linking, shared libraries, userspace processes, an init daemon (mikuD), and process management (fork/exec/wait) are implemented from scratch.
+**Miku OS** is an operating system built from scratch in a `no_std` Rust environment. There is no libc
+underneath it and no host runtime: memory layout, interrupt handling, scheduling, filesystems and drivers
+are all written here.
 
-> All code is written in Rust. Assembly is only used for the bootloader, syscall handler, and context switching.
+What actually runs today: a preemptive SMP kernel, ring-3 user processes with `fork`/`exec`/`wait` and
+signals, a dynamic linker with shared libraries, an init daemon (mikuD), a VFS with ext2/ext3/ext4, a
+block layer with write-back caching, a TCP/IP stack, and a userspace shell.
+
+> All code is Rust. Assembly appears only in the boot entry, the syscall bridge, the AP trampoline and
+> the context switch - places where the calling convention has to be exact.
+
+**Scale:** ~71 500 lines of kernel across 251 files, plus ~30 700 lines of userspace libraries and programs.
 
 ---
 
-## Technical specifications
+## Status and honest limitations
 
-### Kernel
+This is an experimental system. The list below is what is genuinely missing or provisional, so that the
+feature tables further down are not read as more than they are.
+
+| Area | State |
+|:--|:--|
+| **Preemption** | New. Verified in QEMU on 1-16 CPUs. An earlier naked-asm timer entry wedged real hardware, so it sits behind `PREEMPTIVE_TIMER` in `kernel/arch/x86_64/interrupts.rs` - set it to `false` to fall back to cooperative scheduling if a physical machine hangs after the first tick |
+| **Userspace threads** | Absent. No `clone`, no `futex`. Only the kernel uses multiple CPUs; a user process is single-threaded |
+| **`poll` / `select`** | Absent. A program cannot wait on several descriptors at once |
+| **Terminal** | `termios` (canonical/raw, echo, signal characters) and `ioctl` exist. Sessions, process groups, job control, pty and `/dev/tty` do not |
+| **Shell** | Split. `/bin/msh` runs in ring 3, but most commands still live in the in-kernel shell because they call kernel internals with no syscall equivalent |
+| **TLS** | Implemented inside the kernel. Parsing untrusted network input at ring 0 is not where it belongs |
+| **Tests** | No unit tests. Correctness is guarded by a QEMU boot smoke-test in CI |
+| **NVIDIA** | Bring-up in progress: GSP-RM boot path for TU116/TU117 and GB206. Not a usable display driver yet |
+
+---
+
+## Kernel
 
 | Component | Description |
 |:--|:--|
 | **Architecture** | x86_64, `#![no_std]`, `#![no_main]` |
-| **Bootloader** | GRUB2 + Multiboot2, framebuffer (BGR/RGB auto-detection) |
+| **Boot** | GRUB2 + Multiboot2; framebuffer with BGR/RGB auto-detection |
+| **Address space** | Higher-half kernel at `0xFFFFFFFF80000000`, HHDM direct map at `0xFFFF800000000000` |
 | **Protection** | GDT + TSS + IST (double fault, page fault, GPF), ring 0 / ring 3 |
-| **Interrupts** | IDT: timer, keyboard, page fault, GPF, #UD, #NM, double fault |
-| **PIC** | PIC8259 (offset 32/40) |
+| **Interrupts** | IDT with timer, keyboard, ATA IRQ 14/15, NMI, MCE, #UD, #NM, #PF, #GP, double fault, LAPIC error, spurious, 3 IPI vectors, 16 MSI vectors |
+| **Interrupt controller** | LAPIC + IO-APIC. The legacy 8259 PIC is initialised and then fully masked |
+| **Timer** | LAPIC timer, 250 Hz, calibrated against PIT channel 2 with a sanity range and a fallback |
+| **SMP** | Up to 64 CPUs (`MAX_CPUS`); ACPI MADT enumeration, INIT/SIPI bring-up, per-CPU GDT/TSS/GS |
+| **Scheduling** | CFS-style vruntime, per-CPU run queues, work stealing, preemptive timer |
 | **SSE** | CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1 |
-| **Heap** | 32 MB, linked list allocator |
-| **Syscall** | SYSCALL/SYSRET via MSR, naked asm handler, R8/R9/R10 preservation (modular: syscall/) |
-| **Signals** | SIGKILL (9), SIGTERM (15), SIGCHLD (17), 32-bit bitmask |
-| **Init** | mikuD (PID 1) - systemd-like service supervisor |
-| **ACPI** | RSDP/RSDT/XSDT parser, MADT enumeration (LAPIC + IOAPIC discovery) |
-| **APIC** | Local APIC + I/O APIC driver (replaces PIC8259) |
-| **SMP** | Multi-core bring-up: AP trampoline, per-CPU state (percpu), SIPI sequence |
-| **PS/2** | Keyboard controller initialization |
-| **USB** | USB legacy handoff (EHCI/xHCI BIOS release) |
-| **Splash** | Boot splash screen via framebuffer |
-| **fwload** | On-demand firmware loader from `/lib/firmware` (Linux `request_firmware` model) |
+| **Kernel heap** | 128 MiB, static in `.bss`, `linked_list_allocator` |
+| **Kernel stacks** | 1 MiB for the BSP, 512 KiB per thread, 64 KiB per AP - all fenced by a guard page |
+| **Syscalls** | 72 (0-71) via `SYSCALL`/`SYSRET` MSRs, naked asm bridge |
+| **Real-time clock** | CMOS/MC146818 read at boot, refined by NTP when the network comes up |
 
----
+### Boot sequence
 
-### mikuD - init daemon
-
-<details>
-<summary><b>Expand</b></summary>
-
-#### Overview
-
-mikuD is the init daemon (PID 1) for MikuOS - a full systemd-like service supervisor with Unix-style boundaries. It manages service lifecycle, dependency resolution, targets (runlevels), watchdog, notifications, socket activation, timers, ELF binary execution (ExecStart), and graceful shutdown with global timeout.
-
-#### Targets (runlevels)
-
-| Target | Value | Description |
-|:--|:--:|:--|
-| **SysInit** | 0 | System initialization |
-| **MultiUser** | 1 | Multi-user mode (default) |
-| **Graphical** | 2 | Graphical mode |
-| **Rescue** | 3 | Rescue / single-user mode |
-
-Services activate when target >= their declared target. Target transitions trigger automatic reconciliation.
-
-#### Service types
-
-| Type | Description |
-|:--|:--|
-| **Simple** | Long-running service (default) |
-| **Oneshot** | Execute once, then mark completed |
-| **Notify** | Service reports readiness via `notify_ready()` |
-| **Forking** | Service forks child process |
-
-#### Restart policies
-
-| Policy | Behavior |
-|:--|:--|
-| **Always** | Restart on any exit |
-| **Never** | Never restart |
-| **OnFailure** | Restart only if exit code != 0 |
-| **OnSuccess** | Restart only if exit code == 0 |
-| **OnAbnormal** | Restart on signal or non-zero exit |
-
-#### Dependency types
-
-| Type | Behavior |
-|:--|:--|
-| **Requires** (deps) | Hard dependency - service fails if dep fails |
-| **Wants** | Soft dependency - service continues if dep fails |
-| **Conflicts** | Stop conflicting service before starting |
-
-#### Features
-
-| Feature | Details |
-|:--|:--|
-| **ExecStart** | Launch ELF binaries from disk as services |
-| **Watchdog** | Service must ping within timeout or gets restarted |
-| **Notify** | sd_notify analog - service signals readiness |
-| **Conditions** | ConditionPathExists, ConditionServiceActive, ConditionTargetActive |
-| **Masking** | Completely prevent a service from starting |
-| **Critical** | Protected services cannot be stopped by user |
-| **Burst protection** | Max 5 restarts per 10 sec window |
-| **Graceful shutdown** | Stop non-critical first, then critical, 30 sec global timeout |
-| **Boot analysis** | Timing data for all services started during boot |
-| **Environment vars** | Up to 8 key=value pairs per service |
-| **Timeout** | Configurable start/stop timeouts (default 10 sec) |
-| **On-restart hooks** | Callback before service re-entry (shell reinit) |
-| **Isolate** | Switch target and stop everything not in it |
-
-#### Journal (event log)
-
-128-entry ring buffer logging all mikuD events:
-
-| Event | Symbol | Description |
-|:--|:--:|:--|
-| Started | + | Service started |
-| Stopped | - | Service stopped |
-| Exited | x | Service exited (with exit code) |
-| Failed | ! | Service failed |
-| DepFailed | d | Dependency failure |
-| ExecFailed | E | ELF binary launch failed |
-| Reloaded | R | SIGHUP reload |
-| WatchdogTimeout | W | Watchdog expired |
-| BurstLimit | B | Restart rate limit hit |
-| Shutdown | S | Graceful shutdown initiated |
-| TimerFired | F | Timer unit fired |
-| SocketActivated | A | Socket activation triggered |
-
-Events have severity levels: info (0), notice (1), warning (2), critical (3).
-
-#### Timer units
-
-| Type | Behavior |
-|:--|:--|
-| **Interval** | Fire every N ticks repeatedly |
-| **Oneshot** | Fire once after N ticks, then disable |
-| **Realtime** | Fire every N ticks aligned to boot time |
-
-Max 16 timers. Timers trigger service start on fire.
-
-#### Socket activation
-
-Services can be started on-demand when a connection arrives on a registered port.
-Supports Stream (TCP) and Dgram (UDP) socket types. Max 16 sockets.
-
-#### Unit files (.service)
-
-INI-like format loaded from `/etc/mikud/`:
-
-```ini
-[Unit]
-Description=My service
-After=kbd network
-Wants=logging
-Conflicts=rescue-shell
-ConditionPathExists=/etc/config
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/myservice
-Restart=always
-RestartSec=50
-Priority=5
-WatchdogSec=100
-TimeoutStartSec=2500
-RemainAfterExit=false
-Critical=false
-Environment=LANG=en
-
-[Install]
-WantedBy=multi-user
-```
-
-#### Shell commands (sv)
-
-| Command | Description |
-|:--|:--|
-| `sv list` | List all services with state, PID, restarts |
-| `sv status <name>` | Detailed status + journal entries |
-| `sv start <name>` | Start a service |
-| `sv stop <name>` | Stop a service (graceful) |
-| `sv restart <name>` | Restart a service |
-| `sv reload <name>` | Send SIGHUP for config reload |
-| `sv enable <name>` | Enable service |
-| `sv disable <name>` | Disable service (stop + deactivate) |
-| `sv mask <name>` | Prevent service from starting |
-| `sv unmask <name>` | Allow masked service to start |
-| `sv force-stop <name>` | Force kill (even critical services) |
-| `sv journal [name]` | Show event log (last 20 or per service) |
-| `sv target [name]` | Show/set active target |
-| `sv analyze` | Boot timing analysis |
-| `sv tree <name>` | Dependency tree visualization |
-| `sv rdeps <name>` | Reverse dependencies |
-| `sv cat <name>` | Show service unit config |
-| `sv load <path>` | Load .service unit file |
-| `sv scan` | Scan /etc/mikud/ for unit files |
-| `sv timer list` | List timer units |
-| `sv timer start/stop <name>` | Control timers |
-
-</details>
-
----
-
-### ELF loader and dynamic linking
-
-<details>
-<summary><b>ELF Loader</b></summary>
-
-#### Features
-
-| Feature | Description |
-|:--|:--|
-| **Formats** | ET_EXEC (static), ET_DYN (PIE) |
-| **Segments** | PT_LOAD, PT_INTERP, PT_DYNAMIC, PT_TLS, PT_GNU_RELRO, PT_GNU_STACK |
-| **Relocations** | R_X86_64_RELATIVE, R_X86_64_JUMP_SLOT, R_X86_64_GLOB_DAT, R_X86_64_64 |
-| **Security** | W^X enforcement (W+X segments rejected), RELRO |
-| **ASLR** | 20-bit entropy for PIE binaries (RDRAND + TSC fallback) |
-| **Stack** | SysV ABI compliant: argc, argv, envp, auxv (16-byte aligned) |
-| **TLS** | Thread Local Storage (via FS.base register) |
-
-#### Modular structure
-
-| Module | Description |
-|:--|:--|
-| **elf_loader.rs** | ELF parsing, segment mapping |
-| **exec_elf.rs** | Process creation, stack construction |
-| **dynlink.rs** | Dynamic linking (delegates to reloc.rs) |
-| **reloc.rs** | Unified relocation engine |
-| **vfs_read.rs** | Unified file reading (VFS + ext2) |
-| **random.rs** | RDRAND/TSC random numbers, ASLR |
-
-#### auxv Entries
-
-| Key | Description |
-|:--|:--|
-| AT_PHDR | Virtual address of program headers |
-| AT_PHENT | Size of program header entry |
-| AT_PHNUM | Number of program headers |
-| AT_PAGESZ | Page size (4096) |
-| AT_ENTRY | Executable entry point |
-| AT_BASE | Interpreter base address |
-| AT_RANDOM | 16 bytes of random data |
-
-</details>
-
-<details>
-<summary><b>ld-miku (Dynamic Linker)</b></summary>
-
-#### Overview
-
-`ld-miku` is the ELF dynamic linker for MikuOS. Written in Rust in a `#![no_std]` environment,
-compiled as a static PIE binary.
-
-#### Loading process
+Each step is reported as `[boot] ok <name>` on the serial console and the framebuffer:
 
 ```
-1. Kernel loads ELF -> detects PT_INTERP
-2. ld-miku.so mapped from INCLUDE_BYTES into memory
-3. ld-miku starts -> parses auxv (AT_PHDR/AT_ENTRY)
-4. Identifies required libraries from DT_NEEDED
-5. Maps shared libraries via SYS_MAP_LIB syscall
-6. Applies PLT/GOT relocations
-7. Exports symbols to global table
-8. Executes DT_INIT / DT_INIT_ARRAY
-9. Jumps to executable entry point
+Physical memory manager → ACPI (RSDP/MADT) → APIC → IO-APIC → LAPIC timer →
+Real-time clock → IRQ routing → Virtual file system → Shared library cache →
+Block device probe → Block device nodes (/dev) → Network subsystem →
+Firmware store → NVIDIA GPU probe → Scheduler → Firmware SMI silence →
+PS/2 keyboard → Interrupts → Timer calibration → SMP (AP bringup) →
+mikuD init daemon
 ```
 
-#### Features
+### Memory safety of the kernel itself
 
-- Global symbol table (up to 1024 symbols)
-- Weak symbol resolution
-- Recursive dependency loading (up to 16 libraries)
-- R_X86_64_COPY relocation support
-- DT_HASH / DT_GNU_HASH for accurate symbol counting
-- Correct envp skipping during auxv parsing
+Each of these exists because it caught a real, hard-to-diagnose bug:
 
-</details>
-
-<details>
-<summary><b>Shared Libraries (solib)</b></summary>
-
-#### Global library cache
-
-| Parameter | Value |
-|:--|:--|
-| **Max cached** | 32 libraries |
-| **Search paths** | /lib, /usr/lib |
-| **Page mapping** | All segments copied per-process |
-| **OOM protection** | parse_and_prepare aborts on OOM without caching broken data |
-
-#### SYS_MAP_LIB Syscall (nr=15)
-
-The kernel parses ELF segments and maps the shared library directly into the process address space.
-
-- Read-only segments -> private copy from cache
-- Writable segments -> fresh allocation per process
-- Rollback on map_page failure
-
-#### System libraries
-
-`libmiku.so` is embedded in the kernel via `include_bytes!` and registered in the cache at boot via `solib::preload`.
-
-#### Shell commands
-
-| Command | Description |
-|:--|:--|
-| `ldconfig` | Scan /lib and /usr/lib, update cache |
-| `ldd` | List cached libraries |
-
-</details>
+- **Stack guard pages** (`kernel/mm/kstack.rs`) - every thread stack takes `pages + 1` contiguous frames
+  and unmaps the lowest one from the HHDM. Overflow faults on the guard page, at the instruction that did
+  it, and the fault handler names the owning pid. The kernel image is mapped by a single 1 GiB huge page,
+  so without this an overflow silently overwrites whatever the allocator handed out next.
+- **BSP stack canary** (`kernel/kcore/stack_guard.rs`) - a poisoned page below the boot stack, checked
+  after every init step.
+- **`IrqMutex`** (`kernel/kcore/irq_lock.rs`) - disables interrupts for the critical section. Required for
+  every lock an interrupt handler can touch (`PMM`, `SWAP_MAP`, `EMERGENCY_POOL`, `REFCOUNTS`,
+  `MSI_HANDLERS`); a plain spin lock there deadlocks a CPU against itself.
+- **`SchedMutex`** (`kernel/kcore/sched_lock.rs`) - spins briefly, then yields to the scheduler. Used for
+  the VFS lock, which is held across disk I/O where spinning wastes whole timeslices.
 
 ---
 
-### libmiku.so (standard library)
+## Memory management
 
-<details>
-<summary><b>Expand</b></summary>
+### Physical (`kernel/mm/pmm.rs`)
 
-#### Overview
+Bitmap frame allocator with word-parallel scanning, separate hints for single-frame and contiguous
+allocation, refcounting for copy-on-write, and an emergency reserve pool used by the swap-in path.
 
-libmiku is a C-compatible standard library for MikuOS. Written in Rust, it provides 63 modules and 956 exported functions covering everything from basic I/O to data structures, cryptography, parsing, and a full POSIX libc compatibility layer (stdio, stdlib, string.h, etc.).
-Dynamically loaded by ld-miku, used by all userspace programs.
+### Virtual (`kernel/mm/vmm.rs`)
 
-#### Module categories
+Four-level paging behind an `AddressSpace` type. User address spaces copy PML4 entries 256-511 from the
+kernel tables, so kernel and HHDM mappings are shared and stay in sync. Huge pages are split on demand
+when a 4 KiB mapping is needed (MMIO, guard pages).
 
-| Category | Modules |
-|:--|:--|
-| **Data Structures** | vec, list, hashmap, treemap, trie, queue, ringbuf, ringbuf2, heap_queue, bitset, channel |
-| **Strings** | string, strbuf, ctype, utf8, format, regex, glob |
-| **I/O** | io, bufio, stdio, file, dir, path |
-| **Numbers / Math** | num, math, random, convert, endian, bitops |
-| **Encoding** | base64, hex, json, csv, ini, lz |
-| **Crypto / Hash** | sha256, checksum, hash, uuid |
-| **System** | sys, proc, signal, env, errno, args, getopt |
-| **Concurrency** | sync, channel, event, timer |
-| **Time** | time, datetime |
-| **Memory** | mem, heap, arena, pool, slab |
-| **Logging / Testing** | log, test, panic |
-| **Sorting** | sort |
-| **libc compat** | libc (fopen/fclose/fread/fwrite/fprintf/fgets/fputs etc., 151 functions) |
+### Swap (`kernel/mm/swap.rs`, `swap_map.rs`)
 
-> The previous `util` module was split into `math` (abs/min/max/clamp/isqrt/div_ceil/is_prime), `random` (srand/rand/rand_range/rand_bytes) and `panic` (assert_fail/panic/assert_eq/assert_not_null). Calls like `miku_abs` / `miku_rand_range` remain ABI-compatible.
+Reverse mapping from physical frame to `(cr3, virt)`, clock-sweep eviction with aging and pinning, and a
+swap PTE encoding that preserves the original flags. Reclaim runs on the **kswapd** thread - the timer
+tick only raises a flag, because eviction performs disk I/O and takes locks that must never be entered
+from an interrupt handler.
 
-#### Module: io (input/output)
+### mmap (`kernel/mm/mmap.rs`)
 
-| Function | Description |
-|:--|:--|
-| `miku_write(fd, buf, len)` | Write to fd |
-| `miku_read(fd, buf, len)` | Read from fd |
-| `miku_print(str)` | Print string |
-| `miku_println(str)` | Print string + newline |
-| `miku_puts(str)` | puts-compatible |
-| `miku_putchar(c)` | Output 1 byte |
-| `miku_getchar()` | Input 1 byte |
-| `miku_readline(buf, max)` | Line input (fixed buffer) |
-| `miku_getline()` | Line input (malloc, needs free) |
-
-#### Module: string (strings)
-
-| Function | Description |
-|:--|:--|
-| `miku_strlen` | String length |
-| `miku_strcmp` / `miku_strncmp` | String comparison |
-| `miku_strcpy` / `miku_strncpy` | String copy |
-| `miku_strcat` / `miku_strncat` | String concatenation |
-| `miku_strchr` / `miku_strrchr` | Character search |
-| `miku_strstr` | Substring search |
-| `miku_strdup` | String duplicate (malloc) |
-| `miku_toupper` / `miku_tolower` | Case conversion |
-| `miku_isdigit` / `miku_isalpha` / `miku_isalnum` / `miku_isspace` | Character classification |
-| `miku_strtok` | Tokenization (stateful) |
-| `miku_strpbrk` | Character set search |
-| `miku_strspn` / `miku_strcspn` | Prefix length |
-| `miku_strtol` / `miku_strtoul` | String to number (base 0/8/10/16) |
-| `miku_strlcpy` / `miku_strlcat` | BSD-safe copy/concatenation |
-
-#### Module: num (numbers)
-
-| Function | Description |
-|:--|:--|
-| `miku_itoa(val, buf)` | Integer to string |
-| `miku_utoa(val, buf)` | Unsigned integer to string |
-| `miku_atoi(str)` | String to integer |
-| `miku_print_int(val)` | Print decimal |
-| `miku_print_hex(val)` | Print 0x... |
-
-#### Module: mem (memory)
-
-| Function | Description |
-|:--|:--|
-| `miku_memset` | Memory fill |
-| `miku_memcpy` | Memory copy |
-| `miku_memmove` | Memory copy (overlap-safe) |
-| `miku_memcmp` | Memory comparison |
-| `miku_bzero` | Zero fill |
-| `miku_memchr` | Byte search |
-| `miku_memrchr` | Reverse byte search |
-| `miku_memmem` | Byte sequence search |
-
-#### Module: heap (dynamic memory)
-
-| Function | Description |
-|:--|:--|
-| `miku_malloc(size)` | Allocate memory |
-| `miku_free(ptr)` | Free memory |
-| `miku_realloc(ptr, size)` | Resize allocation |
-| `miku_calloc(count, size)` | Zero-initialized allocation |
-
-Implementation: mmap-based slab allocator. < 32KB from 128KB slab, >= 32KB via individual mmap/munmap.
-
-#### Module: fmt (formatted output)
-
-| Function | Description |
-|:--|:--|
-| `miku_printf(fmt, ...)` | Formatted output |
-| `miku_snprintf(buf, max, fmt, ...)` | Formatted output to buffer |
-
-Supported formats: `%s` `%d` `%u` `%x` `%c` `%p` `%%`
-
-Implementation: `global_asm!` trampoline saves rsi/rdx/rcx/r8/r9 to stack. No XMM registers used, avoiding SSE alignment issues. `%d/%x/%u` are 32-bit (read as i32/u32).
-
-#### Module: file (file I/O)
-
-| Function | Description |
-|:--|:--|
-| `miku_open(path, len)` | Open file |
-| `miku_open_cstr(path)` | Open file (C string) |
-| `miku_close(fd)` | Close |
-| `miku_seek(fd, offset)` | Set offset |
-| `miku_fsize(fd)` | Get file size |
-| `miku_read_file(path, &size)` | Read entire file (malloc) |
-
-#### Module: time (time)
-
-| Function | Description |
-|:--|:--|
-| `miku_sleep(ticks)` | Sleep (~4 ms/tick at 250 Hz) |
-| `miku_sleep_ms(ms)` | Sleep in milliseconds |
-| `miku_uptime()` | Ticks since boot |
-| `miku_uptime_ms()` | Milliseconds since boot |
-
-#### Module: proc (process)
-
-| Function | Description |
-|:--|:--|
-| `miku_exit(code)` | Terminate process |
-| `miku_getpid()` | Get PID |
-| `miku_getcwd(buf, size)` | Get current directory |
-| `miku_brk(addr)` | Expand heap (0=query) |
-| `miku_mmap` / `miku_munmap` / `miku_mprotect` | Memory mapping |
-| `miku_set_tls` / `miku_get_tls` | TLS register |
-| `miku_map_lib(name, len)` | Map shared library |
-
-</details>
+Anonymous and file-backed mappings, demand paging, copy-on-write across `fork`, `mprotect`, `msync`.
 
 ---
 
-### Userspace SDK
+## Processes and scheduling
 
-<details>
-<summary><b>Expand</b></summary>
-
-#### Overview
-
-MikuOS provides a Rust SDK for developing userspace programs in a `no_std` environment.
-C is also supported.
-
-#### Safe wrappers (miku.rs)
-
-| Wrapper | Description |
+| Feature | Detail |
 |:--|:--|
-| `miku::print(s: &str)` | Print string |
-| `miku::println(s: &str)` | Print string + newline |
-| `miku::exit(code)` | Terminate process |
-| `miku::open(path) -> Result` | Open file |
-| `miku::read_file(path) -> Option` | Read entire file |
-| `miku::sleep_ms(ms)` | Sleep in milliseconds |
-| `miku::rand_range(lo, hi)` | Random number in range |
-| `cstr!("text")` | C string macro |
-
-#### Entry point
-
-Use `_start_main`, not `_start`. `miku.rs` contains a `global_asm!` trampoline that defines `_start` with `and rsp, -16` for SSE alignment before calling `_start_main`.
-
-#### Test suite
-
-1617 tests across the following categories:
-
-| Category | Count |
-|:--|:--|
-| strings (basic/extended) | 24 |
-| numbers | 7 |
-| memory | 4 |
-| utilities | 7 |
-| heap | 7 |
-| process | 2 |
-| printf / snprintf | 11 |
-| time | 5 |
-| file I/O | 3+ |
-| libc compat (stdio) | 1500+ |
-
-</details>
+| **Model** | One `Process` per thread; kernel threads share the kernel CR3, user processes get their own |
+| **Creation** | `fork` (CoW), `exec`/`execve`, `wait4`, `kill`, zombie reaping |
+| **Scheduler** | CFS-style vruntime with priority weights, per-CPU run queues, min-vruntime selection |
+| **Load balancing** | Placement on the lightest eligible CPU plus work stealing when a queue runs dry |
+| **Preemption** | Timer-driven. The naked stub builds the 15-GPR + iret frame the scheduler expects and resumes on whatever stack it returns |
+| **Affinity** | 64-bit CPU mask per process |
+| **Signals** | User-registered dispatch entry, `sigreturn`, SIGINT/SIGQUIT/SIGTERM/SIGKILL/SIGCHLD |
+| **Worker pool** | Sized from the ACPI CPU count, clamped to 4-32 threads |
+| **Descriptors** | Per-process FD table, cloned on `fork`, released at `exit` rather than at reap |
 
 ---
 
-### Memory management
+## System calls
 
-<details>
-<summary><b>Physical Memory (PMM)</b></summary>
+72 entries, dispatched from a naked `SYSCALL` bridge that swaps to the per-CPU kernel stack via `gs`.
 
-#### Frame allocator
-
-- Bitmap allocator: up to 4M frames (16 GB RAM), 1 bit = 1 frame of 4KB
-- `free_hint` and `contiguous_hint` for fast free frame lookup
-- Contiguous alloc: N frames in a single request
-- Regions: dynamic RAM range registration from Multiboot2 memory map
-
-#### Emergency pool
-
-| Parameter | Value |
+| Range | Area |
 |:--|:--|
-| **Pool size** | 64 frames (256 KB) |
-| **Purpose** | Swap-in within page fault handler only |
-| **Refill** | Timer ISR at 250Hz via `refill_emergency_pool_tick()` |
+| 0-10 | `exit`, `write`, `read`, `mmap`, `munmap`, `mprotect`, `brk`, `getpid`, `getcwd`, `set_tls`, `get_tls` |
+| 11-17 | `open`, `close`, `seek`, `fsize`, `map_lib`, `sleep`, `uptime` |
+| 18-27 | `stat`, `fstat`, `mkdir`, `rmdir`, `unlink`, `readdir`, `rename`, `link`, `chmod`, `chown` |
+| 28-42 | `dup`, `dup2`, `truncate`, `write_file`, `symlink`, `readlink`, `pipe`, `chdir`, `statfs`, `fallocate`, `getxattr`, `setxattr`, `utimensat`, `fsync`, `punch_hole` |
+| 43-47 | `fork`, `wait4`, `kill`, `exec`, `umask` |
+| 48-55 | `getuid`, `getgid`, `geteuid`, `getegid`, `setuid`, `setgid`, `seteuid`, `setegid` |
+| 56-66 | `socket`, `connect`, `send`, `recv`, `mmap_file`, `msync`, `bind`, `listen`, `accept`, `sendto`, `recvfrom` |
+| 67-69 | `execve`, `sigentry`, `sigreturn` |
+| 70-71 | `clock_gettime`, `ioctl` |
 
-</details>
+**User pointer validation** (`kernel/syscall/usercopy.rs`): every range must lie in the canonical user
+half, every page is walked to confirm `PRESENT | USER` (and `WRITABLE` where needed), lazy VMA pages are
+faulted in first, and paths are copied into kernel memory before use so they cannot be rewritten after
+validation.
 
-<details>
-<summary><b>Virtual Memory (VMM)</b></summary>
+---
 
-- 4-level page tables (PML4 -> PDP -> PD -> PT)
-- HHDM: Higher Half Direct Map (`0xFFFF800000000000`)
-- `mark_swapped()`: write swap PTE when evicting a page
-- Ring 0 / ring 3 mapping support
-- Address space creation and destruction for user processes
-- Per-process address space for fork/exec
+## Virtual file system
 
-</details>
-
-<details>
-<summary><b>mmap Subsystem</b></summary>
-
-| Parameter | Value |
+| Property | Value |
 |:--|:--|
-| **MMAP range** | 0x100000000 ~ 0x7F0000000000 |
-| **BRK range** | 0x6000000000 ~ |
-| **Max VMAs** | 256 entries |
-| **Features** | mmap, munmap, mprotect, brk, file-backed mmap, msync |
-| **File-backed** | `sys_mmap_file` maps a file lazily (page-fault fill); MAP_SHARED dirty pages write back on munmap/msync |
-| **MAP_FIXED** | Unmaps existing mappings + removes overlapping VMAs |
-| **VMA validation** | Rollback on insert failure |
+| Vnodes | 256 |
+| Open files per process | 128 |
+| Mount slots | 8 (VFS) / 4 (ext driver) |
+| Name length | 64 bytes |
+| Page cache | 1024 pages × 512 B = 512 KiB |
+| Filesystem types | tmpfs, devfs, procfs, ext2, ext3, ext4, cowfs, pipefs |
 
-</details>
+Features: hierarchical namespace, hard and symbolic links, permissions with uid/gid/umask, extended
+attributes, file locks, per-process cwd, dentry cache, journal hooks, quota accounting, content-addressed
+storage helpers, and `/dev` block-device nodes generated from the block layer.
 
-<details>
-<summary><b>Swap</b></summary>
+`/proc` exposes `uptime`, `meminfo`, `diskstats` and friends; `/dev` carries the console, null, zero,
+random and the block devices; `/lib` holds the ten preloaded shared libraries.
 
-#### Reverse mapping (swap_map)
+---
 
-- Each physical frame records `(cr3, virt_addr, age, pinned)`
-- Tracks up to 512K frames (2 GB RAM)
+## Filesystems
 
-#### Eviction algorithm: clock sweep
+### ext2 / ext3 / ext4 (`kernel/fs/ext/`)
+
+The driver detects the on-disk flavour from the superblock feature bits and reports it as such -
+`ext2`, `ext3` or `ext4` - in the mount log, in `statfs()` and in `/proc`:
 
 ```
-Pass 1: search for frames with age >= 3 (oldest)
-Pass 2: emergency mode, any unpinned frame
+[miku_extfs] slot 0 drive 1 lba 0 - ext4 (journal=true extents=true 64bit=true
+                                          metadata_csum=true flex_bg=true dir_index=true)
 ```
 
-- `touch(phys)`: reset age to 1 on page access
-- `age_all()`: increment age of all frames on timer
+| Capability | Detail |
+|:--|:--|
+| **Read** | Direct, indirect, double- and triple-indirect blocks; ext4 extent trees; inline data |
+| **Write** | Allocation with per-group hints, truncate, punch hole, fallocate, rename, links |
+| **ext3** | JBD2-style journal: transactions, descriptor and revoke blocks, replay on mount |
+| **ext4** | Extent trees, 64-bit block numbers, flex_bg, metadata checksums (CRC32c), inline data |
+| **Volume size** | Limited by the filesystem, not the driver - block group tables grow on the heap |
+| **Integrity** | fsck, orphan inode cleanup on mount, TRIM/discard, `fiemap` |
+| **mkfs** | ext2/ext3/ext4 creation with a dry-run mode |
 
-#### Swap PTE encoding
+### Others
+
+- **tmpfs** - the root filesystem, page-cache backed
+- **devfs**, **procfs** - synthesised
+- **GPT** - partition table parsing, partition nodes, `partprobe`
+
+---
+
+## Storage stack
 
 ```
-bit 0     = 0  (PRESENT=0)
-bit 1     = 1  (SWAP_MARKER)
-bits 12.. = swap slot number
-Additional check: slot number != 0 (false positive prevention)
+VFS  →  block layer  →  buffer cache  →  driver  →  device
 ```
 
-</details>
+- **Block layer** (`kernel/io/block/`) - device registry, partition mapping, per-device I/O statistics,
+  discard and write-zeroes, health monitoring (NVMe log pages and ATA SMART), `/proc/diskstats`
+- **Buffer cache** - 512 chunks × 4 KiB, 8-way set associative, write-back with a **bdflush** flusher
+  thread
+- **Queues** - `&self` drivers with lockless dispatch; NVMe uses four per-CPU submission queues
+
+**Drivers** (`kernel/drivers/block/`): `ata` (PIO + bus-master DMA), `ahci`, `nvme`, `virtio_blk`,
+`ramdisk` (used for the firmware image handed over by GRUB).
 
 ---
 
-### Process management
+## Network stack
 
-| Feature | Description |
+| Layer | Support |
 |:--|:--|
-| **fork()** | Full COW-style process cloning via deep page table copy |
-| **exec()** | Replace process image with ELF binary |
-| **wait4()** | Wait for child process (blocking) |
-| **kill()** | Send signal to process (SIGTERM, SIGKILL, SIGCHLD) |
-| **Zombie reaping** | Automatic via mikuD and wait4 |
-| **Process hierarchy** | Parent-child tracking via ppid |
-| **Per-process identity** | `cwd`, `umask`, `uid`, `gid`, `euid`, `egid`, stored atomically on `Process`, inherited by `fork()`, synced into VFS context on every syscall |
+| **Drivers** | Intel e1000 (82540EM/82545EM/82574L/82579LM/I217), Realtek RTL8139/8168/8169, virtio-net |
+| **Link** | Ethernet, ARP with cache |
+| **Network** | IPv4, ICMP (ping, traceroute) |
+| **Transport** | UDP, TCP with a full state machine, retransmission and listeners |
+| **Application** | DHCP client, DNS resolver, HTTP/1.1, HTTP/2, NTP |
+| **Security** | TLS 1.2/1.3 client: RSA, ECDHE, AES-GCM, bignum arithmetic - currently in ring 0 |
+| **Sockets** | Per-process socket table; `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `sendto`, `recvfrom` |
+
+`netd` runs DHCP at boot and brings the link up automatically.
 
 ---
 
-### Scheduler
+## Input and console
 
-| Parameter | Value |
-|:--|:--|
-| **Algorithm** | CFS, preemptive |
-| **Max processes** | 4096 |
-| **Timer frequency** | 250 Hz (PIT) |
-| **CPU window** | 250 ticks (1 second) |
-| **Stack** | 512 KB per process |
-| **States** | Ready / Running / Sleeping / Blocked / Dead |
-| **Implementation** | Lock-free: ISR uses atomics only |
-| **Priority** | 1-20 scale with weighted vruntime |
-| **Affinity** | Per-process CPU mask |
+- **PS/2 keyboard** - controller init, scancode set 1, lock-free ring buffer
+- **USB** - xHCI controller, HID keyboard, BIOS/EHCI handoff
+- **Console** - framebuffer text console with colour, scrolling and a JetBrains Mono bitmap font generated
+  at build time. All console output is mirrored to the serial port, which is what makes headless boots and
+  CI logs useful
+- **Terminal** (`kernel/io/input/user_stdin.rs`) - line discipline with canonical and raw modes, echo
+  control, Ctrl-C → SIGINT, Ctrl-\ → SIGQUIT, Ctrl-D → EOF, Ctrl-U → kill line. Settings are reachable
+  from ring 3 through `ioctl` (`TCGETS`, `TCSETS`, `TIOCGWINSZ`)
 
 ---
 
-### System calls
+## mikuD - init daemon
 
-| Nr | Name | Description |
-|:--:|:--|:--|
-| **0** | `sys_exit` | Terminate process + yield |
-| **1** | `sys_write` | Write to stdout/stderr (fd 1/2) |
-| **2** | `sys_read` | Read from stdin (fd 0) or file descriptor |
-| **3** | `sys_mmap` | Create memory mapping |
-| **4** | `sys_munmap` | Remove memory mapping |
-| **5** | `sys_mprotect` | Change memory protection attributes |
-| **6** | `sys_brk` | Expand heap |
-| **7** | `sys_getpid` | Get current process PID |
-| **8** | `sys_getcwd` | Get current directory |
-| **9** | `sys_set_tls` | Set FS.base register (TLS) |
-| **10** | `sys_get_tls` | Get FS.base register |
-| **11** | `sys_open` | Open file (VFS + ext2) |
-| **12** | `sys_close` | Close file descriptor |
-| **13** | `sys_seek` | Set file offset |
-| **14** | `sys_fsize` | Get file size |
-| **15** | `sys_map_lib` | Direct shared library mapping |
-| **16** | `sys_sleep` | Sleep process (~4ms/tick) |
-| **17** | `sys_uptime` | Get ticks since boot |
-| **18** | `sys_stat` | File stat |
-| **19** | `sys_fstat` | File descriptor stat |
-| **20** | `sys_mkdir` | Create directory |
-| **21** | `sys_rmdir` | Remove directory |
-| **22** | `sys_unlink` | Remove file |
-| **23** | `sys_readdir` | Read directory entries |
-| **24** | `sys_rename` | Rename file/directory |
-| **25** | `sys_link` | Create hard link |
-| **26** | `sys_chmod` | Change permissions |
-| **27** | `sys_chown` | Change ownership |
-| **28** | `sys_dup` | Duplicate file descriptor |
-| **29** | `sys_dup2` | Duplicate to specific fd |
-| **30** | `sys_truncate` | Truncate file |
-| **31** | `sys_write_file` | Write file contents |
-| **32** | `sys_symlink` | Create symbolic link |
-| **33** | `sys_readlink` | Read symbolic link |
-| **34** | `sys_pipe` | Create pipe |
-| **35** | `sys_chdir` | Change directory |
-| **36** | `sys_statfs` | File system statistics |
-| **37** | `sys_fallocate` | Preallocate file space |
-| **38** | `sys_getxattr` | Get extended attribute |
-| **39** | `sys_setxattr` | Set extended attribute |
-| **40** | `sys_utimensat` | Set file timestamps |
-| **41** | `sys_fsync` | Flush file to disk |
-| **42** | `sys_punch_hole` | Punch hole in file |
-| **43** | `sys_fork` | Fork current process |
-| **44** | `sys_wait4` | Wait for child process |
-| **45** | `sys_kill` | Send signal to process |
-| **46** | `sys_exec` | Execute ELF binary |
-| **47** | `sys_umask` | Set file-creation mask (returns previous) |
-| **48** | `sys_getuid` | Get real user ID |
-| **49** | `sys_getgid` | Get real group ID |
-| **50** | `sys_geteuid` | Get effective user ID |
-| **51** | `sys_getegid` | Get effective group ID |
-| **52** | `sys_setuid` | Set real UID (-EPERM if not root) |
-| **53** | `sys_setgid` | Set real GID (-EPERM if not root) |
-| **54** | `sys_seteuid` | Set effective UID (-EPERM if not root) |
-| **55** | `sys_setegid` | Set effective GID (-EPERM if not root) |
-| **56** | `sys_socket` | Create socket (AF_INET/SOCK_STREAM) → fd ≥ 4096 |
-| **57** | `sys_connect` | Connect socket to (ip, port) |
-| **58** | `sys_send` | Send data on socket fd |
-| **59** | `sys_recv` | Receive data from socket fd (0 = EOF) |
+PID 1. Owns service lifecycle, dependencies and restarts.
 
-Total: 60 syscalls (0..59). Socket fds start at `SOCK_FD_BASE = 4096`; `read`/`write`/`close` route to the socket layer by fd range. Timer is the LAPIC at 250 Hz; PIT is only used for LAPIC calibration. FD table is per-process: `MikuVFS::fd_tables` is a `BTreeMap<pid, FdTable>`. `fork()` clones the parent table for the child; process exit drops the entry and dec_refs each held vnode. Per-process identity (`cwd`, `umask`, `uid`, `gid`, `euid`, `egid`) is stored on the `Process` struct and inherited atomically at `fork()`; `with_vfs()` syncs these into `vfs.ctx` on every entry.
+| Concept | Values |
+|:--|:--|
+| **Targets** | `SysInit`, `MultiUser`, `Graphical`, `Rescue` |
+| **Restart policies** | `Always`, `Never`, `OnFailure`, `OnSuccess`, `OnAbnormal` |
+| **Service entry** | A kernel `fn()` or an ELF binary path on disk |
+| **Extras** | Dependency graph, ordering, watchdogs, restart delays, masking, journal, timer units, socket activation, `.service` unit files |
+
+Services registered at boot: `kbd`, `shell`, `netd`, `usbd`, `bdflush`, `kswapd`.
+
+The `shell` service prefers `/bin/msh` (ring 3) when the root filesystem carries it, and falls back to the
+in-kernel shell otherwise. The choice is logged.
 
 ---
 
-### Network stack
+## Userspace
 
-<details>
-<summary><b>Network Card Drivers</b></summary>
+### Dynamic linking
 
-| Driver | Chip |
-|:--|:--|
-| **Intel E1000** | 82540EM, 82545EM, 82574L, 82579LM, I217 |
-| **Realtek RTL8139** | RTL8139 |
-| **Realtek RTL8168** | RTL8168, RTL8169 |
-| **VirtIO Net** | QEMU/KVM virtual network card |
+`ld-miku` is the dynamic loader: ELF64 parsing, `PT_LOAD` mapping, relocation processing (`RELA`,
+`JMPREL`, `GLOB_DAT`, `JUMP_SLOT`, `RELATIVE`), symbol resolution across libraries, `DT_NEEDED` dependency
+walking, TLS setup and a full auxv.
 
-</details>
+Ten shared libraries are preloaded into the VFS at `/lib` and served straight from kernel image memory
+without touching the page cache:
 
-<details>
-<summary><b>Protocols</b></summary>
+`core_miku`, `sys_miku`, `text_miku`, `ds_miku`, `algo_miku`, `codec_miku`, `fs_miku`, `net_miku`,
+`parse_miku`, `libc_miku`
 
-| Layer | Protocols |
-|:--|:--|
-| **L2** | Ethernet, ARP (with cache table, header validation) |
-| **L3** | IPv4, ICMP |
-| **L4** | UDP, TCP (listener + client, state machine, retransmits) |
-| **Application** | DHCP, DNS, NTP, HTTP/1.1, HTTP/2 (HPACK), Ping, Traceroute |
-| **Security** | TLS 1.2 / 1.3 (ECDHE + RSA + AES-GCM, constant-time) |
-| **Userspace sockets** | AF_INET/SOCK_STREAM via syscalls 56-59; `SOCK_FD_BASE=4096`; blocking TCP client with 30 s timeout; up to 64 sockets system-wide |
+Pages are shared between processes that map the same library; only writable segments are private.
 
-**netd** is a mikuD service registered at the `MultiUser` target. It runs automatic DHCP after link comes up, so the network is ready without any manual `dhcp` command.
+### `/bin/msh` - the userspace shell
 
-</details>
+A ring-3 shell built strictly on the syscall ABI, which is what keeps that ABI honest.
 
-<details>
-<summary><b>TLS 1.2 / 1.3: Complete Implementation from Scratch</b></summary>
+**Builtins:** `pwd`, `cd`, `ls`, `cat`, `stat`, `mkdir`, `rm`, `write`, `echo`, `wc`, `head`, `grep`,
+`uptime`, `date`, `stty`, `pid`, `help`, `exit`
 
-- ECDH: P-256 ECDHE key exchange (`tls_ecdh.rs`), constant-time Montgomery-style scalar multiplication (always-double-always-add + `cmov`)
-- RSA: ASN.1/DER certificate parsing, PKCS#1 v1.5 padding (`tls_rsa.rs`), RDRAND-sourced padding bytes
-- BigNum: custom big number implementation for RSA 2048-bit (`tls_bignum.rs`)
-- AES-GCM: authenticated symmetric encryption (`tls_gcm.rs`)
-- SHA-256, HMAC, HKDF: hashing, key derivation (`tls_crypto.rs`)
-- Handshake: ClientHello -> ServerHello -> Certificate -> [ECDHE] -> Finished (client + server Finished verify_data checked)
-- HTTP/2: RFC 7540 framing and RFC 7541 HPACK with correct Appendix B Huffman table (`http2.rs`)
-
-#### Security hardening
-
-| Concern | Mitigation |
-|:--|:--|
-| **RNG** | RDRAND-based CSPRNG for ClientHello random, CBC IV, ECDH private key, RSA padding (`random::random_u64`) |
-| **Timing (Lucky13)** | Constant-time MAC compare via OR-accumulator byte diff |
-| **Padding oracle** | Full RFC 5246 padding check - all pad bytes verified, not just the last |
-| **ECDH timing leak** | `fe_cmov` / `jac_cmov` XOR-mask constant-time field/point select |
-| **Server impersonation** | TLS 1.2 server Finished `verify_data = PRF(master, "server finished", hs_hash)` checked constant-time |
-| **PKCS#1 padding** | RDRAND-sourced non-zero padding bytes (rejection loop) |
-| **ARP spoofing** | hw_type / proto_type / hlen / plen checks before accepting ARP-IPv4 entries |
-
-</details>
-
----
-
-### VFS (virtual file system)
-
-<details>
-<summary><b>Expand</b></summary>
-
-#### Core features
-
-| Parameter | Value |
-|:--|:--|
-| **VNodes** | 256 |
-| **Open files** | 32 |
-| **Mount points** | 8 |
-| **Child nodes** | Dynamic (unlimited) |
-
-Child nodes are managed via a dynamic `Vec`-based hash map. Initial slot count is 16, automatically doubling at 75% utilization.
-
-- Node types: `Regular`, `Directory`, `Symlink`, `CharDevice`, `BlockDevice`, `Pipe`, `Fifo`, `Socket`
-- Full metadata: permissions, uid/gid, timestamps, size, nlinks
-
-#### System libraries
-
-At boot, `/lib` directory is created in tmpfs and `libmiku.so` is written as an immutable file.
-The immutable flag prevents unlink / write / rename.
-
-#### Cache
-
-| Cache | Size |
-|:--|:--|
-| **Page cache** | 128 pages x 512 bytes, LRU eviction |
-| **Dentry cache** | 128 entries, FNV32 hash |
-
-#### Navigation
-
-- Path walking: depth up to 32 components
-- Symlink resolution: loop protection (8 levels)
-- FNV32 hash: O(1) lookup by name
-
-#### Security
-
-- UNIX permission model: `owner/group/other`, `setuid/setgid/sticky`
-- Security labels (MAC), byte and inode quotas
-- File locking: shared/exclusive with deadlock detection (up to 16 locks)
-- Immutable flag: system library protection
-
-#### Advanced features
-
-| Feature | Details |
-|:--|:--|
-| **VFS journal** | 16 operation log entries |
-| **Xattr** | 8 extended attributes per node |
-| **Notify events** | inotify-like subsystem (up to 16 events) |
-| **Version store** | 16 file snapshots |
-| **CAS store** | Content-addressed deduplication (up to 16 objects) |
-| **Block I/O queue** | 8 async requests |
-
-</details>
-
----
-
-### File systems
-
-| FS | Mount Point | Description |
-|:--:|:--:|:--|
-| **tmpfs** | `/` | RAM-based root FS |
-| **devfs** | `/dev` | Devices: `null`, `zero`, `random`, `urandom`, `console`, plus raw block nodes `blkN` / `blkNpM` (major 8) |
-| **procfs** | `/proc` | `version`, `uptime`, `meminfo`, `mounts`, `cpuinfo`, `stat`, `heap`, `diskstats` |
-| **ext2** | `/mnt` | Full read-write to real disk |
-| **ext3** | `/mnt` | Journaling (JBD2) on top of ext2, delayed writes |
-| **ext4** | `/mnt` | Extent-based files + crc32c checksums |
-
----
-
-### MikuFS: ext2/3/4 driver
-
-<details>
-<summary><b>Expand</b></summary>
-
-#### Reading
-
-- Superblock, group descriptors, inodes, directory entries
-- Indirect blocks (single / double / triple)
-- Ext4 extent trees
-
-#### Writing
-
-- Create and delete files, directories, symbolic links
-- Bitmap allocator for blocks and inodes (with group priority)
-- Recursive deletion
-- Delayed writes (dirty cache + pdflush)
-
-#### Ext3 Journal (JBD2)
-
-- Journal creation (`ext2 -> ext3` conversion)
-- Transaction writing: descriptor blocks, commit blocks, revoke blocks
-- Recovery: replay incomplete transactions on mount
-- Delayed commit: accelerate journal writes via dirty cache
-
-#### mkfs
-
-- ext2/ext3/ext4 formatting
-- Lazy init: only group 0 metadata initialized immediately, rest deferred
-- Journal superblock only initialization (skip full block zeroing)
-
-#### Utilities
-
-- `fsck`, `tree`, `du`, `cp`, `mv`, `chmod`, `chown`, hard links
-
-</details>
-
----
-
-### NVIDIA GPU driver
-
-<details>
-<summary><b>Expand</b></summary>
-
-#### Overview
-
-MikuOS includes a native driver for NVIDIA GSP-era GPUs. Written from scratch
-in Rust without std, uses MMIO over HHDM.
-
-> Turing is the first NVIDIA generation with a GSP (GPU System Processor) on an embedded RISC-V core.
-> Without a signed GSP firmware blob, most engines are inaccessible.
-> The GTX 1650 (TU116/TU117) runs the full host-side probe + Falcon engine management + DMA loopback + GSP-RM staging.
-> Every other NVIDIA card (other Turing SKUs, Ampere, Ada, ...) is recognized and brought up host-side via the generic path.
-
-#### Supported GPUs
-
-**Full driver (embedded firmware, GSP-RM pipeline):**
-
-| Silicon | SKU | Device ID range |
-|:--|:--|:--|
-| **TU117** | GTX 1650 GDDR5 / GDDR6, Mobile/Max-Q | 0x1F82..0x1FBA |
-| **TU116** | GTX 1650 SUPER, GTX 1660 / 1660 Ti / 1660 SUPER | 0x2182..0x21C4 |
-
-**Generic host-side bring-up (recognition + diagnostics, no firmware):**
-
-Any NVIDIA GPU identified from PMC_BOOT_0 - the whole Turing / Ampere / Ada
-Lovelace lineup (and newer families, probed read-only with the Turing
-register map). Mapped, identified, MSI/VBIOS-probed, Falcon-liveness-checked,
-and registered in the generic GPU table (`nvidia list`). The GSP-RM offload
-pipeline stays gated behind a per-chip firmware bundle, which only TU116 ships.
-
-#### Module layout (nvidia/)
-
-| Module | Description |
-|:--|:--|
-| **mod.rs** | Root: probe entry, dispatch (gtx1650 vs generic), ACTIVE_GTX1650 global handle |
-| **pci.rs** | PCI scan (class 0x03 + vendor 0x10DE), BAR sizing |
-| **mmio.rs** | MMIO primitives: volatile r/w over HHDM |
-| **chip.rs** | Chip identification via PMC_BOOT_0; codenames for Turing/Ampere/Hopper/Ada |
-| **profile.rs** | Per-chip profile: Falcon engine base offsets + firmware capability |
-| **generic.rs** | Host-side bring-up for any NVIDIA GPU + the generic GPU registry |
-| **msi.rs** | PCI MSI / MSI-X capability walker |
-| **vbios.rs** | VBIOS image extraction from PCI expansion ROM |
-| **fb.rs** | Framebuffer: boot scanout detection, BAR index and offset |
-| **gtx1650/** | Full driver for GTX 1650 / 1660 (TU117 + TU116), the one chip with embedded firmware |
-
-#### GTX 1650 Driver (nvidia/gtx1650/)
-
-| Module | Description |
-|:--|:--|
-| **gsprm.rs** | GSP-RM staging: VRAM probe, WPR2 layout, radix3 page table, sysmem alloc |
-| **bootargs.rs** | GSP-RM boot arguments: libos init args, GSP_ARGUMENTS_CACHED, CMDQ/MSGQ shared region, FALCON_OS handoff |
-| **msgq.rs** | CMDQ/MSGQ ring buffer framing (host-producer + gsp-producer pages) |
-
-#### Chip architectures
-
-| Arch code | Family | Examples | Driver tier |
-|:--:|:--|:--|:--|
-| 0x16 | Turing | TU102, TU104, TU106, TU116 (0x8), TU117 (0x7) | TU116/TU117 full; others host-side |
-| 0x17 | Ampere | GA100, GA102, GA103, GA104, GA106, GA107 | host-side |
-| 0x18 | Hopper | GH100 | host-side |
-| 0x19 | Ada Lovelace | AD102, AD103, AD104, AD106, AD107 | host-side |
-| 0x1A/0x1B | Blackwell | GB10x / GB100 | host-side (read-only probe) |
-
-#### Falcon engines
-
-| Engine | Base offset | Description |
-|:--|:--|:--|
-| **SEC2** | PSEC_BASE | Security engine: ACR boot, HS ucode upload |
-| **GSP** | PGSP_BASE | GPU System Processor (RISC-V) |
-| **NVDEC** | PNVDEC_BASE | Video decoder |
-| **FECS** | PFECS_BASE | Front-end context switch |
-| **GPCCS0/1** | PGPCCS_BASE | GPC context switch |
-
-Liveness states: Alive, GatedPriSentinel, NoResponse, BadHwcfg.
-
-#### DMA Path (SEC2 loopback)
+**Shell features:** redirection `>` `>>` `<`, pipelines `|` (one forked process per stage), and a startup
+script at `/etc/msh.rc`.
 
 ```
-1. DmaBuffer::alloc(pages) - physically contiguous pages from PMM
-2. Fill pattern (0xCAFE_xxxx) + write_barrier (sfence)
-3. Program SEC2 TRANSCFG[7]: NoncoherentSysmem + Physical addressing
-4. Set FBIF_CTL.ALLOW_PHYS_NO_CTX
-5. Engine::dma_load: sysmem -> SEC2 DMEM/IMEM (256 B chunk, ctxdma=7)
-6. PIO readback via FALCON_DMEM_C0/D0 (or IMEM_C0/D0)
-7. Pattern verification + TRANSCFG restore
-```
-
-#### Firmware bundle (TU116)
-
-| Blob | Engine | Container |
-|:--|:--|:--|
-| acr/bl.bin | SEC2 | NVFW v1 |
-| acr/ucode_ahesasc.bin | SEC2 | NVFW v1 |
-| gsp/booter_load.bin | GSP | NVFW v1 |
-| gsp/booter_unload.bin | GSP | NVFW v1 |
-| nvdec/scrubber.bin | NVDEC | NVFW v1 |
-| fecs/ucode.bin | FECS | raw |
-| gpccs/ucode.bin | GPCCS | raw |
-
-All blobs are embedded into the kernel via include_bytes! at compile time.
-The GSP-RM image (gsp_t.bin) is NOT included - requires NVIDIA open-kernel-modules.
-
-#### Driver bring-up roadmap
-
-| Step | Status | Description |
-|:--:|:--:|:--|
-| 1 | done | PCI bind + BAR0 mapped |
-| 2 | done | Chip identification (PMC_BOOT_0) |
-| 3 | done | Firmware bundle embedded |
-| 4 | done | SEC2 / GSP falcon alive probe |
-| 5 | done | FBIF scan + TRANSCFG decode |
-| 6 | done | DMA loopback (DMEM + IMEM) |
-| 7 | wip | SEC2 ACR first-contact (`sec2::attempt_acr` / `_v2`); full WPR2 lock pending |
-| 8 | wip | NVDEC scrubber first-contact (`nvdec::attempt_scrub`); full scrub-descriptor staging pending |
-| 9 | wip | GSP-RM staging (`gsprm`) + full boot orchestrator (`gsprm::boot`, `nvidia gsp-rm-boot-full`): scrub->load->ACR->WPR2->booter->MSGQ handshake. GSP-RM blob embedded. Boot args wired (`bootargs::GspBootArgs`): libos table, CMDQ/MSGQ shared region, MAILBOX0/1 handoff, FALCON_OS set to app_version. One gate remains: ACR WPR2 lock (needs `RM_FLCN_ACR_DESC` in SEC2 DMEM) |
-| 10 | - | FECS/GPCCS contexts, PGRAPH usable |
-| - | done | PTHERM on-die temperature read-out (`nvidia temp`) |
-
-</details>
-
----
-
-### Block layer and storage drivers
-
-<details>
-<summary><b>Block layer</b></summary>
-
-#### Overview
-
-The block layer is the single routing point between filesystems and storage drivers, modelled on Linux's generic block layer. Concrete drivers are registered once behind a stable `BlockDevId`; nothing above this layer holds a driver directly.
-
-| Parameter | Value |
-|:--|:--|
-| **Device IDs** | 0-3: legacy ATA slots; 4-7: PCI block devices (AHCI, NVMe, virtio-blk) |
-| **Max devices** | 8 |
-| **I/O accounting** | BIO queue with submitted / completed / error counters |
-| **Locking** | Per-device slot mutex; ATA slots share a bus lock; PCI devices are fully parallel |
-| **Retries** | Transient errors (timeout/fault) get up to 2 transparent re-issues; per-device error/retry counters |
-| **Failfast state** | Per-device Online/Degraded/Offline (SCSI-style); 8 consecutive post-retry failures take a device Offline and it fails fast instead of hanging on timeouts. `blkonline <drive>` resets it; state shown in `blkstat` and `/proc/diskstats` |
-| **FUA barriers** | `block::write_barrier` commits with Force Unit Access (NVMe FUA bit, ATA WRITE DMA FUA EXT) for the ext3/4 journal commit; non-FUA backends fall back to write-plus-flush |
-| **partprobe** | `/dev/blkNpM` partition nodes are rescannable from the GPT at runtime (`partprobe`), no reboot needed |
-| **Latency** | Per-request TSC timing; `blkstat` shows average I/O latency (iostat `await`) |
-
-#### API
-
-| Function | Description |
-|:--|:--|
-| `block::probe()` | PCI bus walk: registers AHCI ports, virtio-blk and NVMe controllers into IDs 4-7 |
-| `block::read(dev, lba, count, buf)` | Cached read; sequential misses trigger read-ahead |
-| `block::write(dev, lba, count, buf)` | Write-back: lands in cache, written to disk on flush/eviction |
-| `block::write_sync(dev, lba, count, buf)` | Write-through: device write completes before return (journals, GPT, swap) |
-| `block::flush(dev)` | Drain dirty cache (elevator-ordered) + flush device write cache |
-| `block::discard(dev, lba, count)` | Discard/TRIM a sector range; fully covered cache chunks (dirty included) are dropped before the device command |
-| `block::write_zeroes(dev, lba, count)` | Zero a range; NVMe/virtio native Write Zeroes for the aligned middle, regular writes on the edges, zero-filled-write fallback |
-| `MikuFS::trim_free_blocks(minlen)` | FITRIM: walks the mounted fs's group bitmaps and discards free-block runs (the `fstrim` command); `mkfs.*` pre-discards the whole target region |
-| `block::info(dev)` | Geometry / identity for a device (includes the `discard` capability flag) |
-| `block::cache_stats()` | `(hits, misses, readaheads, write_merges, dirty)` |
-| `block::io_stats()` | `(submitted, completed, errors)` from the BIO queue |
-| `block::dev_stats(dev)` | `(kind, sectors_read, sectors_written, sectors_discarded, ios, avg_io_us)` per device |
-| `block::health(dev)` | SMART / NVMe health snapshot; `None` if the backend has no health source |
-
-#### Buffer cache
-
-| Parameter | Value |
-|:--|:--|
-| **Granularity** | 4 KiB chunks (8 sectors per chunk) |
-| **Capacity** | 512 chunks × 4 KiB = **2 MiB** |
-| **Organization** | 8-way set-associative, 64 sets, per-set LRU |
-| **Policy** | Write-back; `write_sync` is write-through for ordered writes |
-| **Read-ahead** | Adaptive: 32 KiB for a fresh sequential stream, ramping to 64 KiB (16 chunks) when sustained |
-| **Dirty limit** | Flush triggered at 256 dirty chunks (high-water mark) |
-| **Write merging** | Adjacent dirty chunks coalesce into one driver command of up to 64 KiB during writeback |
-| **bdflush** | Background mikuD service: sweeps dirty chunks to disk every 2 s (ascending-LBA elevator pass) |
-| **Coherence** | All kernel disk accesses go through `crate::block`; no second path |
-
-</details>
-
-<details>
-<summary><b>Storage drivers</b></summary>
-
-#### AHCI (SATA)
-
-| Parameter | Value |
-|:--|:--|
-| **PCI class** | 01.06 (Mass Storage / SATA AHCI) |
-| **Registers** | BAR5 (ABAR) MMIO, mapped uncached through HHDM |
-| **Max ports** | 4 SATA disks per probe |
-| **Commands** | READ DMA EXT, WRITE DMA EXT, FLUSH CACHE EXT, IDENTIFY, DATA SET MANAGEMENT (TRIM) |
-| **Completion** | Polled PxCI |
-| **Buffer** | 64 KiB bounce buffer, single PRD entry |
-| **TRIM** | Capability from IDENTIFY word 169; 8-byte range entries, 64 per 512-byte block |
-
-#### NVMe
-
-| Parameter | Value |
-|:--|:--|
-| **Queues** | 1 admin queue pair (depth 16) + **4 I/O queue pairs (depth 64)** routed per-CPU with per-queue locks - several CPUs submit/poll in parallel (blk-mq) |
-| **Transfer** | Up to 128 sectors (64 KiB) per command via PRP1 + PRP list page |
-| **Completion** | Polled CQ phase bit |
-| **Memory** | One page-aligned allocation: admin SQ/CQ, I/O SQ/CQ, PRP list, IDENTIFY buffer, bounce |
-| **Opcodes** | NVM READ (0x02), NVM WRITE (0x01), NVM FLUSH (0x00), NVM DSM (0x09, deallocate = discard) |
-| **Discard** | Dataset Management with the deallocate attribute; capability from ONCS bit 2 |
-| **Write Zeroes** | Write Zeroes command (opcode 0x08); capability from ONCS bit 3 |
-| **Health** | Get Log Page (LID 0x02) - SMART / Health Information (512 bytes): temp, wear, POH, lifetime R/W |
-
-#### virtio-blk (legacy/transitional)
-
-| Parameter | Value |
-|:--|:--|
-| **Transport** | Legacy virtio-pci, port I/O (BAR0) |
-| **Ring** | Layout computed at runtime from device-reported queue size |
-| **Max queue** | 256 descriptors |
-| **Transfer** | Up to 128 sectors (64 KiB) per request; larger transfers chunked by block layer |
-| **Features** | FLUSH (bit 9), DISCARD (bit 13) and WRITE_ZEROES (bit 14) negotiated; discards/zeroes capped at the device's `max_discard_sectors` / `max_write_zeroes_sectors` |
-
-#### ATA (legacy PIO)
-
-| Parameter | Value |
-|:--|:--|
-| **Mode** | PIO (Programmed I/O) |
-| **Operations** | Sector read/write (512 bytes), up to 255 sectors/command |
-| **Disks** | 4: Primary/Secondary × Master/Slave (IDs 0-3) |
-| **Protection** | Cache flush after write, 50K iteration timeout |
-| **Addressing** | LBA28 (up to 128 GB) + **LBA48** (READ/WRITE EXT, 48-bit addressing) |
-| **DMA** | Bus-master DMA capability detection and state tracking |
-| **TRIM** | DATA SET MANAGEMENT, range payload via bus-master DMA; capability from IDENTIFY word 169 |
-| **Health** | SMART RETURN STATUS (cmd 0xB0/feature 0xDA): LBA mid/high signature reports healthy vs. failing |
-
-</details>
-
----
-
-## Build and Run
-
-### Required tools
-
-| Tool | Purpose |
-|:--|:--|
-| **Rust nightly** | `no_std` + unstable compiler features |
-| **QEMU** | x86_64 machine emulation |
-| **grub-mkrescue** | Create bootable ISO |
-| **GCC** | libmiku stub generation + C program compilation |
-| **e2tools** | File copy to ext4 image |
-| **Cargo** | Kernel build |
-
-### Running
-
-```bash
-git clone https://github.com/alunwrd/miku-os
-cd miku-os/builder
-cargo run
-```
-
-The builder handles everything automatically:
-
-```
-RAM saving mode? (y/N)
-[1/7] Compile ld-miku.so
-[2/7] Compile libmiku.so
-[3/7] Compile miku-os kernel
-[4/7] Create file structure
-[5/7] Generate system image (miku-os.iso)
-[6/7] Prepare disk
-[7/7] Launch QEMU (optional (y/N))
+$ cat /p.txt | wc
+3 3 14
+$ ls /bin | grep msh
+msh
 ```
 
 ### Building userspace programs
 
 ```bash
 cd src/lib/userspace
-./build.sh hello         # build + copy to disk
-./build.sh test_full     # test suite
-./build.sh               # all binaries
+cargo +nightly build --release --target x86_64-miku-app.json \
+    -Z json-target-spec -Z build-std=core \
+    -Z build-std-features=compiler-builtins-mem --bin msh
+```
+
+The builder does this automatically and stages the binaries into `/bin` on the root image.
+
+---
+
+## In-kernel shell
+
+Still the larger of the two shells, because these commands reach into kernel internals that have no
+syscall yet. Roughly 190 commands, including:
+
+- **Files** - `ls`, `cat`, `cd`, `cp`, `mv`, `rm`, `mkdir`, `tree`, `du`, `stat`, `ln`, `chmod`, `chattr`
+- **ext (version-agnostic)** - `extls`, `extcat`, `extwrite`, `extfsck`, `extinfo`, `extsync`, … plus the
+  `ext2*` / `ext3*` / `ext4*` families
+- **Mounting** - `mount`, `umount`, `fs.list`, `fs.select`, `partprobe`, `gpt`, `mkfs.ext2/3/4`
+- **Storage** - `blkstat`, `blkdiscard`, `blkzero`, `smart`, `fstrim`, `fiemap`, `nvmestress`
+- **Swap** - `mkswap`, `swapon`, `swapoff`, `swapinfo`
+- **Processes** - `ps`, `top`, `kill`, `nice`, `affinity`, `exec`
+- **Services** - `sv start|stop|restart|status|enable|disable|mask|journal|timer|analyze`
+- **Network** - `net`, `ping`, `dhcp`, `ntp`, `wget`, `curl`, `fetch`, `traceroute`, `socket`
+- **Linking** - `ldd`, `ldconfig`, `load`
+- **GPU** - `nvidia` subcommands
+- **System** - `info`, `heap`, `memmap`, `history`, `reboot`, `poweroff`
+
+---
+
+## NVIDIA GPU driver
+
+Bring-up work in progress - not a display driver.
+
+| Chip family | Target | State |
+|:--|:--|:--|
+| TU116 / TU117 (Turing) | GTX 1650 / 1660 | Falcon bring-up, FWSEC, ACR, SEC2, GSP-RM boot args, message queues |
+| GB206 (Blackwell) | RTX 5060 / 5060 Ti | FSP, FMC, GSP bootloader path |
+
+Module layout (`kernel/drivers/gpu/nvidia/`): `pci`, `mmio`, `chip`, `vbios`, `reset`, `msi`, `fb`,
+`profile`, `generic`, a shared `gsp_common/` (RPC, sysinfo) and per-chip `gtx1650/` and `rtx5060/`.
+
+Firmware is not embedded in the kernel. It is staged into a `/lib/firmware` tree, packed into an ext2
+image, handed to the kernel as a GRUB module and mounted on demand - so a single ISO carries kernel and
+firmware without needing a second disk.
+
+---
+
+## Build and run
+
+### Requirements
+
+| Tool | Purpose |
+|:--|:--|
+| Rust nightly + `rust-src` | `build-std` for the bare-metal target |
+| `grub-mkrescue`, `xorriso`, `mtools` | ISO creation |
+| `qemu-system-x86_64` | Running |
+| `e2fsprogs` (`mke2fs`, `debugfs`) | Root image and firmware staging |
+
+### Build everything
+
+```bash
+cd builder
+cargo run
+```
+
+The builder builds `ld-miku`, the miku libraries, the userspace programs and the kernel (release), creates
+the ISO, provisions `disk.img` with `/lib/firmware` and `/bin`, and can launch QEMU.
+
+### Run by hand
+
+```bash
+qemu-system-x86_64 \
+  -boot d -cdrom miku-os/miku-os.iso \
+  -drive file=miku-os/disk.img,format=raw,if=none,id=disk0,cache=unsafe,aio=threads \
+  -device ide-hd,drive=disk0,bus=ide.0,unit=1 \
+  -serial stdio -display gtk -m 4G -smp 4 \
+  -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0
+```
+
+### Write to a USB stick
+
+```bash
+sudo dd if=miku-os/miku-os.iso of=/dev/sdX bs=4M status=progress conv=fdatasync
 ```
 
 ---
 
-## MikuOS ABI
+## Repository layout
 
-Complete documentation for developing userspace programs: [MikuOS_ABI.md](docs/MikuOS_ABI.md)
-
----
-
-### Shell commands
-
-#### Service management (sv)
-
-| Command | Description |
-|:--|:--|
-| `sv list` | List all services |
-| `sv status <name>` | Detailed service status |
-| `sv start/stop/restart <name>` | Service lifecycle |
-| `sv reload <name>` | Send SIGHUP |
-| `sv enable/disable <name>` | Enable/disable |
-| `sv mask/unmask <name>` | Mask/unmask |
-| `sv force-stop <name>` | Force kill |
-| `sv journal [name]` | Event log |
-| `sv target [name]` | Target management |
-| `sv analyze` | Boot analysis |
-| `sv tree/rdeps <name>` | Dependency info |
-| `sv load/scan` | Unit file management |
-| `sv timer list/start/stop` | Timer management |
-
-#### Unified ext Commands (auto-detects mounted FS version)
-
-| Command | Syntax | Description |
-|:--|:--|:--|
-| `ext2mount` | `ext2mount [drive]` | Mount ext2 |
-| `ext3mount` | `ext3mount [drive]` | Mount ext3 |
-| `ext4mount` | `ext4mount [drive]` | Mount ext4 |
-| `extls` | `extls [path]` | Directory listing |
-| `extcat` | `extcat <path>` | File contents |
-| `extstat` | `extstat <path>` | Inode details |
-| `extinfo` | `extinfo` | Superblock info |
-| `extwrite` | `extwrite <path> <text>` | Write to file |
-| `extappend` | `extappend <path> <text>` | Append to file |
-| `exttouch` | `exttouch <path>` | Create empty file |
-| `extmkdir` | `extmkdir <path>` | Create directory |
-| `extrm` | `extrm [-rf] <path>` | Delete file |
-| `extrmdir` | `extrmdir <path>` | Delete empty directory |
-| `extmv` | `extmv <path> <newname>` | Rename file |
-| `extcp` | `extcp <src> <dst>` | Copy file |
-| `extln -s` | `extln -s <target> <link>` | Create symbolic link |
-| `extlink` | `extlink <existing> <link>` | Create hard link |
-| `extchmod` | `extchmod <mode> <path>` | Change permissions |
-| `extchown` | `extchown <uid> <gid> <path>` | Change owner |
-| `extdu` | `extdu [path]` | Disk usage |
-| `exttree` | `exttree [path]` | Directory tree |
-| `extfsck` | `extfsck` | FS integrity check |
-| `extcache` | `extcache` | Block cache statistics |
-| `extcacheflush` | `extcacheflush` | Flush cache |
-| `extsync` / `sync` | `sync` | Write to disk |
-
-> Legacy commands (`ext2ls`, `ext3cat`, `ext4write`, etc.) are kept for backward compatibility.
-
-#### VFS Commands
-
-| Command | Description |
-|:--|:--|
-| `ls [path]` | Directory listing (ext + VFS combined view) |
-| `cd <path>` | Change directory |
-| `pwd` | Print current path |
-| `mkdir <path>` | Create directory |
-| `touch <path>` | Create file (RAM) |
-| `cat <path>` | File contents |
-| `write <path> <text>` | Write to file (RAM) |
-| `dd if= of= [bs= count= skip= seek= conv=notrunc,fsync]` | Copy blocks between files, `/dev/zero` and raw `/dev/blkN` nodes |
-| `rm [-rf] <path>` | Delete file/directory |
-| `rmdir <path>` | Delete directory (ext compatible) |
-| `mv <old> <new>` | Rename |
-| `stat <path>` | File info |
-| `chmod <mode> <path>` | Change permissions |
-| `df` | File system info |
-
-#### Dynamic linking commands
-
-| Command | Description |
-|:--|:--|
-| `exec <path> [args]` | Run ELF binary (with dynamic linking) |
-| `ldconfig` | Update shared library cache |
-| `ldd` | List cached libraries |
-
-#### Process management
-
-| Command | Description |
-|:--|:--|
-| `ps` | List all processes |
-| `top` | Live process monitor |
-| `kill <pid>` | Kill process by PID |
-| `nice <pid> <prio>` | Change process priority (1-20) |
-| `affinity <pid> <mask>` | Set CPU affinity mask |
-| `swaptest` | Stress-test the swap subsystem |
-
-#### NVIDIA GPU Commands
-
-| Command | Description |
-|:--|:--|
-| `nvidia` / `nvidia info` | GPU summary: PCI, chip, BAR0/1/3, PTIMER, MSI, scanout |
-| `nvidia debug` | Full BAR0 register dump (PMC, PBUS, PFIFO, PTOP, PTIMER) |
-| `nvidia firmware` | List embedded TU116 blobs with NVFW headers |
-| `nvidia falcon` | Per-engine liveness: SEC2, GSP, NVDEC, FECS, GPCCS0/1 |
-| `nvidia ungate` | Set PMC_ENABLE.GR + CE0 (bring up FECS / GPCCS / CE0) |
-| `nvidia pmc-scan` | Read-only sweep of PMC area (0x000..0x1000) |
-| `nvidia dma-state` | Per-engine DMATRF register snapshot + IDLE/ERROR status |
-| `nvidia fbif-scan` | Sweep FBIF window (+0x500..+0xa00) per live engine |
-| `nvidia fbif-decode` | Decode all 8 TRANSCFG slots per live engine |
-| `nvidia dma-test` | End-to-end DMA loopback: sysmem -> SEC2 DMEM (256 B, CAFE pattern) |
-| `nvidia imem-test` | IMEM variant DMA loopback: sysmem -> SEC2 IMEM |
-| `nvidia acr-info` | Structural dump of each SEC2 ACR blob (NVFW container + HS headers) |
-| `nvidia gsp` | GSP first-contact boot via gsp::attempt_boot |
-| `nvidia gsp-rm` / `gsprm` | Prepare GSP-RM staging (VRAM probe, WPR2 layout, sysmem alloc) |
-| `nvidia gsp-rm-dryrun` | Build the radix3 page table and verify chain integrity |
-| `nvidia gsp-rm-load` | Stage signed GSP-RM blob into WPR2 (MissingFirmware if absent) |
-| `nvidia gsp-rm-boot` | Kick the GSP booter HS image and watch the result |
-| `nvidia gsp-bootargs` / `bootargs` | Build + verify libos/rmargs/CMDQ-MSGQ boot args in sysmem (no Falcon kick) |
-| `nvidia sec2-acr` / `sec2-acr-v2` | SEC2 ACR first-contact boot (ahesasc upload + bl kick) |
-| `nvidia wpr-state` | Dump current WPR / WPR2 register state |
-| `nvidia msgq` | CMDQ/MSGQ ring self-test (host-side framing only) |
-| `nvidia rpc` | GSP-RM RPC header framing self-test |
-| `nvidia temp` | PTHERM on-die temperature + slowdown/shutdown thresholds |
-| `nvidia next` | Inspect live state, prescribe next driver bring-up step |
-| `nvidia splash` | Redraw boot splash via framebuffer |
-
-#### System commands
-
-| Command | Description |
-|:--|:--|
-| `poweroff` / `shutdown` / `halt` | Graceful shutdown via mikuD |
-| `reboot` / `restart` | Graceful reboot via mikuD |
-| `info` | System information |
-| `memmap` | Physical memory map |
-| `heap` | Heap statistics |
-| `clear` | Clear screen |
-| `echo <text>` | Print text |
-| `history` | Command history |
-| `help` | Command list |
-
-#### mkfs / disk / swap commands
-
-| Command | Description |
-|:--|:--|
-| `mkfs.ext2 <drive>` | Format ext2 |
-| `mkfs.ext3 <drive>` | Format ext3 (with journal) |
-| `mkfs.ext4 <drive>` | Format ext4 (extents + journal) |
-| `blkstat` | Show all block devices (ATA/AHCI/NVMe/virtio-blk) + GPT partition tree + BIO queue + cache stats |
-| `blkdiscard <drive> [lba count]` | Discard/TRIM a sector range (whole device when no range given); blkdiscard(8) analogue |
-| `blkzero <drive> <lba> <count>` | Zero a sector range (NVMe/virtio Write Zeroes, zero-filled-write fallback) |
-| `fstrim` | Discard all free blocks of the active mounted ext filesystem by walking the group bitmaps; fstrim(8) analogue |
-| `blkonline <drive>` | Bring a device taken offline by failfast back online (clears the error run) |
-| `smart <drive>` | SMART / NVMe health report: status, temperature, wear, power-on hours, lifetime R/W |
-| `mkfs.dry <drive> <ext2\|ext3\|ext4>` | Dry-run format (layout only) |
-| `gpt <drive>` | Show GPT partition table |
-| `gpt.init <drive>` | Initialize empty GPT |
-| `gpt.add <drive> <partition spec>` | Add partition |
-| `gpt.del <drive> <partition>` | Delete partition |
-| `partprobe [drive]` | Re-read GPT and refresh `/dev/blkNpM` nodes at runtime (partprobe(8)) |
-| `mkswap <drive> <partition>` | Create swap area on partition |
-| `swapon <drive> <partition>` | Activate swap |
-| `swapon.raw <drive> <start> <size>` | Activate raw-range swap |
-| `swapon.auto` | Auto-discover and activate swap partitions |
-| `swapoff` | Deactivate swap |
-| `swapinfo` | Show swap usage |
-| `mkswap.raw <drive> <start> <size>` | Create raw swap without GPT |
-
-#### Extended attributes / flags
-
-| Command | Description |
-|:--|:--|
-| `getxattr <path> <name>` | Read user xattr |
-| `setxattr <path> <name> <value>` | Write user xattr |
-| `listxattr <path>` | List all xattrs |
-| `chattr <+/-flags> <path>` | Set file flags (i=immutable, a=append, d=nodump, A=noatime) |
-| `lsattr <path>` | List file flags |
-| `fiemap <path>` | Show file extent map (ext4) |
-
-#### Networking
-
-| Command | Description |
-|:--|:--|
-| `net <subcmd>` | Network status / config |
-| `dhcp` | Request lease via DHCP |
-| `ping <ip\|host> [count]` | ICMP echo (resolves via DNS) |
-| `ntp [server]` | Sync clock via NTP |
-| `traceroute` / `tr <host>` | UDP/ICMP route tracing |
-| `fetch <url\|host> [port]` | Minimal HTTP/HTTPS client |
-| `wget <url> [-O <file>]` | Download over HTTP(S) |
-| `curl <url> [-X GET\|POST] [-d <data>] [-o <file>] [-I]` | HTTP(S) client |
+```
+kernel/                 kernel sources
+  arch/x86_64/          boot entry, GDT, IDT, APIC, ACPI, SMP, RTC, per-CPU, serial
+  mm/                   pmm, vmm, heap, mmap, swap, kernel stacks
+  sched/                CFS scheduler, run queues, lifecycle, workers
+  process/              Process, ELF loader, dynamic linking, signals
+  syscall/              dispatch, adapters, usercopy, errno
+  fs/                   VFS, ext2/3/4, tmpfs, devfs, procfs, mkfs, GPT
+  io/                   block layer, console, framebuffer, input
+  net/                  Ethernet through TLS
+  drivers/              block, bus (PCI), net, input (PS/2, USB), gpu (NVIDIA)
+  mikud/                init daemon
+  shell/                in-kernel shell
+  kcore/                boot state, clock, firmware, locks, power, RNG, time
+src/lib/                userspace
+  ld_miku/              dynamic loader
+  libmiku/, mikulibs/   standard library sources and per-domain libraries
+  userspace/            ring-3 programs (msh, hello, tests)
+builder/                build orchestration and ISO/disk provisioning
+docs/                   translations, ABI reference, GPU notes
+```
 
 ---
 
 ## Author
 
-<div align="center">
-  <a href="https://github.com/alunwrd">
-    <img src="https://github.com/alunwrd.png" width="100" style="border-radius:50%;" alt="alunwrd">
-  </a>
-  <br><br>
-  <a href="https://github.com/alunwrd"><b>@alunwrd</b></a>
-  <br>
-  <sub>Author and sole developer of Miku OS</sub>
-  <br>
-  <sub>Kernel - VFS - MikuFS - ELF - ld-miku - libmiku - Shell - Network - TLS - Scheduler - PMM - VMM - Swap - mikuD - Signals - fork/exec - ACPI - APIC - SMP - NVIDIA GPU Driver - Block Layer - AHCI/NVMe/virtio-blk</sub>
-</div>
+**alunwrd** - [github.com/alunwrd](https://github.com/alunwrd)
 
----
+Written in Rust, from scratch, by one person.
 
-## From the Author
+## License
 
-Enjoy using it :)
-
-<div align="center">
-
-**Miku OS** - A pure OS written from scratch in Rust
-
-*With love*
-
-<img src="https://raw.githubusercontent.com/alunwrd/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
+MIT - see [LICENSE](../LICENSE).

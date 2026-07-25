@@ -1,62 +1,155 @@
 name: Miku OS Release
+
 on:
   push:
     tags:
       - "v*"
+
 permissions:
   contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_NIGHTLY: nightly-2026-06-08
+
 jobs:
   build-release:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xorriso mtools grub-pc-bin grub-efi-amd64-bin git make gcc nasm
+          sudo apt-get install -y \
+            xorriso mtools grub-pc-bin grub-efi-amd64-bin grub-common \
+            qemu-system-x86 e2fsprogs
 
-      - name: Install Rust Nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_NIGHTLY }}
           components: rust-src, llvm-tools-preview
 
-      - name: Build ld-miku.so
-        run: |
-          if [ -d "ld-miku" ]; then
-            cd ld-miku
-            LD_SCRIPT="$(pwd)/ld_link.ld"
-            export RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-z -C link-arg=noexecstack -C link-arg=-z -C link-arg=now -C link-arg=--no-dynamic-linker -C link-arg=-T${LD_SCRIPT} -C no-redzone=y"
-            cargo +nightly build --release --target x86_64-miku-ldso.json -Z json-target-spec -Z build-std=core -Z build-std-features=compiler-builtins-mem
-            mkdir -p ../src/lib/ld_miku
-            cp ../target/x86_64-miku-ldso/release/ld-miku ../src/lib/ld_miku/ld-miku.bin
-          fi
+      - name: Cargo cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: "miku-os-release"
+          workspaces: |
+            .
+            ld-miku
+            mikulibs
+            src/lib/userspace
 
-      - name: Build libmiku.so
+      - name: Build ld-miku
         run: |
-          if [ -d "libmiku" ]; then
-            cd libmiku
-            export RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-z -C link-arg=noexecstack -C link-arg=-z -C link-arg=now -C link-arg=--no-dynamic-linker -C link-arg=--export-dynamic -C link-arg=--hash-style=both -C no-redzone=y"
-            cargo +nightly build --release --target x86_64-miku-lib.json -Z json-target-spec -Z build-std=core -Z build-std-features=compiler-builtins-mem
-            mkdir -p ../src/lib/libmiku
-            cp target/x86_64-miku-lib/release/libmiku ../src/lib/libmiku/libmiku.so
-          fi
+          cd ld-miku
+          LD_SCRIPT="$(pwd)/ld_link.ld"
+          export RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie \
+            -C link-arg=-z -C link-arg=noexecstack -C link-arg=-z -C link-arg=now \
+            -C link-arg=--no-dynamic-linker -C link-arg=-T${LD_SCRIPT} -C no-redzone=y"
+          cargo build --release --target x86_64-miku-ldso.json \
+            -Z json-target-spec -Z build-std=core \
+            -Z build-std-features=compiler-builtins-mem
+          mkdir -p ../src/lib/ld_miku
+          cp ../target/x86_64-miku-ldso/release/ld-miku ../src/lib/ld_miku/ld-miku.bin
 
-      - name: Build Kernel
+      - name: Build miku libraries
+        run: |
+          cd mikulibs
+          export RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie \
+            -C link-arg=-z -C link-arg=noexecstack -C link-arg=-z -C link-arg=now \
+            -C link-arg=--no-dynamic-linker -C link-arg=--hash-style=both \
+            -C no-redzone=y"
+          cargo build --release --target x86_64-miku-lib.json \
+            -Z json-target-spec -Z build-std=core \
+            -Z build-std-features=compiler-builtins-mem
+          cd ..
+          mkdir -p src/lib/mikulibs/libs
+          grep -vE '^\s*(#|$)' src/lib/mikulibs/libs.list | cut -d: -f1 | tr -d ' ' | \
+          while read -r lib; do
+            cp "mikulibs/target/x86_64-miku-lib/release/$lib" "src/lib/mikulibs/libs/$lib.so"
+            echo "[ok] $lib.so"
+          done
+
+      - name: Build userspace programs
+        run: |
+          cd src/lib/userspace
+          export RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie \
+            -C link-arg=-z -C link-arg=noexecstack -C no-redzone=y"
+          cargo build --release --target x86_64-miku-app.json \
+            -Z json-target-spec -Z build-std=core \
+            -Z build-std-features=compiler-builtins-mem \
+            --bin msh --bin hello
+
+      - name: Build kernel
         run: |
           export RUSTFLAGS="-C relocation-model=static -C link-arg=-Tlinker.ld -C link-arg=--no-dynamic-linker"
-          cargo build --target x86_64-unknown-none -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem
+          cargo build --release --target x86_64-unknown-none \
+            -Z build-std=core,compiler_builtins,alloc \
+            -Z build-std-features=compiler-builtins-mem
 
       - name: Create ISO
         run: |
           mkdir -p iso_root/boot/grub
-          cp target/x86_64-unknown-none/debug/miku-os-release iso_root/boot/kernel.elf
-          printf 'set timeout=-1\nset default=0\nmenuentry "Miku OS" {\n    multiboot2 /boot/kernel.elf\n    boot\n}\n' > iso_root/boot/grub/grub.cfg
+          cp target/x86_64-unknown-none/release/miku-os-release iso_root/boot/kernel.elf
+          cat > iso_root/boot/grub/grub.cfg <<'CFG'
+          set timeout=5
+          set default=0
+
+          menuentry "Miku OS" {
+              insmod all_video
+              set gfxpayload=keep
+              multiboot2 /boot/kernel.elf
+              boot
+          }
+          CFG
           grub-mkrescue -o miku-os.iso iso_root
+          ls -la miku-os.iso
+
+      - name: Create root disk
+        run: |
+          mkdir -p root/bin root/etc
+          cp src/lib/userspace/target/x86_64-miku-app/release/msh root/bin/
+          cp src/lib/userspace/target/x86_64-miku-app/release/hello root/bin/
+          printf '# msh startup script\ndate\nuptime\n' > root/etc/msh.rc
+          dd if=/dev/zero of=disk.img bs=1M count=128 status=none
+          mke2fs -t ext4 -F -q -d root disk.img
+          ls -la disk.img
 
       - name: Publish
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          files: miku-os.iso
+          files: |
+            miku-os.iso
+            disk.img
           fail_on_unmatched_files: true
           generate_release_notes: true
+          body: |
+            ## Miku OS ${{ github.ref_name }}
+
+            **Files**
+            - `miku-os.iso` - bootable image (BIOS and UEFI)
+            - `disk.img` - 128 MiB ext4 root carrying `/bin/msh`, the ring-3 shell
+
+            **Running**
+            ```bash
+            qemu-system-x86_64 -boot d -cdrom miku-os.iso \
+              -drive file=disk.img,format=raw,if=none,id=disk0 \
+              -device ide-hd,drive=disk0,bus=ide.0,unit=1 \
+              -serial stdio -m 2G -smp 4
+            ```
+            Or write the ISO to a USB stick:
+            ```bash
+            sudo dd if=miku-os.iso of=/dev/sdX bs=4M status=progress conv=fdatasync
+            ```
+
+            **NVIDIA firmware is not included.** The GSP/FWSEC/ACR blobs are
+            NVIDIA's to distribute, so they are not kept in this repository and
+            not shipped here. The system boots without them and reports
+            `firmware unavailable`; see
+            `kernel/drivers/gpu/nvidia/firmware/README.md` for how to add them
+            to a local build.
+
+            Both images were booted in QEMU (1 and 4 CPUs) before publishing.

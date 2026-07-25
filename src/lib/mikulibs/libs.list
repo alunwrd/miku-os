@@ -1,0 +1,22 @@
+# Single source of truth for the split miku libraries.
+#
+# Format:  <library>: <dependency> <dependency> ...
+# Consumed by:
+#   - mikulibs/build.rs          (link stubs, DT_NEEDED, shim regeneration)
+#   - src/lib/userspace/build.rs (app link stubs)
+#   - builder/src/main.rs        (build + copy of the .so files)
+#   - build.rs (kernel root)     (generates ldso MIKU_LIBS table)
+#
+# The dependency graph must stay acyclic; mikulibs/build.rs fails the
+# build on cycles, missing roots, or roots missing from this list.
+
+core_miku:
+sys_miku:   core_miku
+text_miku:  core_miku
+ds_miku:    core_miku
+algo_miku:  core_miku
+codec_miku: core_miku algo_miku
+fs_miku:    core_miku
+net_miku:
+parse_miku: core_miku text_miku
+libc_miku:  core_miku fs_miku sys_miku algo_miku text_miku

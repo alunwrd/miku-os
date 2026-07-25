@@ -2,17 +2,23 @@
 
 pub type CmpFn = unsafe extern "C" fn(*const u8, *const u8) -> i32;
 
-#[link(name = "miku")]
+#[link(name = "core_miku")]
 extern "C" {
     // io
     pub fn miku_write(fd: u64, buf: *const u8, len: usize) -> i64;
     pub fn miku_read(fd: u64, buf: *mut u8, len: usize) -> i64;
 
-    // net (TCP client sockets); fd is also usable with miku_read/write/close
+    // net (TCP + UDP sockets); fd is also usable with miku_read/write/close
     pub fn miku_socket() -> i64;
+    pub fn miku_socket_udp() -> i64;
     pub fn miku_connect(fd: i64, ip: *const u8, port: u16) -> i64;
     pub fn miku_send(fd: i64, buf: *const u8, len: usize) -> i64;
     pub fn miku_recv(fd: i64, buf: *mut u8, len: usize) -> i64;
+    pub fn miku_bind(fd: i64, port: u16) -> i64;
+    pub fn miku_listen(fd: i64, backlog: i64) -> i64;
+    pub fn miku_accept(fd: i64, ip: *mut u8, port: *mut u16) -> i64;
+    pub fn miku_sendto(fd: i64, buf: *const u8, len: usize, ip: *const u8, port: u16) -> i64;
+    pub fn miku_recvfrom(fd: i64, buf: *mut u8, len: usize, src_ip: *mut u8, src_port: *mut u16) -> i64;
 
     // stdio
     pub fn miku_print(s: *const u8);
@@ -950,6 +956,30 @@ extern "C" {
     pub fn miku_env_clear();
     pub fn miku_env_iter(cb: extern "C" fn(*const u8, *const u8, *mut u8), ctx: *mut u8);
     pub fn miku_putenv(s: *const u8) -> bool;
+    /// Seed the env store from the kernel envp (3rd argument of
+    /// `_start_main`). Call once at startup; returns imported count
+    pub fn miku_env_init(envp: *const *const u8) -> usize;
+}
+
+// process control
+extern "C" {
+    /// 0 in the child, child pid in the parent, negative errno on failure
+    pub fn miku_fork() -> i64;
+    /// Blocks until a child exits. pid 0 = any child; status may be null.
+    /// Returns the reaped pid or negative errno
+    pub fn miku_waitpid(pid: u64, status: *mut i64) -> i64;
+    pub fn miku_kill(pid: u64, sig: u64) -> i64;
+    /// Replace the process image (kernel default environment).
+    /// argv = array of C-string pointers, argv[0] = program name
+    pub fn miku_exec(path: *const u8, argv: *const *const u8, argc: usize) -> i64;
+    /// exec with explicit environment ("KEY=value" C strings)
+    pub fn miku_execve(
+        path: *const u8,
+        argv: *const *const u8,
+        argc: usize,
+        envp: *const *const u8,
+        envc: usize,
+    ) -> i64;
 }
 
 // signal
@@ -2156,17 +2186,21 @@ macro_rules! cstr {
     };
 }
 
-// SysV-style initial stack layout: [rsp]=argc, [rsp+8]=argv[0], ...
-// Pass argc/argv to _start_main via rdi/rsi so 'extern "C" fn
-// _start_main(argc: i32, argv: *const *const u8)'' works, while
-// argless _start_main signatures (the original convention) keep
-// compiling; extra register args are harmless for a callee that
-// doesn't read them
+// SysV-style initial stack layout: [rsp]=argc, [rsp+8]=argv[0], ...,
+// argv NULL, envp[0], ..., envp NULL, auxv. Pass argc/argv/envp to
+// _start_main via rdi/rsi/rdx so any of these signatures work:
+//   fn _start_main() -> !
+//   fn _start_main(argc: i32, argv: *const *const u8) -> !
+//   fn _start_main(argc: i32, argv: *const *const u8, envp: *const *const u8) -> !
+// Extra register args are harmless for a callee that doesn't read them.
+// Pass envp to miku_env_init() to make miku_getenv() see the inherited
+// environment
 core::arch::global_asm!(
     ".global _start",
     "_start:",
     "mov rdi, [rsp]",
     "lea rsi, [rsp + 8]",
+    "lea rdx, [rsi + rdi*8 + 8]",
     "and rsp, -16",
     "call _start_main",
     "ud2",

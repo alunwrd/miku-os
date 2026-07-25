@@ -1,4 +1,4 @@
-# MikuOS ABI v0.2.9-rc
+# MikuOS ABI v0.2.10
 
 Application Binary Interface for MikuOS userspace.
 
@@ -6,22 +6,26 @@ Application Binary Interface for MikuOS userspace.
 
 ## 1. Overview
 
-MikuOS is an x86_64 OS. Userspace programs run in Ring 3 and communicate with the kernel via `syscall` (entries 0..59; socket syscalls occupy 56..59). The standard library **libmiku** links dynamically through **ld-miku**.
+MikuOS is an x86_64 OS. Userspace programs run in Ring 3 and communicate with the kernel via `syscall` (entries 0..71; socket syscalls occupy 56..66). The standard library is split into per-domain **miku libraries** (`core_miku.so`, `fs_miku.so`, `net_miku.so`, ...) linked dynamically through **ld-miku**.
 
 ```
 +----------------------------------+
 |        Program (ELF)             |
 |  _start -> _start_main -> code  |
 +----------------------------------+
-|    libmiku.so  (956 functions)  |
-|  63 modules: string/ mem/ heap/ |
-|  io/ fmt/ file/ libc/ json/...  |
+|  miku libraries (956 functions) |
+|  core_miku.so  sys_miku.so      |
+|  text_miku.so  ds_miku.so       |
+|  algo_miku.so  codec_miku.so    |
+|  fs_miku.so    net_miku.so      |
+|  parse_miku.so libc_miku.so     |
 +----------------------------------+
 |     ld-miku.so  (linker)        |
-|  loads .so, PLT, relocations    |
+|  loads .so, DT_NEEDED deps,     |
+|  PLT, relocations               |
 +----------------------------------+
 |     MikuOS Kernel               |
-|  syscall nr=0..59, mikuD init   |
+|  syscall nr=0..71, mikuD init   |
 +----------------------------------+
 ```
 
@@ -64,7 +68,7 @@ New hardware subsystems initialized before userspace starts:
 ```
 src/lib/userspace/
 ├── Cargo.toml              crate configuration
-├── build.rs                auto-generates stub libmiku.so
+├── build.rs                auto-generates a link stub per miku library
 ├── build.sh                build + deploy script
 ├── x86_64-miku-app.json    target spec
 └── src/
@@ -73,25 +77,38 @@ src/lib/userspace/
     └── test_full.rs        test suite
 ```
 
-### 2.4 libmiku Structure
+### 2.4 miku libraries structure
 
-63 modules, 956 exported functions. Modules:
+The former monolithic libmiku is split into 10 shared libraries (64 modules,
+956 exported functions). Module sources live in `src/lib/libmiku/`, library
+roots in `src/lib/mikulibs/`, the built `.so` files in
+`src/lib/mikulibs/libs/`, the build crate is `mikulibs/`. The single
+source of truth for the set of libraries and their dependency graph is
+`src/lib/mikulibs/libs.list`; it drives the mikulibs build (which validates
+the graph and regenerates the cross-library shims on every build), the
+kernel preload table, the builder, and the userspace link stubs. Libraries
+call each other only through the C ABI (`miku_*`), recorded as `DT_NEEDED`
+dependencies that ld-miku loads recursively:
 
-| Category | Modules |
-|---|---|
-| **Core** | lib, sys, proc, io, mem, num, string, heap, file, time, fmt |
-| **Data structures** | vec, list, hashmap, treemap, trie, queue, ringbuf, ringbuf2, heap_queue, bitset, channel |
-| **Strings** | strbuf, ctype, utf8, format, regex, glob |
-| **I/O** | bufio, stdio, dir, path |
-| **Encoding** | base64, hex, json, csv, ini, lz |
-| **Crypto / hash** | sha256, checksum, hash, uuid |
-| **System** | signal, env, errno, args, getopt |
-| **Concurrency** | sync, event, timer |
-| **Time** | datetime |
-| **Memory** | arena, slab, pool |
-| **Math / RNG / sort** | math, random, convert, endian, bitops, sort |
-| **Diagnostics** | log, test, panic |
-| **libc compat** | libc (fopen/fclose/fread/fwrite/fprintf/fgets/fputs etc., 151 functions) |
+| Library | Modules | DT_NEEDED |
+|---|---|---|
+| **core_miku.so** | sys, errno, sync, panic, mem, heap, io, proc, string, ctype, convert, num, stdio, time | - |
+| **sys_miku.so** | signal, env, event, timer, log, test, datetime | core |
+| **text_miku.so** | utf8, strbuf, format, fmt, glob, regex | core |
+| **ds_miku.so** | vec, list, queue, hashmap, treemap, trie, ringbuf, ringbuf2, bitset, heap_queue, channel, arena, slab, pool | core |
+| **algo_miku.so** | sort, hash, bitops, math, random, endian | core |
+| **codec_miku.so** | base64, hex, checksum, sha256, lz, uuid | core, algo |
+| **fs_miku.so** | file, bufio, dir, path | core |
+| **net_miku.so** | net | - |
+| **parse_miku.so** | json, csv, ini, getopt, args | core, text |
+| **libc_miku.so** | libc (fopen/fclose/fread/fwrite/fprintf/fgets/fputs etc., 151 functions) | core, fs, sys, algo, text |
+
+Cross-library calls inside the modules go through thin shims
+(`src/lib/mikulibs/shim/`) that forward to the exported C symbols, so a
+module's source is identical whether its dependency is in the same library
+or another one. Symbol names are unchanged, existing binaries keep working
+as long as their `DT_NEEDED` entries are updated (relink against the new
+stubs).
 
 > The old `util` module has been split: `math` owns `miku_abs` / `miku_min` / `miku_max` / `miku_clamp` / `miku_swap` / `miku_isqrt` / `miku_div_ceil` / `miku_is_prime`; `random` owns `miku_srand` / `miku_rand` / `miku_rand_range` / `miku_rand_bytes`; `panic` owns `miku_assert_fail` / `miku_panic` / `miku_assert_eq` / `miku_assert_not_null`. Symbol names are unchanged, so existing binaries keep working.
 
@@ -173,6 +190,36 @@ Clobbered:    rcx, r11
 | 57 | connect | fd | sockaddr* | addrlen | | 0 / -errno |
 | 58 | send | fd | buf | len | flags | n / -errno |
 | 59 | recv | fd | buf | len | flags | n (0=EOF) / -errno |
+| 60 | mmap_file | args_ptr (u64[6]: addr,len,prot,flags,fd,offset) | | | | addr / -errno |
+| 61 | msync | addr | len | | | 0 / -errno |
+| 62 | bind | fd | sockaddr* | addrlen | | 0 / -errno |
+| 63 | listen | fd | backlog | | | 0 / -errno |
+| 64 | accept | fd | sockaddr* | addrlen_ptr | | fd / -errno |
+| 65 | sendto | fd | buf | len | sockaddr* | n / -errno |
+| 66 | recvfrom | fd | buf | len | sockaddr* | n / -errno |
+| 67 | execve | args_ptr (u64[6]: path,path_len,argv,argc,envp,envc) | | | | never (success) / -errno |
+| 68 | sigentry | entry_addr | | | | 0 / -errno |
+| 69 | sigreturn | frame_ptr | | | | original rax |
+| 70 | clock_gettime | clock_id (0=REALTIME, 1=MONOTONIC) | timespec* | | | 0 / -errno |
+| 71 | ioctl | fd (0..2) | request | argp | | 0 / -errno |
+
+Signal delivery: the kernel delivers at syscall boundaries. With a
+dispatch entry registered (68, sys_miku.so does it automatically on the first
+`miku_signal`/`miku_sigaction` with a handler), the kernel writes a frame
+on the user stack `[sig, rip, rsp, rax, rflags]`, redirects sysret to the
+entry stub, which runs the handler and resumes via sigreturn (69).
+SIGKILL/SIGTERM always kill; SIGINT/SIGQUIT/SIGHUP kill with code 128+sig
+when no entry is registered (or when unhandled). Ctrl+C sends SIGINT to
+the foreground process. A blocked wait4 returns EINTR when a deliverable
+signal arrives. Handlers may clobber caller-saved registers: the syscall
+wrappers in core_miku.so declare rdi/rsi/rdx/r10/r8/r9 (plus rax/rcx/r11) as
+clobbered by every syscall.
+
+`exec` (46) runs with the kernel default environment
+(`src/exec_elf.rs` `DEFAULT_ENV`); `execve` (67) passes the caller's
+environment. Both support `#!` interpreter scripts (one level, interpreter
+must be an absolute path; everything after the interpreter is passed as a
+single argument, POSIX style).
 
 Socket fds are returned in a dedicated range (`SOCK_FD_BASE = 4096`..) and are
 also usable with `read`/`write`/`close` (which route to recv/send/close by fd
@@ -259,39 +306,74 @@ Timer: Local APIC timer at 250 Hz (1 tick ~= 4 ms). PIT is used only for
 
 ### 4.1 Binary requirements
 
-- Format: ELF64, ET_EXEC
+- Format: ELF64, ET_EXEC or ET_DYN (PIE)
 - `.interp` points to `/lib/ld-miku.so`
-- `NEEDED: libmiku.so`
+- `NEEDED: core_miku.so` (plus one entry per additional miku library actually used)
 - Entry point: `_start`
-- No PIE (fixed addresses)
+- PIE binaries load at a randomized base (28 bits of ASLR entropy); ET_EXEC keeps its fixed link addresses
+- W+X segments are rejected (W^X policy); a PT_GNU_STACK exec-stack request is ignored, the stack is always NX
 - No red zone (`-mno-red-zone`)
 
 ### 4.2 Loading sequence
 
 1. Kernel reads ELF, maps segments
 2. Loads `ld-miku.so` from `.interp`
-3. `ld-miku` loads `libmiku.so` from the kernel via `map_lib`
+3. `ld-miku` loads each `DT_NEEDED` miku library from the kernel via `map_lib`, recursively pulling in the libraries' own `DT_NEEDED` deps (e.g. `parse_miku.so` pulls `text_miku.so` and `core_miku.so`)
 4. `ld-miku` resolves PLT/GOT
 5. Jumps to `_start` in the program
 
 ### 4.3 Address space layout
 
+All bases are randomized per exec (Linux-style ASLR):
+
 ```
-0x0000_0000_0040_0000 .. 0x0000_0000_0080_0000  PIE program (code + data, ASLR-shifted)
-0x0000_0000_4100_0000                            TLS area
-0x0000_0000_6000_0000_0000                       brk arena base
-0x0000_0001_0000_0000 .. 0x0000_7F00_0000_0000  mmap / libmiku / heap
-0x0000_7F00_0000_0000                            ld-miku interpreter load base
-0x0000_7FFF_FFEF_0000 .. 0x0000_7FFF_FFFF_0000  user stack (1 MiB, 256 pages)
+0x0000_0000_0040_0000  ..                       ET_EXEC program (fixed link addresses)
+                        heap (brk)              image end + random gap (up to 32 MiB)
+0x0000_0001_0000_0000 .. 0x0000_7F00_0000_0000  mmap / miku libraries
+0x0000_5555_0000_0000  + ASLR (up to 1 TiB)     PIE program load base
+0x0000_7F00_0000_0000  + ASLR (up to 2 GiB)     ld-miku interpreter load base
+                        TLS block               16 MiB below the stack's low end
+  ..  0x0000_7FFF_FFFF_0000 - ASLR (<= 16 MiB)  user stack (8 MiB VMA, grows on demand)
 ```
 
-Exact constants live in `src/elf_loader.rs` (`PIE_BASE`, `TLS_VIRT`,
-`INTERP_BASE`, `USER_STACK_TOP`, `STACK_PAGES`) and `src/mmap.rs`
-(`MMAP_BASE`, `MMAP_LIMIT`, `BRK_BASE`).
+The stack is an 8 MiB VMA of which only the top 256 KiB is mapped at
+exec; the rest faults in as zero pages on first touch. The pages below
+the stack VMA are an unmapped guard: touching them kills the process.
+
+### 4.4 Initial stack (SysV)
+
+At `_start`, `rsp` is 16-byte aligned and points to:
+
+```
+[rsp]        argc
+[rsp+8]      argv[0..argc-1], then NULL
+             envp[0..envc-1] ("KEY=value" C strings), then NULL
+             auxv pairs (AT_PHDR, AT_ENTRY, AT_BASE, AT_RANDOM,
+               AT_HWCAP, AT_PLATFORM, AT_EXECFN, AT_MINSIGSTKSZ, ...), AT_NULL
+             padding, string data (argv/envp bytes, "x86_64", execfn path,
+               16 random bytes)
+```
+
+Auxv notes: `AT_HWCAP` carries CPUID.1:EDX, `AT_PLATFORM` points to the
+C string "x86_64", `AT_EXECFN` points to the path passed to exec, and
+`AT_RANDOM` points to 16 CSPRNG bytes.
+
+The userspace `_start` shim passes `argc`/`argv`/`envp` to `_start_main`
+in `rdi`/`rsi`/`rdx`. Call `miku_env_init(envp)` once at startup to seed
+`miku_getenv`/`miku_setenv` with the inherited environment. Limits are
+byte budgets rather than fixed slot counts: 128 KiB of argv+envp string
+data and 8192 total vector entries (`kernel/process/elf_loader.rs`
+`ARG_MAX_STRING_BYTES`, `ARG_MAX_VECTOR_ENTRIES`). Shell `exec` and
+syscall 46 supply `DEFAULT_ENV` (PATH/HOME/TERM/OS); `execve` (67)
+passes the caller's own environment.
+
+Exact constants live in `kernel/process/elf_loader.rs` (`PIE_BASE`, `INTERP_BASE`,
+`USER_STACK_TOP`, `STACK_SIZE`) and `src/mmap.rs` (`MMAP_BASE`,
+`MMAP_LIMIT`).
 
 ---
 
-## 5. libmiku API
+## 5. miku libraries API
 
 ### 5.1 Module `io`: input / output
 
@@ -482,7 +564,7 @@ void  miku_rand_perm(unsigned long n, unsigned long *out);
 void  miku_rand_shuffle(unsigned char *data, unsigned long count, unsigned long elem_size);
 ```
 
-Note: `random` is a userspace PRNG (xorshift). The kernel TLS / ECDH paths use RDRAND-backed CSPRNG internally; that is not exposed via libmiku.
+Note: `random` is a userspace PRNG (xorshift). The kernel TLS / ECDH paths use RDRAND-backed CSPRNG internally; that is not exposed via the miku libraries.
 
 #### `panic`: assertions and aborts
 
@@ -572,7 +654,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! { miku::exit(1); }
 
 | Element | Purpose |
 |---|---|
-| `#![no_std]` | No std (using libmiku instead) |
+| `#![no_std]` | No std (using the miku libraries instead) |
 | `#![no_main]` | Entry point is not `main` |
 | `mod miku` | SDK bindings |
 | `fn _start_main() -> !` | Entry point (never returns) |
@@ -667,13 +749,13 @@ gcc -nostdlib -nostdinc -fno-builtin -fno-stack-protector \
 ### 7.3 Linking
 
 ```bash
-# Generate stub (one time only):
-gcc -shared -nostdlib -fPIC -Wl,-soname,libmiku.so -o libmiku.so miku_stub.c
+# Generate stubs (one per miku library the app uses), e.g. for core:
+gcc -shared -nostdlib -fPIC -Wl,-soname,core_miku.so -o libcore_miku.so core_miku_stub.c
 
-# Link:
+# Link (list every stub the app needs):
 ld app.o -o app \
     --dynamic-linker=/lib/ld-miku.so \
-    libmiku.so --no-as-needed -e _start
+    libcore_miku.so libfs_miku.so --no-as-needed -e _start
 ```
 
 ### 7.4 ASSERT Macro
@@ -743,10 +825,10 @@ miku@os:/ $ exec my_app
 
 ## 9. Rebuilding the Kernel
 
-When libmiku or ld-miku changes:
+When the miku libraries or ld-miku change:
 
 ```bash
-cd ~/miku-os/libmiku && cargo clean
+cd ~/miku-os/mikulibs && cargo clean
 cd ~/miku-os/builder && cargo run
 ```
 
@@ -844,7 +926,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! { miku::exit(1); }
 
 ```bash
 readelf -l app | grep INTERP        # should show /lib/ld-miku.so
-readelf -d app | grep NEEDED        # should show libmiku.so
+readelf -d app | grep NEEDED        # should list the miku libraries used (core_miku.so, ...)
 readelf --dyn-syms app | grep miku  # should list miku_* symbols
 ```
 
@@ -852,10 +934,10 @@ readelf --dyn-syms app | grep miku  # should list miku_* symbols
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `page fault addr=0x0 INSTRUCTION_FETCH` | Missing `.interp` or unresolved symbols | Link against `libmiku.so` stub |
-| `interp=false` in boot log | `--unresolved-symbols` produced a static binary | Use stub |
-| `not found: libmiku_stub.so` | Wrong soname on stub | Add `-Wl,-soname,libmiku.so` |
-| GPF `code=0` in libmiku | SSE movaps alignment fault | Set `opt-level = 1` in libmiku `Cargo.toml` |
+| `page fault addr=0x0 INSTRUCTION_FETCH` | Missing `.interp` or unresolved symbols | Link against the miku library stubs |
+| `interp=false` in boot log | `--unresolved-symbols` produced a static binary | Use stubs |
+| `not found: <name>_stub.so` | Wrong soname on stub | Add `-Wl,-soname,<name>_miku.so` |
+| GPF `code=0` in a miku library | SSE movaps alignment fault | Set `opt-level = 1` in mikulibs `Cargo.toml` |
 | GPF on 3rd+ exec | Shared pages freed prematurely | Apply solib fix: copy pages |
 | `[swap] slot=0` spam | `is_swap_pte` false positive | Add `slot != 0` check |
 | Files disappear | ext4 64-bit feature enabled | Format with `mkfs.ext4 -O ^64bit,^metadata_csum` |
@@ -879,7 +961,7 @@ readelf --dyn-syms app | grep miku  # should list miku_* symbols
   (`socket`/`connect`/`send`/`recv`). Socket fds start at `SOCK_FD_BASE=4096` and
   route through the generic `read`/`write`/`close`. No UDP, listen/accept, or
   non-blocking mode yet. Max 64 sockets per system; connect/recv block with a 30 s
-  hard timeout. The `libmiku/net.rs` module exposes safe Rust wrappers for the
+  hard timeout. The `net` module (net_miku.so) exposes safe Rust wrappers for the
   socket syscalls.
 - No `fcntl`, `ioctl`, `poll`, `select`, or `epoll`; `pipe` works but cannot be multiplexed
 - NVIDIA GPU driver does not yet expose a userspace API; accessible only via shell commands (nvidia info/debug/falcon/dma-test/gsp etc.)
@@ -891,13 +973,14 @@ readelf --dyn-syms app | grep miku  # should list miku_* symbols
 
 | Limit | Value | Source |
 |---|---|---|
-| Max open FDs per process | 128 | `src/vfs/types.rs` `MAX_FDS` |
-| Max `exec` argv entries | 64 | `src/elf_loader.rs` `MAX_ARGS` |
-| Max single argv string length | 4096 bytes | `src/syscall/user_mem.rs` `MAX_ARG_BYTES` |
+| Max open FDs per process | 128 | `kernel/fs/vfs/types.rs` `MAX_FDS` |
+| Max `exec` argv+envp string bytes | 128 KiB | `kernel/process/elf_loader.rs` `ARG_MAX_STRING_BYTES` |
+| Max `exec` argv+envp vector entries | 8192 | `kernel/process/elf_loader.rs` `ARG_MAX_VECTOR_ENTRIES` |
+| Max single argv string length | 32 KiB | `src/syscall/user_mem.rs` `MAX_ARG_BYTES` |
 | Max path length | 4096 bytes | `src/syscall/user_mem.rs` `MAX_PATH_LEN` |
-| Max ELF file size | 64 MiB | `src/elf_loader.rs` `MAX_ELF_SIZE` |
+| Max ELF file size | 64 MiB | `kernel/process/elf_loader.rs` `MAX_ELF_SIZE` |
 | `sleep(ticks)` upper bound | 100_000 ticks (~400 s) | `src/syscall/process.rs` clamp |
-| User stack | 256 pages = 1 MiB | `src/elf_loader.rs` `STACK_PAGES` |
+| User stack | 8 MiB VMA, top 256 KiB eager, rest on demand | `kernel/process/elf_loader.rs` `STACK_SIZE` |
 
 ### 12.2 Signal handling
 
@@ -914,14 +997,14 @@ readelf --dyn-syms app | grep miku  # should list miku_* symbols
 `getxattr`, `setxattr` and `utimensat` (syscalls 38-40) currently take an
 ext2/ext4 inode number rather than a path, and only operate on the
 active ext filesystem (return `-ENOSYS` otherwise). They have no
-libmiku wrapper yet. Path-based versions will replace these once the
+library wrapper yet. Path-based versions will replace these once the
 VFS gains a unified ino-by-path lookup.
 
 ### 12.4 `map_lib` syscall
 
 `map_lib` (nr 15) resolves a shared object by name. Lookup order:
 
-1. In-kernel solib cache (includes the preloaded `libmiku.so`).
+1. In-kernel solib cache (includes all 10 preloaded miku libraries).
 2. Filesystem search paths configured via `solib::add_search_path`
    (default: `/lib`). Reads through the VFS, parses the ELF, maps
    segments into the caller's address space, returns the load base.
@@ -943,6 +1026,6 @@ Other shared libraries must be reachable via one of those search paths.
 
 1. Write `app.c` with `_start` and extern declarations
 2. Compile: `gcc ... -c app.c -o app.o`
-3. Link: `ld app.o -o app ... libmiku.so ...`
+3. Link: `ld app.o -o app ... libcore_miku.so ...`
 4. Deploy: `e2cp app data.img:/`
 5. In MikuOS: `ext4mount 3` then `exec app`
