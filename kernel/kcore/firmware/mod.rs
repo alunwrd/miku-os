@@ -3,22 +3,22 @@ pub mod probe;
 
 // Firmware hand-off helpers: ACPI mode transition + chipset SMI disable
 //
-//  Even after USB legacy handoff (see src/usb_handoff.rs), several other SMM
-//  sources can keep the firmware busy and wedge the OS on 'sti':
+// Even after USB legacy handoff (see `usb_handoff.rs`), other SMM sources can
+// keep the firmware busy and wedge the OS on 'sti':
 //
 //   ACPI events delivered as SMI. Until the OS issues the ACPI
 //   "enable" command (FADT.SMI_CMD <- FADT.ACPI_ENABLE), platform
 //   power-management events (lid, button, thermal, GPE) are routed to
-//   SMM. After the transition they fire as SCI through the IOAPIC
+//   SMM. After the transition they fire as SCI through the IOAPIC.
 //
 //   Intel chipset GLOBAL SMI. The ICH/PCH PMBASE+0x30 register
 //   (SMI_EN) holds individual enables for TCO watchdog, periodic SMI,
-//   APMC SMI, USB SMI, etc. We clear them all (except keeping bit 0
-//   GBL_SMI_EN as-is unless safe to clear), then ACK any latched
-//   status bits in SMI_STS at PMBASE+0x34
+//   APMC SMI, USB SMI, etc. All are cleared (keeping bit 0
+//   GBL_SMI_EN as-is unless safe to clear), then latched status bits
+//   in SMI_STS at PMBASE+0x34 are acknowledged.
 //
-//   This module is best-effort: each step prints what it touched and
-//   returns even if a particular controller/chipset is missing
+// Best-effort: each step prints what it touched and returns even if a
+// controller/chipset is missing
 
 use x86_64::instructions::port::Port;
 
@@ -151,7 +151,7 @@ pub fn acpi_enable() {
         }
     };
     let fadt_virt = fadt_phys + hhdm;
-    crate::serial_println!("[firmware] FADT @ {:#x}", fadt_phys);
+    crate::trace_println!("[firmware] FADT @ {:#x}", fadt_phys);
 
     // FADT field layout (ACPI 1.0 fixed offsets):
     //   48: SMI_CMD            u32
@@ -167,13 +167,13 @@ pub fn acpi_enable() {
     let pm1a_cnt: u32 = unsafe { core::ptr::read_unaligned((fadt_virt + 72) as *const u32) };
     let pm1b_cnt: u32 = unsafe { core::ptr::read_unaligned((fadt_virt + 76) as *const u32) };
 
-    crate::serial_println!(
+    crate::trace_println!(
         "[firmware] SMI_CMD={:#x} ACPI_ENABLE={:#x} PM1A_CNT={:#x} PM1B_CNT={:#x}",
         smi_cmd, acpi_enable_val, pm1a_cnt, pm1b_cnt
     );
 
     if smi_cmd == 0 || acpi_enable_val == 0 || pm1a_cnt == 0 {
-        crate::serial_println!("[firmware] ACPI enable not required (HW-reduced or already on)");
+        crate::trace_println!("[firmware] ACPI enable not required (HW-reduced or already on)");
         return;
     }
 
@@ -185,8 +185,8 @@ pub fn acpi_enable() {
         return;
     }
 
-    // Issue the enable command and poll. Per ACPI spec the firmware can
-    // take several seconds; we cap at ~3 seconds-ish via spin count
+    // Issue the enable command and poll. Per the ACPI spec the firmware can
+    // take several seconds; capped at ~3 seconds via spin count
     crate::serial_println!("[firmware] writing {:#x} to SMI_CMD ({:#x})", acpi_enable_val, smi_cmd);
     unsafe { Port::<u8>::new((smi_cmd & 0xFFFF) as u16).write(acpi_enable_val); }
 
@@ -208,20 +208,17 @@ pub fn acpi_enable() {
 
 // GPE0 SMI DISABLE
 
-/// Disable every bit in GPE0_EN (FADT-described general purpose event
-/// enable register). Until the OS has entered ACPI mode (SCI_EN=1),
-/// every enabled GPE bit fires SMI - and the BIOS keeps firing as long
-/// as enable bits are set, even if the chipset SMI block enables
-/// (FCH 0x210..) are zero. GPE0 routes through a SEPARATE chipset path
+/// Disable every bit in GPE0_EN (FADT-described general purpose event enable
+/// register). Until the OS has entered ACPI mode (SCI_EN=1), every enabled GPE
+/// bit fires SMI, even with the chipset SMI block enables (FCH 0x210..) at
+/// zero: GPE0 routes through a separate chipset path.
 ///
-/// Probe data on Ryzen 5 2600 / B450M-HDV showed
+/// On Ryzen 5 2600 / B450M-HDV, after firmware silence + ACPI enable:
 ///   [probe.fadt] PM1A_CNT live=0x0 SCI_EN=0
 ///   [probe.fadt] GPE0 sts=0x23 en=0xff
-/// after firmware silence + ACPI enable - i.e. the OS never managed to
-/// transition into ACPI mode AND all 8 GPE sources are still enabled
-/// with 3 of them already latched. Writing the SMI_CMD trampoline did
-/// not flip SCI_EN on this platform, so we must take the OTHER route:
-/// silence GPE at the source by clearing its own enable register
+/// So ACPI mode was not entered, all 8 GPE sources were enabled, with 3
+/// latched. The SMI_CMD write does not flip SCI_EN on this platform, so GPE is
+/// silenced at the source by clearing its own enable register
 pub fn disable_gpe0() {
     let hhdm = grub::hhdm();
     let fadt_phys = match find_fadt(hhdm) {
@@ -238,8 +235,8 @@ pub fn disable_gpe0() {
         crate::serial_println!("[firmware] no GPE0 block in FADT");
         return;
     }
-    // GPE0_LEN is total block size (status+enable). First half is status,
-    // second half is enable. Each half is gpe0_len/2 bytes wide
+    // GPE0_LEN is total block size (status+enable). The first half is status,
+    // the second enable, each gpe0_len/2 bytes wide
     let half = (gpe0_len / 2) as u16;
     let port_sts = (gpe0_blk & 0xFFFF) as u16;
     let port_en  = port_sts + half;
@@ -250,8 +247,8 @@ pub fn disable_gpe0() {
             total_sts |= (Port::<u8>::new(port_sts + i).read() as u32) << (8 * i);
             total_en  |= (Port::<u8>::new(port_en  + i).read() as u32) << (8 * i);
         }
-        // Clear every enable bit and ACK every status bit. RWC: writing
-        // 1 to a status bit clears it
+        // Clear every enable bit and ACK every status bit. RWC: writing 1 to a
+        // status bit clears it
         for i in 0..half {
             Port::<u8>::new(port_en  + i).write(0x00);
             Port::<u8>::new(port_sts + i).write(0xFF);
@@ -265,11 +262,10 @@ pub fn disable_gpe0() {
 // intel chipset smi disable
 
 /// Find the LPC bridge (Intel ICH/PCH) and clear all SMI enables in
-/// PMBASE+SMI_EN. Idempotent. AMD or non-Intel platforms: noop
+/// PMBASE+SMI_EN. Idempotent. No-op on AMD or non-Intel platforms
 pub fn disable_intel_chipset_smi() {
-    // Walk PCI bus 0 looking for an Intel ISA/LPC bridge
-    //   class=0x06 (bridge), subclass=0x01 (ISA bridge) is LPC on Intel
-    //   vendor must be 0x8086
+    // Walk PCI bus 0 for an Intel ISA/LPC bridge: class=0x06 (bridge),
+    // subclass=0x01 (ISA bridge), vendor 0x8086
     for dev in 0..32u8 {
         for func in 0..8u8 {
             let id = pci_read32(0, dev, func, 0x00);
@@ -296,16 +292,13 @@ pub fn disable_intel_chipset_smi() {
 }
 
 fn clear_smi_for_lpc(dev: u8, func: u8) {
-    // PMBASE register location varies by chipset:
-    //     ICH (older): config offset 0x40, 16-bit, low 7 bits zero
-    //     PCH (modern): config offset 0x40, 16-bit, low 7 bits zero
-    //                   (ABASE - ACPI Base Address)
-    // Either way: read 16 bits at 0x40, mask off low 7 bits, that is the
-    // I/O base for ACPI block. SMI_EN at base+0x30, SMI_STS at base+0x34
+    // PMBASE register: config offset 0x40, 16-bit, low 7 bits zero, on ICH and
+    // on PCH (ABASE, ACPI Base Address). That is the I/O base for the ACPI
+    // block: SMI_EN at base+0x30, SMI_STS at base+0x34
     let pmbase_raw = pci_read16(0, dev, func, 0x40);
     let pmbase = pmbase_raw & 0xFF80;
     if pmbase == 0 {
-        crate::serial_println!("[firmware] LPC PMBASE not set, skipping SMI clear");
+        crate::trace_println!("[firmware] LPC PMBASE not set, skipping SMI clear");
         return;
     }
     let smi_en_port  = pmbase + 0x30;
@@ -325,12 +318,12 @@ fn clear_smi_for_lpc(dev: u8, func: u8) {
             "[firmware] SMI_EN before={:#x} SMI_STS before={:#x}", en0, sts0
         );
 
-        // Clear every SMI enable except bit 0 (GBL_SMI_EN). On most
-        // chipsets the global enable just gates the rest; clearing all
-        // sub-enables makes it harmless. Touching bit 0 is risky on some
-        // platforms (BIOS may need it for CPU thermal throttling)
+        // Clear every SMI enable except bit 0 (GBL_SMI_EN). On most chipsets
+        // the global enable only gates the rest, so clearing the sub-enables
+        // makes it harmless. Bit 0 is risky on some platforms (BIOS may need it
+        // for CPU thermal throttling)
         en_port.write(en0 & 1);
-        // ACK every latched status (RWC: write 1s clears)
+        // ACK every latched status (RWC: writing 1s clears)
         sts_port.write(0xFFFF_FFFF);
 
         let en1 = en_port.read();
@@ -342,18 +335,17 @@ fn clear_smi_for_lpc(dev: u8, func: u8) {
 }
 
 
-// HIGH-LEVEL ENTRY
-// AMD CHIPSET SMI DISABLE (FCH / SP5100 / Promontory)
+// High-level entry. AMD chipset SMI disable (FCH / SP5100 / Promontory)
 
-/// AMD platforms (FCH / SP5100 / Promontory) route platform SMI through
-/// the AcpiMmio block at fixed physical address 0xFED8_0000. Layout:
-///   +0x000 SMBus              (we don't touch)
-///   +0x100 GPIO               (we don't touch)
-///   +0x200 SMI block          (we clear EVERY register here)
+/// AMD platforms (FCH / SP5100 / Promontory) route platform SMI through the
+/// AcpiMmio block at fixed physical address 0xFED8_0000. Layout:
+///   +0x000 SMBus              (untouched)
+///   +0x100 GPIO               (untouched)
+///   +0x200 SMI block          (event status and enable banks cleared)
 ///   +0x300 PMIO
 ///   +0x400 PMIO2
 ///   ...
-///   +0xB00 Watchdog Timer     (we disable this too)
+///   +0xB00 Watchdog Timer     (disabled too)
 pub fn disable_amd_chipset_smi() {
     let mut found = false;
     let mut sample_vendor = 0u16;
@@ -373,7 +365,7 @@ pub fn disable_amd_chipset_smi() {
         if found { break; }
     }
     if !found {
-        crate::serial_println!("[firmware] no AMD chipset, skipping AMD SMI clear");
+        crate::trace_println!("[firmware] no AMD chipset, skipping AMD SMI clear");
         return;
     }
     crate::cprintln!(180, 180, 180,
@@ -384,15 +376,14 @@ pub fn disable_amd_chipset_smi() {
     crate::mm::vmm::map_mmio_uc(acpimmio_phys, 0x1000);
     let mmio_virt = acpimmio_phys + grub::hhdm();
 
-    // Conservative AMD FCH SMI clear. We touch ONLY the event enable
-    // and status banks (0x200..0x21F), leaving the control/timer bits
-    // (0x80..0xBF) alone. The AMD FCH layout from BKDG/PPR:
+    // Conservative AMD FCH SMI clear: only the event enable and status banks
+    // (0x200..0x21F), leaving the control/timer bits (0x80..0xBF). The AMD FCH
+    // layout from BKDG/PPR:
     //   0x200..0x20F: SMI_EVENT_STATUS_0..3 (RWC)
     //   0x210..0x21F: SMI_EVENT_ENABLE_0..3 (RW)
     //
-    // Earlier we cleared the entire 0x200..0x300 region and the next
-    // LAPIC/IOAPIC access wedged - the FCH evidently takes critical
-    // control bits in 0x80..0xBF that we must not touch
+    // Clearing the whole 0x200..0x300 region wedges the next LAPIC/IOAPIC
+    // access: the FCH keeps critical control bits in 0x80..0xBF
     unsafe {
         let event_status = (mmio_virt + 0x200) as *mut u32;
         let event_enable = (mmio_virt + 0x210) as *mut u32;
@@ -411,21 +402,21 @@ pub fn disable_amd_chipset_smi() {
     crate::serial_println!("[firmware] AMD event-side SMI cleared (conservative)");
 }
 
-// Disable any HPET timer that the firmware programmed for SMI delivery.
-// HPET sits at the standard MMIO address 0xFED0_0000 (per IA-PC HPET
-// spec; rare to be elsewhere on consumer hardware)
+// Disable any HPET timer the firmware programmed for SMI delivery. HPET is at
+// the standard MMIO address 0xFED0_0000 (IA-PC HPET spec; rarely elsewhere on
+// consumer hardware)
 //
 // HPET layout:
-//   0x000 GCAP_ID        - capability id
-//   0x010 GEN_CONF       - bit 0 ENABLE_CNF, bit 1 LEG_RT_CNF
-//   0x020 GINTR_STA      - per-timer interrupt status (RWC)
-//   0x100 + 0x20*N       - per-timer N config:
+//   0x000 GCAP_ID        : capability id
+//   0x010 GEN_CONF       : bit 0 ENABLE_CNF, bit 1 LEG_RT_CNF
+//   0x020 GINTR_STA      : per-timer interrupt status (RWC)
+//   0x100 + 0x20*N       : per-timer N config:
 //                          bit 1 INT_TYPE (level)
 //                          bit 2 INT_ENB
 //                          bit 14 FSB_INT (MSI mode)
 //                          bits 9..13 INT_ROUTE (IOAPIC GSI)
-// Timer configs sometimes have bits set that route interrupts as SMI on
-// real silicon even though the spec calls them GSI. We disable every timer entirely
+// Timer configs sometimes have bits set that route interrupts as SMI on real
+// silicon though the spec calls them GSI, so every timer is disabled
 pub fn disable_hpet_smi() {
     let hpet_phys: u64 = 0xFED0_0000;
     crate::mm::vmm::map_mmio_uc(hpet_phys, 0x1000);
@@ -452,8 +443,8 @@ pub fn disable_hpet_smi() {
             let cfg_addr = mmio_virt + 0x100 + (0x20 * n as u64);
             let cfg = cfg_addr as *mut u64;
             let v = core::ptr::read_volatile(cfg);
-            // Clear INT_ENB (bit 2), TYPE (bit 1), FSB_INT (bit 14), and
-            // make routing 0 (bits 9..13). Preserve cap bits
+            // Clear INT_ENB (bit 2), TYPE (bit 1), FSB_INT (bit 14), and route
+            // 0 (bits 9..13). Cap bits preserved
             let new = v & !((1 << 1) | (1 << 2) | (1 << 14) | (0x1F << 9));
             if v != new {
                 core::ptr::write_volatile(cfg, new);
@@ -500,22 +491,19 @@ fn find_madt(hhdm: u64) -> Option<u64> {
     None
 }
 
-// Honor ACPI MADT "LAPIC NMI" (type 4) entries by programming
-// LVT_LINT0/LINT1 with delivery mode = NMI on the BSP. Without this
-// step the BIOS keeps asserting LINT1 (it expects NMI delivery per
-// MADT), our LVT in FIX mode translates the signal to vector 0xff
-// (spurious), our spurious handler returns WITHOUT EOI as required
-// by SDM 10.9, and the BIOS just asserts LINT1 again - infinite
-// spurious-vector loop in which 'sti' never effectively returns to user code
+// Honor ACPI MADT "LAPIC NMI" (type 4) entries by programming LVT_LINT0/LINT1
+// with delivery mode = NMI on the BSP. Otherwise the BIOS keeps asserting LINT1
+// (expecting NMI delivery per MADT), an LVT in FIX mode translates the signal
+// to vector 0xff (spurious), the spurious handler returns without EOI as SDM
+// 10.9 requires, and the BIOS asserts LINT1 again: an infinite spurious-vector
+// loop in which 'sti' never effectively returns to user code.
 //
-// Probe data on Ryzen 5 2600 / B450M-HDV showed
+// On Ryzen 5 2600 / B450M-HDV:
 //   [probe.madt] LAPIC NMI: cpu=0xff lint=1 flags=0x5
-// meaning all CPUs, LINT1, edge-triggered, active-high. With this
-// function honoring the entry, our nmi_handler runs, paints slot 9
-// white, and we get out of the loop
+// all CPUs, LINT1, edge-triggered, active-high.
 //
-// LINT pins NOT covered by an MADT entry are masked defensively
-// (vector=0xff, FIX mode, mask bit set) so a stray hardware signal  cannot deliver garbage
+// LINT pins not covered by an MADT entry are masked (vector=0xff, FIX mode,
+// mask bit set), so a stray hardware signal cannot deliver garbage
 pub fn configure_lapic_per_madt() {
     let hhdm = grub::hhdm();
     let madt_phys = match find_madt(hhdm) {
@@ -583,8 +571,8 @@ pub fn configure_lapic_per_madt() {
         lint1_val, if lint1_nmi { "NMI" } else { "masked" });
 }
 
-// Run all firmware-handoff steps in the right order. Prints a one-line
-// summary on the framebuffer so the user can see what actually fired without needing serial
+// Run all firmware-handoff steps in order. Prints a one-line summary on the
+// framebuffer, visible without serial
 pub fn run() {
     let cpu_vendor = detect_cpu_vendor();
     crate::cprintln!(180, 180, 180, "[firmware] cpu vendor: {}", cpu_vendor);

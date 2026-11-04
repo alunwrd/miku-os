@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Path data: every command, absolute and relative, numbers written
+     every way SVG allows, both fill rules -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <path d="M4 4 L20 4 L20 20 L4 20 Z" fill="#c0392b"/>
+  <path d="m24,4 h16 v6 h-10 v10 h-6 z" fill="#2980b9" fill-opacity="0.7"/>
+  <path d="M4 24 C4 30 10 36 16 36 S28 30 28 24" fill="none" stroke="#27ae60" stroke-width="2"/>
+  <path d="M30 24 Q36 44 44 24 T46 40" fill="#8e44ad" opacity=".6"/>
+  <path d="M4,40-.5,47 12,47zM14 40l6 7h-12z" fill="rgb(230, 126, 34)"/>
+  <path fill-rule="evenodd" d="M30 30 h14 v14 h-14 z M33 33 h8 v8 h-8 z" fill="#16a085"/>
+  <path d="M22 38 l2 -4 2 4 -2 4 z" fill="teal"/>
+</svg>

@@ -1,21 +1,18 @@
-//////////////////////////////////////////////////////////////////////////////////
-// Framebuffer NVIDIA BAR correlation                                           //
-//                                                                              //
-// On a machine whose primary display adapter is an NVIDIA card, the boot       //
-// framebuffer set up by the firmware (UEFI GOP or legacy VBE, reported to      //
-// us via GRUB's multiboot2 'framebuffer' tag) is physically located in the     //
-// card's BAR1 (the large prefetchable aperture that maps onto video RAM)       // 
-// Writing a pixel into that buffer drives the card's scanout hardware and      //
-// the image appears on the monitor                                             //
-//                                                                              //
-// This module gives a tiny helper used during driver init: given the boot      //
-// framebuffer's physical address, find which GPU BAR (if any) contains it      //
-// The BAR index and offset are then stored on the Gtx1650 struct so later      //
-// code can assert, log, or reuse the mapping                                   //
-//////////////////////////////////////////////////////////////////////////////////
+// Framebuffer NVIDIA BAR correlation
+//
+// On a machine whose primary display adapter is an NVIDIA card, the boot
+// framebuffer set up by the firmware (UEFI GOP or legacy VBE, reported via
+// GRUB's multiboot2 'framebuffer' tag) is physically in the card's BAR1, the
+// large prefetchable aperture onto video RAM.
+//
+// Given the boot framebuffer's physical address, this finds which GPU BAR (if
+// any) contains it. The BAR index and offset are stored on the Gtx1650 struct
 
 use super::pci::GpuDevice;
 
+/// Where a physical address falls inside a GPU's BARs. Carries the whole
+/// window: which BAR, and where that BAR is
+#[allow(dead_code)]
 #[derive(Copy, Clone, Debug)]
 pub struct FbLocation {
     pub bar_index: u8,

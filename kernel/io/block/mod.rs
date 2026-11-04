@@ -1,12 +1,11 @@
-//  Block layer - the single routing point between filesystems and storage
-//  drivers, modelled on Linux's generic block layer
-// 
-//  Concrete drivers (ATA today) are registered once and live here behind a
-//  stable 'BlockDevId'; nobody above this layer holds a driver directly.
-//  Every read/write is expressed as a 'BioRequest' (see 'crate::fs::vfs::bio'),
-//  pushed through a real, serviced 'BioQueue', then dispatched to the driver.
-//  The queue is now on the live I/O path (previously it was a dead struct),
-//  which gives us per-device accounting and a seam for an I/O scheduler / IRQ completion later
+// Block layer: the single routing point between filesystems and storage
+// drivers, modelled on Linux's generic block layer
+//
+// Concrete drivers are registered once and live here behind a stable
+// 'BlockDevId'; nobody above this layer holds a driver directly. Every
+// read/write is a 'BioRequest' (see 'crate::fs::vfs::bio'), pushed through a
+// 'BioQueue', then dispatched to the driver. The queue gives per-device
+// accounting and a seam for an I/O scheduler / IRQ completion
 
 extern crate alloc;
 
@@ -20,9 +19,10 @@ use spin::Mutex;
 use driver::{BlkError, BlockDevInfo, BlockDriver};
 use crate::drivers::block::ata::AtaDrive;
 use crate::fs::vfs::bio::{BioDirection, BioQueue};
-use crate::fs::vfs::types::{BlockDevId, INVALID_ID, INVALID_U8, MAX_BLOCK_DEVICES};
+use crate::fs::vfs::types::{BlockDevId, INVALID_ID, INVALID_PAGE, INVALID_U8, MAX_BLOCK_DEVICES};
 
-/// Device ids 0..=3 are reserved for the four legacy ATA slots; ids from 'FIRST_DYNAMIC_DEV' up are handed out to probed drivers (virtio-blk, ...)
+/// Device ids 0..=3 are reserved for the four legacy ATA slots; ids from
+/// 'FIRST_DYNAMIC_DEV' up are handed out to probed drivers (virtio-blk, ...)
 pub const FIRST_DYNAMIC_DEV: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,10 +37,9 @@ pub enum DevKind {
 
 /// Operational state of a device, modelled on the SCSI device states Linux
 /// keeps. Healthy devices are 'Online'; a device that has taken errors but
-/// still completes I/O is 'Degraded'; one that has failed too many requests
-/// in a row is taken 'Offline' and every further request fails fast instead
-/// of waiting out a full hardware timeout. This is what keeps a dying disk
-/// from hanging the whole system
+/// still completes I/O is 'Degraded'; one that has failed too many requests in
+/// a row is taken 'Offline', and further requests fail fast, so a dying disk
+/// does not hang the system
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DevState {
     Online,
@@ -63,9 +62,9 @@ const OFFLINE_THRESHOLD: u32 = 8;
 use core::sync::atomic::{AtomicU64, AtomicU32, AtomicU8, Ordering};
 
 /// A registered device. The driver is dispatched through '&self' without a
-/// device-wide lock, so several CPUs can have I/O in flight on it at once
-/// (NVMe spreads them across queues; single-queue backends serialize on
-/// their own internal lock). All accounting is therefore atomic
+/// device-wide lock, so several CPUs can have I/O in flight on it (NVMe spreads
+/// them across queues; single-queue backends serialize on an internal lock).
+/// All accounting is atomic
 struct DeviceSlot {
     driver: Box<dyn BlockDriver>,
     info:   BlockDevInfo,
@@ -85,6 +84,9 @@ struct DeviceSlot {
     state:         AtomicU8,
     consec_errors: AtomicU32,
     offline_count: AtomicU64,
+    /// For a ramdisk, the span it is backed by: two ramdisks of the same size
+    /// at different addresses are two devices
+    ram_base: u64,
 }
 
 type SlotRef = Arc<DeviceSlot>;
@@ -116,7 +118,7 @@ static CACHE: Mutex<Option<cache::BufferCache>> = Mutex::new(None);
 ///
 /// Idempotent: the device id is derived from the drive's controller/role index
 /// (0..=3), so registering the same physical drive twice reuses one slot and
-/// one driver instance - exactly what a freely-copied 'AtaDrive' needs
+/// one driver instance, as a freely-copied 'AtaDrive' needs
 pub fn register_ata(drive: AtaDrive) -> BlockDevId {
     let id = drive.idx() as usize;
     if id >= MAX_BLOCK_DEVICES {
@@ -133,10 +135,16 @@ pub fn register_ata(drive: AtaDrive) -> BlockDevId {
         let _bus = ATA_BUS.lock();
         boxed.info()
     };
-    crate::serial_println!(
-        "[block] register dev {} (ata{}) model='{}' sectors={} lba48={}",
-        id, id, info.model_str(), info.total_sectors, info.lba48
-    );
+    // A channel with nothing on it registers all the same (the slot has to
+    // exist for /dev to be addressable), with no log line
+    if info.total_sectors == 0 {
+        crate::trace_println!("[block] register dev {} (ata{}) - no media", id, id);
+    } else {
+        crate::serial_println!(
+            "[block] register dev {} (ata{}) model='{}' sectors={} lba48={}",
+            id, id, info.model_str(), info.total_sectors, info.lba48
+        );
+    }
 
     let mut reg = REGISTRY.lock();
     if reg[id].is_none() {
@@ -159,6 +167,7 @@ impl DeviceSlot {
             state:             AtomicU8::new(DevState::Online.as_u8()),
             consec_errors:     AtomicU32::new(0),
             offline_count:     AtomicU64::new(0),
+            ram_base:          0,
         }
     }
 }
@@ -211,11 +220,52 @@ fn register_dynamic(boxed: Box<dyn BlockDriver>, kind: DevKind, label: &str) {
     }
 }
 
-/// Register a RAM-backed image (a GRUB multiboot module loaded by the
-/// bootloader) as a block device, returning its stable id. Used by the
-/// firmware loader to mount /lib/firmware from the boot medium with no
-/// second disk. Idempotent per physical span: a repeat registration of the
-/// same base reuses the existing slot rather than consuming another id
+/// Register a RAM-backed image (a GRUB multiboot module) as a block device,
+/// returning its stable id. For the firmware loader to mount /lib/firmware from
+/// the boot medium with no second disk. Idempotent per physical span: a repeat
+/// registration of the same base reuses the slot.
+///
+/// A ramdisk over memory already mapped, for a caller with a buffer and no
+/// physical span: the ext selftest, which needs two real block devices
+pub fn register_ramdisk_virt(virt_base: u64, len: u64) -> BlockDevId {
+    let boxed: Box<dyn BlockDriver> =
+        Box::new(crate::drivers::block::ramdisk::RamBlockDev::from_virt(virt_base, len));
+    let info = boxed.info();
+    let mut reg = REGISTRY.lock();
+    for i in FIRST_DYNAMIC_DEV..MAX_BLOCK_DEVICES {
+        if let Some(slot) = &reg[i] {
+            if slot.kind == DevKind::Ramdisk
+                && slot.ram_base == virt_base
+                && slot.info.total_sectors == info.total_sectors
+            {
+                return i as BlockDevId;
+            }
+        }
+    }
+    let Some(id) = (FIRST_DYNAMIC_DEV..MAX_BLOCK_DEVICES).find(|&i| reg[i].is_none()) else {
+        return INVALID_U8;
+    };
+    let mut slot = DeviceSlot::new(boxed, info, DevKind::Ramdisk);
+    slot.ram_base = virt_base;
+    reg[id] = Some(Arc::new(slot));
+    id as BlockDevId
+}
+
+/// Forget a device registered earlier. Only for a ramdisk the caller owns: the
+/// selftest's, whose backing memory goes away with it
+pub fn unregister_ramdisk(id: BlockDevId) {
+    let mut reg = REGISTRY.lock();
+    let i = id as usize;
+    if i < MAX_BLOCK_DEVICES {
+        if let Some(slot) = &reg[i] {
+            if slot.kind != DevKind::Ramdisk {
+                return;
+            }
+        }
+        reg[i] = None;
+    }
+}
+
 pub fn register_ramdisk(phys_base: u64, len: u64) -> BlockDevId {
     let boxed: Box<dyn BlockDriver> = Box::new(crate::drivers::block::ramdisk::RamBlockDev::new(phys_base, len));
     let info = boxed.info();
@@ -224,7 +274,10 @@ pub fn register_ramdisk(phys_base: u64, len: u64) -> BlockDevId {
     // Reuse a slot already backing the same span (idempotent boot path)
     for i in FIRST_DYNAMIC_DEV..MAX_BLOCK_DEVICES {
         if let Some(slot) = &reg[i] {
-            if slot.kind == DevKind::Ramdisk && slot.info.total_sectors == info.total_sectors {
+            if slot.kind == DevKind::Ramdisk
+                && slot.ram_base == phys_base
+                && slot.info.total_sectors == info.total_sectors
+            {
                 return i as BlockDevId;
             }
         }
@@ -237,11 +290,14 @@ pub fn register_ramdisk(phys_base: u64, len: u64) -> BlockDevId {
         "[block] register dev {} (ramdisk) sectors={} ({} MB) @ phys {:#x}",
         id, info.total_sectors, info.total_sectors * 512 / (1024 * 1024), phys_base
     );
-    reg[id] = Some(Arc::new(DeviceSlot::new(boxed, info, DevKind::Ramdisk)));
+    let mut slot = DeviceSlot::new(boxed, info, DevKind::Ramdisk);
+    slot.ram_base = phys_base;
+    reg[id] = Some(Arc::new(slot));
     id as BlockDevId
 }
 
-/// Probe the PCI bus for storage controllers (IDE bus-master DMA, AHCI, virtio-blk) and register what is found into the dynamic id range.
+/// Probe the PCI bus for storage controllers (IDE bus-master DMA, AHCI,
+/// virtio-blk) and register what is found into the dynamic id range.
 /// Idempotent: runs the bus walk only once per boot
 pub fn probe() {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -274,10 +330,10 @@ pub fn probe() {
     }
 }
 
-/// GPT partition ranges per device - '(start_lba, sector_count)' - filled
-/// when the /dev block nodes are registered. Indexed by partition number
-/// minus one; 15 partitions per device match the /dev minor encoding
-/// ('minor = dev * 16 + part')
+/// GPT partition ranges per device, '(start_lba, sector_count)', filled when
+/// the /dev block nodes are registered. Indexed by partition number minus one;
+/// 15 partitions per device match the /dev minor encoding ('minor = dev * 16 +
+/// part')
 static PARTITIONS: Mutex<[[Option<(u64, u64)>; 15]; MAX_BLOCK_DEVICES]> =
     Mutex::new([[None; 15]; MAX_BLOCK_DEVICES]);
 
@@ -287,8 +343,8 @@ pub fn set_partition(dev_id: BlockDevId, part_idx: usize, start_lba: u64, sector
     }
 }
 
-/// Forget every partition range of a device - used by a partition rescan
-/// before re-reading the GPT, so a removed partition stops being addressable
+/// Forget every partition range of a device: for a partition rescan before
+/// re-reading the GPT, so a removed partition stops being addressable
 pub fn clear_partitions(dev_id: BlockDevId) {
     if (dev_id as usize) < MAX_BLOCK_DEVICES {
         PARTITIONS.lock()[dev_id as usize] = [None; 15];
@@ -365,8 +421,8 @@ pub fn read(dev_id: BlockDevId, lba: u64, count: u32, buf: &mut [u8]) -> Result<
             // command; random misses fetch just their own chunk
             let avail = (total - chunk_start) / cache::CHUNK_SECTORS;
             // Adaptive window: a fresh sequential stream gets 32 KiB; a
-            // sustained one (4+ chunks in a row) ramps to 64 KiB - the
-            // same ramp-up idea as Linux readahead
+            // sustained one (4+ chunks in a row) ramps to 64 KiB, as Linux
+            // readahead does
             let want = match streak {
                 0 => 1,
                 1..=3 => RA_CHUNKS,
@@ -374,7 +430,17 @@ pub fn read(dev_id: BlockDevId, lba: u64, count: u32, buf: &mut [u8]) -> Result<
             };
             let n = (want as u64).min(avail).max(1) as usize;
 
-            let mut window = [0u8; RA_MAX_CHUNKS * cache::CHUNK_BYTES];
+            // The window on the heap: 64 KiB is too much for a kernel stack
+            // frame (`mm::kstack`). With no memory for one the read takes just
+            // its own chunk, into `tmp`
+            let mut big: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+            let n = if n > 1 && big.try_reserve_exact(n * cache::CHUNK_BYTES).is_ok() {
+                big.resize(n * cache::CHUNK_BYTES, 0);
+                n
+            } else {
+                1
+            };
+            let window: &mut [u8] = if n > 1 { &mut big[..] } else { &mut tmp[..] };
             let sectors = (n as u64 * cache::CHUNK_SECTORS) as u32;
             driver_read(dev_id, chunk_start, sectors, &mut window[..n * cache::CHUNK_BYTES])?;
 
@@ -384,8 +450,8 @@ pub fn read(dev_id: BlockDevId, lba: u64, count: u32, buf: &mut [u8]) -> Result<
                 let victim = CACHE.lock().as_mut().and_then(|c| {
                     c.insert(dev_id, chunk + i as u64, &window[off..off + cache::CHUNK_BYTES], &mut evicted)
                 });
-                // Inserting clean data may displace someone's dirty chunk;
-                // it must reach the disk before the cache forgets it
+                // Inserting clean data may displace a dirty chunk, which must
+                // reach the disk before the cache forgets it
                 if let Some((vdev, vchunk)) = victim {
                     let vlba = vchunk * cache::CHUNK_SECTORS;
                     dispatch(vdev, BioDirection::Write, vlba, cache::CHUNK_SECTORS as u32, |drv| {
@@ -414,11 +480,12 @@ const RA_CHUNKS: usize = 8;
 /// Ramped-up readahead window for sustained sequential streams (64 KiB)
 const RA_MAX_CHUNKS: usize = 16;
 
-/// Write 'count' 512-byte sectors starting at 'lba' from 'buf' - write-back:
-/// the data lands in the buffer cache and the call returns; the device write
-/// happens on 'flush', on dirty-pressure, or when the chunk gets evicted.
-/// Sub-chunk writes read-modify-write their chunk so the cache always holds
-/// whole 4 KiB units. Anything the cache can't take (device tail, cache not up yet) is written through
+/// Write 'count' 512-byte sectors starting at 'lba' from 'buf', write-back: the
+/// data lands in the buffer cache and the call returns; the device write
+/// happens on 'flush', on dirty pressure, or when the chunk is evicted.
+/// Sub-chunk writes read-modify-write their chunk so the cache holds whole 4
+/// KiB units. Anything the cache cannot take (device tail, cache not up yet) is
+/// written through
 pub fn write(dev_id: BlockDevId, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
     if count == 0 {
         return Ok(());
@@ -458,7 +525,8 @@ pub fn write(dev_id: BlockDevId, lba: u64, count: u32, buf: &[u8]) -> Result<(),
                 c.insert_dirty(dev_id, chunk, &buf[buf_off..buf_off + len], &mut evicted)
             })
         } else {
-            // Partial chunk: merge into the resident copy, or read-modify - write to make it resident
+            // Partial chunk: merge into the resident copy, or read-modify-write
+            // to make it resident
             let merged = CACHE.lock().as_mut().map_or(false, |c| {
                 c.merge_dirty(dev_id, chunk, s - chunk_start, &buf[buf_off..buf_off + len])
             });
@@ -475,7 +543,7 @@ pub fn write(dev_id: BlockDevId, lba: u64, count: u32, buf: &[u8]) -> Result<(),
             }
         };
 
-        // A dirty chunk got evicted to make room - write it out now
+        // A dirty chunk was evicted to make room: write it out now
         if let Some((vdev, vchunk)) = victim {
             let vlba = vchunk * cache::CHUNK_SECTORS;
             dispatch(vdev, BioDirection::Write, vlba, cache::CHUNK_SECTORS as u32, |drv| {
@@ -484,7 +552,7 @@ pub fn write(dev_id: BlockDevId, lba: u64, count: u32, buf: &[u8]) -> Result<(),
         }
     }
 
-    // Backpressure: don't let dirty data swamp the cache
+    // Backpressure, so dirty data cannot swamp the cache
     let dirty = CACHE.lock().as_ref().map_or(0, |c| c.dirty_count());
     if dirty > DIRTY_HIGH_WATER {
         flush_dirty_only(dev_id)?;
@@ -512,11 +580,10 @@ pub fn write_sync(dev_id: BlockDevId, lba: u64, count: u32, buf: &[u8]) -> Resul
     result
 }
 
-/// Barrier write: like 'write_sync' but the data is committed to stable
-/// media with Force Unit Access, so it survives a power loss the instant
-/// this returns - no separate device flush needed. This is the durability
-/// primitive for journal commit blocks. Backends without a hardware FUA
-/// bit fall back to write-plus-flush, which is heavier but just as safe
+/// Barrier write: like 'write_sync', but committed to stable media with Force
+/// Unit Access, surviving a power loss the instant this returns, with no
+/// separate device flush. The durability primitive for journal commit blocks.
+/// Backends without a hardware FUA bit fall back to write-plus-flush
 pub fn write_barrier(dev_id: BlockDevId, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
     if count == 0 {
         return Ok(());
@@ -533,19 +600,28 @@ pub fn write_barrier(dev_id: BlockDevId, lba: u64, count: u32, buf: &[u8]) -> Re
     result
 }
 
-/// Write out every dirty chunk of 'dev_id' in ascending LBA order - a
-/// single elevator sweep across the disk. Adjacent dirty chunks coalesce
-/// into one driver command of up to 64 KiB (the block layer's request
-/// merging). Returns how many chunks went out
+/// Write out every dirty chunk of 'dev_id' in ascending LBA order: one elevator
+/// sweep across the disk. Adjacent dirty chunks coalesce into one driver
+/// command of up to 64 KiB. Returns how many chunks went out
 fn flush_dirty_only(dev_id: BlockDevId) -> Result<usize, BlkError> {
     /// Merge window: 16 chunks = 64 KiB = one full driver transfer
     const MERGE_CHUNKS: usize = 16;
-    let mut tmp = [0u8; MERGE_CHUNKS * cache::CHUNK_BYTES];
+    // On the heap: 64 KiB is too much for a kernel stack frame, and an `fsync`
+    // reaches here (`mm::kstack`). With no memory for it the runs go a chunk at
+    // a time
+    let mut one = [0u8; cache::CHUNK_BYTES];
+    let mut big: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let (tmp, merge): (&mut [u8], usize) = if big.try_reserve_exact(MERGE_CHUNKS * cache::CHUNK_BYTES).is_ok() {
+        big.resize(MERGE_CHUNKS * cache::CHUNK_BYTES, 0);
+        (&mut big[..], MERGE_CHUNKS)
+    } else {
+        (&mut one[..], 1)
+    };
     let mut after = 0u64;
     let mut flushed = 0usize;
     loop {
         let (chunk, n) = match CACHE.lock().as_mut().and_then(|c| {
-            c.pop_dirty_run(dev_id, after, &mut tmp, MERGE_CHUNKS)
+            c.pop_dirty_run(dev_id, after, tmp, merge)
         }) {
             Some(run) => run,
             None => break,
@@ -561,16 +637,22 @@ fn flush_dirty_only(dev_id: BlockDevId) -> Result<usize, BlkError> {
     Ok(flushed)
 }
 
-/// Background writeback daemon - MikuOS's flusher thread. Wakes every
-/// couple of seconds and sweeps each device's dirty chunks out to disk, so
-/// write-back data never lingers in RAM indefinitely even when nobody
-/// calls 'sync'. Registered with mikuD as the 'bdflush' service
+/// Background writeback daemon. Wakes every couple of seconds and sweeps each
+/// device's dirty chunks out to disk, so write-back data does not linger in RAM
+/// when nobody calls 'sync'. Registered with mikuD as the 'bdflush' service
 pub fn writeback_thread() -> ! {
     // 500 ticks @ 250 Hz = 2 s between sweeps
     const INTERVAL_TICKS: u64 = 500;
     crate::serial_println!("[bdflush] thread started");
     loop {
         crate::sched::sleep(INTERVAL_TICKS);
+        // Files' pages dirty for five seconds go to their filesystems first,
+        // and so into this cache for the sweep below
+        // (`fs/vfs/core/writeback.rs`)
+        crate::fs::vfs::core::writeback::writeback_old();
+        // Then each filesystem's journal commit, which the sweep below writes
+        // out with the rest
+        crate::fs::ext::mount::periodic_sync();
         if CACHE.lock().as_ref().map_or(0, |c| c.dirty_count()) == 0 {
             continue;
         }
@@ -592,11 +674,18 @@ pub fn writeback_thread() -> ! {
 /// Flush threshold: at half the cache dirty, writers start draining
 const DIRTY_HIGH_WATER: usize = 256;
 
+/// Device commands made by a task holding the VFS lock to write, reads and
+/// writes: how many, how long in all and the longest, in ns. Every other
+/// VFS call waits for them (`/proc/lockstat`)
+pub static IO_UNDER_VFS: [[core::sync::atomic::AtomicU64; 3]; 2] =
+    [const { [const { core::sync::atomic::AtomicU64::new(0) }; 3] }; 2];
+
 fn driver_read(dev_id: BlockDevId, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError> {
     dispatch(dev_id, BioDirection::Read, lba, count, |drv| drv.read_blocks(lba, count, buf))
 }
 
-/// '(hits, misses, readaheads, write_merges, dirty)' from the shared buffer cache
+/// '(hits, misses, readaheads, write_merges, dirty)' from the shared buffer
+/// cache
 pub fn cache_stats() -> (u64, u64, u64, u64, u64) {
     match CACHE.lock().as_ref() {
         Some(c) => (c.hits, c.misses, c.readaheads, c.write_merges, c.dirty_count() as u64),
@@ -665,12 +754,12 @@ pub fn health(dev_id: BlockDevId) -> Option<driver::HealthInfo> {
     }
 }
 
-/// Tell the device a sector range no longer holds useful data (TRIM /
-/// NVMe deallocate / virtio discard). The range's contents become
-/// indeterminate. Cache chunks fully inside the range are dropped first -
-/// dirty ones included, their data is dead by definition - so writeback
-/// can't re-materialize discarded sectors; partially-covered edge chunks
-/// stay resident, since their out-of-range sectors are still live
+/// Tell the device a sector range no longer holds useful data (TRIM / NVMe
+/// deallocate / virtio discard). The range's contents become indeterminate.
+/// Cache chunks fully inside the range are dropped first, dirty ones included
+/// (their data is dead), so writeback cannot re-materialize discarded sectors;
+/// partially-covered edge chunks stay resident, as their out-of-range sectors
+/// are live
 pub fn discard(dev_id: BlockDevId, lba: u64, count: u32) -> Result<(), BlkError> {
     let Some(inf) = info(dev_id) else { return Err(BlkError::NoDevice) };
     if !inf.discard {
@@ -689,13 +778,12 @@ pub fn discard(dev_id: BlockDevId, lba: u64, count: u32) -> Result<(), BlkError>
     dispatch(dev_id, BioDirection::Discard, lba, count, |drv| drv.discard(lba, count))
 }
 
-/// Zero a sector range. Unlike 'discard', the range is guaranteed to read
-/// back as zeros. The chunk-aligned middle takes the device-side fast path
-/// (NVMe Write Zeroes / virtio WRITE_ZEROES - no data transfer); its cache
-/// chunks are dropped so later reads refetch zeros. The unaligned edges go
-/// through the regular write path, which keeps partially covered cache
-/// chunks coherent. Devices without a native command get zero-filled
-/// buffer writes instead
+/// Zero a sector range. Unlike 'discard', the range reads back as zeros. The
+/// chunk-aligned middle takes the device-side fast path (NVMe Write Zeroes /
+/// virtio WRITE_ZEROES, no data transfer); its cache chunks are dropped so
+/// later reads refetch zeros. The unaligned edges go through the regular write
+/// path, which keeps partially covered cache chunks coherent. Devices without a
+/// native command get zero-filled buffer writes
 pub fn write_zeroes(dev_id: BlockDevId, lba: u64, count: u32) -> Result<(), BlkError> {
     let Some(inf) = info(dev_id) else { return Err(BlkError::NoDevice) };
     if inf.read_only {
@@ -733,8 +821,11 @@ pub fn write_zeroes(dev_id: BlockDevId, lba: u64, count: u32) -> Result<(), BlkE
         return r;
     }
 
-    // Fallback: stream zero-filled buffers, one full transfer at a time
-    let zbuf = [0u8; 16 * cache::CHUNK_BYTES];
+    // Fallback: stream zero-filled buffers, one full transfer at a time. One
+    // buffer of zeros for every caller, not 64 KiB on each one's stack
+    // (`mm::kstack`)
+    static ZEROS: [u8; 16 * cache::CHUNK_BYTES] = [0; 16 * cache::CHUNK_BYTES];
+    let zbuf = &ZEROS;
     let mut at = mid_start;
     let mut left = mid_count;
     while left > 0 {
@@ -753,6 +844,9 @@ pub fn write_zeroes(dev_id: BlockDevId, lba: u64, count: u32) -> Result<(), BlkE
 /// everything previously written is durable
 pub fn flush(dev_id: BlockDevId) -> Result<(), BlkError> {
     flush_dirty_only(dev_id)?;
+    let under = crate::fs::vfs::core::writer_is_current();
+    let started = if under { crate::kcore::time::now_ns() } else { 0 };
+    let _counted = CountUnder { under, started, write: true };
 
     let Some(slot) = slot_ref(dev_id) else { return Err(BlkError::NoDevice) };
     if slot.kind == DevKind::Ata {
@@ -763,11 +857,32 @@ pub fn flush(dev_id: BlockDevId) -> Result<(), BlkError> {
     }
 }
 
+/// Counts a command into `IO_UNDER_VFS` when it ends, however it ends
+struct CountUnder {
+    under: bool,
+    started: u64,
+    write: bool,
+}
+
+impl Drop for CountUnder {
+    fn drop(&mut self) {
+        use core::sync::atomic::Ordering;
+        if !self.under {
+            return;
+        }
+        let took = crate::kcore::time::now_ns().saturating_sub(self.started);
+        let c = &IO_UNDER_VFS[self.write as usize];
+        c[0].fetch_add(1, Ordering::Relaxed);
+        c[1].fetch_add(took, Ordering::Relaxed);
+        c[2].fetch_max(took, Ordering::Relaxed);
+    }
+}
+
 /// Core dispatch: push the op onto the accounting queue, then run it through
-/// the driver's '&self' method with no device-wide lock. Several CPUs can be
-/// in here for the same NVMe at once (each routed to its own queue); legacy
-/// ATA still takes the shared bus lock since its channels share I/O ports.
-/// All accounting and the failfast state machine are atomic
+/// the driver's '&self' method with no device-wide lock. Several CPUs can be in
+/// here for the same NVMe at once (each routed to its own queue); legacy ATA
+/// takes the shared bus lock since its channels share I/O ports. All accounting
+/// and the failfast state machine are atomic
 fn dispatch<F>(
     dev_id: BlockDevId,
     dir: BioDirection,
@@ -784,10 +899,14 @@ where
 
     let Some(slot) = slot_ref(dev_id) else { return Err(BlkError::NoDevice) };
 
+    let under = crate::fs::vfs::core::writer_is_current();
+    let started = if under { crate::kcore::time::now_ns() } else { 0 };
+    let _counted = CountUnder { under, started, write: matches!(dir, BioDirection::Write) };
+
     let block_count = count.min(u16::MAX as u32) as u16;
     let ticket = BIO
         .lock()
-        .submit(dir, dev_id, lba, block_count, INVALID_ID)
+        .submit(dir, dev_id, lba, block_count, INVALID_PAGE)
         .ok();
 
     // Failfast: an offline device rejects I/O at once rather than spinning

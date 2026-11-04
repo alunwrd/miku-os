@@ -1,6 +1,6 @@
 use crate::drivers::bus::pci::PciDevice;
-use crate::net::NetworkDriver;
-use alloc::boxed::Box;
+use crate::net::{NetworkDriver, RxMeta};
+use crate::mm::dma::{DmaBox, DMA32};
 use x86_64::instructions::port::Port;
 
 const TX_BUF_SIZE: usize = 1536;
@@ -11,13 +11,17 @@ struct TxBuf([u8; TX_BUF_SIZE]);
 #[repr(align(4096))]
 struct RxBuf([u8; RX_BUF_SIZE]);
 
+// SAFETY: bytes only
+unsafe impl crate::mm::dma::Zeroed for TxBuf {}
+unsafe impl crate::mm::dma::Zeroed for RxBuf {}
+
 pub struct Rtl8139 {
     base: u16,
     pub mac: [u8; 6],
     tx_slot: usize,
     rx_offset: usize,
-    tx_bufs: Box<[TxBuf; 4]>,
-    rx_buf: Box<RxBuf>,
+    tx_bufs: DmaBox<[TxBuf; 4]>,
+    rx_buf: DmaBox<RxBuf>,
 }
 
 impl Rtl8139 {
@@ -28,13 +32,9 @@ impl Rtl8139 {
             mac: [0; 6],
             tx_slot: 0,
             rx_offset: 0,
-            tx_bufs: Box::new([
-                TxBuf([0; TX_BUF_SIZE]),
-                TxBuf([0; TX_BUF_SIZE]),
-                TxBuf([0; TX_BUF_SIZE]),
-                TxBuf([0; TX_BUF_SIZE]),
-            ]),
-            rx_buf: Box::new(RxBuf([0; RX_BUF_SIZE])),
+            // The 8139 addresses 32 bits
+            tx_bufs: DmaBox::new_below(DMA32).ok()?,
+            rx_buf: DmaBox::new_below(DMA32).ok()?,
         };
         drv.init();
         Some(drv)
@@ -76,7 +76,7 @@ impl Rtl8139 {
         for i in 0..6 {
             self.mac[i] = self.read8(0x00 + i as u8);
         }
-        let rx_phys = crate::net::virt_to_phys(self.rx_buf.0.as_ptr() as u64);
+        let rx_phys = self.rx_buf.phys_of(self.rx_buf.0.as_ptr());
         self.write32(0x30, rx_phys as u32);
         self.write32(
             0x44,
@@ -95,14 +95,14 @@ impl NetworkDriver for Rtl8139 {
         }
         let slot = self.tx_slot;
         self.tx_bufs[slot].0[..data.len()].copy_from_slice(data);
-        let tx_phys = crate::net::virt_to_phys(self.tx_bufs[slot].0.as_ptr() as u64);
+        let tx_phys = self.tx_bufs.phys_of(self.tx_bufs[slot].0.as_ptr());
         self.write32(0x20 + slot as u8 * 4, tx_phys as u32);
         self.write32(0x10 + slot as u8 * 4, data.len() as u32);
         self.tx_slot = (slot + 1) % 4;
         true
     }
 
-    fn recv(&mut self, handler: &mut dyn FnMut(&[u8])) {
+    fn recv(&mut self, handler: &mut dyn FnMut(&[u8], RxMeta) -> bool) {
         loop {
             if self.read8(0x37) & 0x01 != 0 {
                 break;
@@ -116,12 +116,19 @@ impl NetworkDriver for Rtl8139 {
                 self.write16(0x38, 0xFFF0);
                 break;
             }
+            let mut go_on = true;
             if off + 4 + pkt_len - 4 <= RX_BUF_SIZE {
-                handler(&self.rx_buf.0[off + 4..off + pkt_len]);
+                go_on = handler(&self.rx_buf.0[off + 4..off + pkt_len], RxMeta::default());
             }
             self.rx_offset = (off + 4 + pkt_len + 3) & !3;
             self.rx_offset %= 8192 + 16;
             self.write16(0x38, (self.rx_offset as u16).wrapping_sub(0x10));
+
+            // Read pointer has advanced past the frame taken; stop before
+            // consuming more of the ring
+            if !go_on {
+                break;
+            }
         }
         self.write16(0x3E, 0xFFFF);
     }

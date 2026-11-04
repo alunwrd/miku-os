@@ -1,52 +1,31 @@
 //  ext2/ext3/ext4 mount state
-// 
-//  This used to live in shell/commands/ext2_cmds.rs, which meant the VFS,
-//  the syscall layer and the firmware loader all had to reach up into a shell
-//  command module to read or write the mounted filesystem - 54 references
-//  from 'fs', 'syscall', 'net' and 'kcore' into 'crate::shell'. The mount
-//  table belongs to the filesystem layer; the shell is just one of its users
+//
+// The VFS, the syscall layer and the firmware loader read and write the mounted
+// filesystem through this table; the shell is one of its users
 
 use crate::drivers::block::ata::AtaDrive;
-use crate::fs::ext::ext3::journal::{TxnTag, DEFAULT_JOURNAL_BLOCKS};
-use crate::fs::ext::reader::DiskReader;
+pub use crate::fs::registry::FsProbe;
+use crate::fs::vfs::types::FsType;
+use crate::fs::ext::ext3::journal::DEFAULT_JOURNAL_BLOCKS;
+use crate::fs::host::KernelHost;
 use crate::fs::ext::structs::*;
-use crate::fs::ext::MikuFS;
+use crate::fs::ext::mount_check::{MountError, MountReject};
+use crate::fs::ext::{DiskReader, MikuFS};
 use crate::{print_error, print_success, println, serial_println};
 use alloc::vec::Vec;
 use spin::Mutex;
 
 pub const MAX_MOUNTS: usize = 4;
 
-const EMPTY_FS: MikuFS = MikuFS {
-    superblock:       Superblock { data: [0; 1024] },
-    block_size:       0,
-    inodes_per_group: 0,
-    blocks_per_group: 0,
-    group_count:      0,
-    groups:           Vec::new(),
-    reader: DiskReader {
-        dev_id:    crate::fs::vfs::types::INVALID_U8,
-        start_lba: 0,
-        io_count:  0,
-    },
-    journal_seq:      0,
-    journal_pos:      0,
-    journal_maxlen:   0,
-    journal_first:    0,
-    journal_active:   false,
-    txn_active:       false,
-    txn_desc_pos:     0,
-    txn_tags:         [TxnTag { fs_block: 0, journal_pos: 0 }; 64],
-    txn_tag_count:    0,
-    txn_revokes:      [0; 128],
-    txn_revoke_count: 0,
-    block_cache:      None,
-    superblock_dirty: false,
-    groups_dirty:     Vec::new(),
-    last_sync_ticks:  0,
-    journal_inode_cached: None,
-    alloc_hint: Vec::new(),
-};
+/// What an unused mount slot holds.
+///
+/// The table is a fixed array of filesystem handles with a `ready` flag, so
+/// every slot needs a value. Its device id is the invalid one, so operations on
+/// an unready slot fail at the block layer
+const EMPTY_FS: MikuFS = MikuFS::with_reader(DiskReader::new_read_only(
+    KernelHost::invalid(),
+    0,
+));
 
 pub struct ExtFsState {
     pub slots:       [MikuFS; MAX_MOUNTS],
@@ -54,14 +33,13 @@ pub struct ExtFsState {
     pub drive_idx:   [usize; MAX_MOUNTS],
     pub start_lba:   [u32; MAX_MOUNTS],
     pub active_slot: usize,
-    /// VFS vnode id of each slot's mountpoint, or INVALID_VNODE when the
-    /// slot is mounted at the disk layer but not yet attached to the VFS via
-    /// mount. Lets us umount a specific path instead of always tearing
-    /// down active_slot
-    pub mount_vnode: [u16; MAX_MOUNTS],
+    /// VFS vnode id of each slot's mountpoint, or INVALID_VNODE when the slot
+    /// is mounted at the disk layer but not attached to the VFS. For an umount
+    /// of a specific path, not of active_slot
+    pub mount_vnode: [crate::fs::vfs::types::InodeId; MAX_MOUNTS],
 }
 
-pub const INVALID_VNODE: u16 = u16::MAX;
+pub const INVALID_VNODE: crate::fs::vfs::types::InodeId = crate::fs::vfs::types::INVALID_ID;
 
 impl ExtFsState {
     const fn new() -> Self {
@@ -94,13 +72,57 @@ impl ExtFsState {
     }
 }
 
-pub static STATE: Mutex<ExtFsState> = Mutex::new(ExtFsState::new());
+/// The mount table.
+///
+/// A `SchedMutex`, like `VFS_LOCK`: `with_ext2_for` holds this across whatever
+/// it was given, which reads and writes the disk. A spinning waiter burns a
+/// full timeslice per CPU, and on a uniprocessor cannot let the holder finish
+/// its I/O
+pub static STATE: crate::kcore::sched_lock::SchedMutex<ExtFsState> =
+    crate::kcore::sched_lock::SchedMutex::named("ext", ExtFsState::new());
 
-pub fn with_ext2<F, R>(f: F) -> Option<R>
+
+/// Work on one mounted filesystem by slot number, not the active one
+///
+/// An install deals with two: the boot medium it reads and the disk it writes.
+/// Switching the active slot between chunks would move it under anything else
+/// running
+pub fn with_ext2_slot<F, R>(slot: usize, f: F) -> Option<R>
 where
     F: FnOnce(&mut MikuFS) -> R,
 {
-    STATE.lock().active_fs().map(f)
+    let mut state = STATE.lock();
+    if slot >= MAX_MOUNTS || !state.ready[slot] {
+        return None;
+    }
+    Some(f(&mut state.slots[slot]))
+}
+
+/// True when that slot is mounted and refuses writes
+pub fn slot_read_only(slot: usize) -> bool {
+    let state = STATE.lock();
+    slot < MAX_MOUNTS && state.ready[slot] && state.slots[slot].reader.read_only
+}
+
+/// True when that slot will accept a write.
+///
+/// Not the negation of `slot_read_only`: an unmounted slot is neither read-only
+/// nor writable, and a caller asking "may I write here" must be told no.
+/// `slot_read_only` answers false for an empty slot.
+pub fn slot_writable(slot: usize) -> bool {
+    let state = STATE.lock();
+    slot < MAX_MOUNTS && state.ready[slot] && !state.slots[slot].reader.read_only
+}
+
+/// Which drive a mounted slot came from, for a caller that has a slot and
+/// needs to know which disk it must not touch
+pub fn slot_drive(slot: usize) -> Option<usize> {
+    let state = STATE.lock();
+    if slot < MAX_MOUNTS && state.ready[slot] {
+        Some(state.drive_idx[slot])
+    } else {
+        None
+    }
 }
 
 pub fn is_ext2_ready() -> bool {
@@ -112,26 +134,112 @@ pub fn active_slot_index() -> usize {
     STATE.lock().active_slot
 }
 
-pub fn active_fs_type() -> crate::fs::vfs::types::FsType {
+/// True when the active ext mount refuses writes. Boot-time mounts are
+/// read-only, so neither the ring-3 shell exec'd off the disk nor an atime
+/// stamp can dirty the medium before someone asks
+pub fn active_read_only() -> bool {
     let state = STATE.lock();
     let slot = state.active_slot;
-    if !state.ready[slot] {
-        return crate::fs::vfs::types::FsType::Ext2;
-    }
-    match state.slots[slot].superblock.fs_version_str() {
-        "ext4" => crate::fs::vfs::types::FsType::Ext4,
-        "ext3" => crate::fs::vfs::types::FsType::Ext3,
-        _      => crate::fs::vfs::types::FsType::Ext2,
-    }
+    state.ready[slot] && state.slots[slot].reader.read_only
 }
 
-pub fn ext_fs_version_tag() -> &'static str {
+/// Promote a mounted slot to read-write. Journal replay, orphan cleanup and
+/// stamping the superblock mount state are all deferred to this point, so a
+/// read-only boot leaves the disk byte-for-byte untouched
+pub fn remount_rw(slot: usize) -> Result<(), &'static str> {
+    if slot >= MAX_MOUNTS { return Err("no such slot"); }
+    let mut state = STATE.lock();
+    if !state.ready[slot] { return Err("slot is empty"); }
+    if !state.slots[slot].reader.read_only { return Err("already read-write"); }
+
+    state.slots[slot].reader.read_only = false;
+
+    if state.slots[slot].journal_active
+        && !state.slots[slot]
+            .read_journal_superblock()
+            .map(|j| j.is_clean())
+            .unwrap_or(true)
+    {
+        match state.slots[slot].ext3_recover() {
+            Ok(0) => {}
+            Ok(n) => serial_println!("[ext3] slot {} recovery: replayed {} blocks", slot, n),
+            Err(e) => serial_println!("[ext3] slot {} recovery failed: {:?}", slot, e),
+        }
+    }
+    match state.slots[slot].cleanup_orphans() {
+        Ok(0) => {}
+        Ok(n) => serial_println!("[mount] cleaned {} orphan inodes", n),
+        Err(e) => serial_println!("[mount] orphan cleanup failed: {:?}", e),
+    }
+    state.slots[slot].update_mount_state();
+    let _ = state.slots[slot].flush_all_dirty_metadata();
+    serial_println!("[miku_extfs] slot {} remounted read-write", slot);
+    Ok(())
+}
+
+/// Drop a slot back to read-only. Flushes whatever is dirty first, and marks
+/// the filesystem cleanly unmounted so a later fsck does not see it as dirty
+pub fn remount_ro(slot: usize) -> Result<(), &'static str> {
+    if slot >= MAX_MOUNTS { return Err("no such slot"); }
+    let mut state = STATE.lock();
+    if !state.ready[slot] { return Err("slot is empty"); }
+    if state.slots[slot].reader.read_only { return Err("already read-only"); }
+
+    let _ = state.slots[slot].finish_unmount();
+    state.slots[slot].reader.read_only = true;
+    serial_println!("[miku_extfs] slot {} remounted read-only", slot);
+    Ok(())
+}
+
+/// The flavour of the filesystem in one slot.
+///
+/// `None` when that slot holds nothing. A vnode knows its slot, so this is the
+/// call to use: with the firmware store mounted first and the root disk second,
+/// the active slot at graft time is the ramdisk, not the root
+pub fn fs_type_of(slot: u8) -> Option<crate::fs::vfs::types::FsType> {
+    use crate::fs::vfs::types::FsType;
     let state = STATE.lock();
-    let slot = state.active_slot;
-    if !state.ready[slot] { return "ext"; }
+    let slot = slot as usize;
+    if slot >= MAX_MOUNTS || !state.ready[slot] {
+        return None;
+    }
+    let sb = &state.slots[slot].superblock;
+    Some(if sb.is_ext4() {
+        FsType::Ext4
+    } else if sb.is_ext3() {
+        FsType::Ext3
+    } else {
+        FsType::Ext2
+    })
+}
+
+/// The same, as the short name the shell and the mount log print
+pub fn fs_version_tag_of(slot: u8) -> &'static str {
+    let state = STATE.lock();
+    let slot = slot as usize;
+    if slot >= MAX_MOUNTS || !state.ready[slot] {
+        return "ext";
+    }
     state.slots[slot].superblock.fs_version_str()
 }
 
+/// The flavour of whichever filesystem is active.
+///
+/// Correct only with exactly one mounted, as for `with_ext2_pub`. Anything with
+/// a vnode uses `fs_type_of(vnode.ext2_slot)`
+pub fn active_fs_type() -> crate::fs::vfs::types::FsType {
+    let slot = STATE.lock().active_slot as u8;
+    fs_type_of(slot).unwrap_or(crate::fs::vfs::types::FsType::Ext2)
+}
+
+pub fn ext_fs_version_tag() -> &'static str {
+    let slot = STATE.lock().active_slot as u8;
+    fs_version_tag_of(slot)
+}
+
+/// Work on whichever filesystem is active.
+///
+/// Correct only when there is exactly one; see `with_ext2_for`
 pub fn with_ext2_pub<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut MikuFS) -> R,
@@ -139,11 +247,83 @@ where
     STATE.lock().active_fs().map(f)
 }
 
+
+/// Make every mounted filesystem durable. Returns the number synced, and the
+/// first error if any
+pub fn sync_all_mounts() -> Result<usize, crate::fs::ext::FsError> {
+    let mut state = STATE.lock();
+    let mut synced = 0;
+    let mut first_err = None;
+    for slot in 0..MAX_MOUNTS {
+        if !state.ready[slot] || state.slots[slot].reader.read_only {
+            continue;
+        }
+        match state.slots[slot].sync() {
+            Ok(()) => synced += 1,
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(synced),
+    }
+}
+
+/// The journal's periodic commit and checkpoint, on every mounted filesystem:
+/// the commit interval belongs to each, and a mount nothing has looked at
+/// recently has the oldest open transaction. bdflush's, every two seconds, so
+/// no operation closing a five-second-old transaction pays for the commit under
+/// the VFS lock
+pub fn periodic_sync() {
+    for_each_mount(|fs| fs.check_periodic_sync());
+}
+
+/// Run `f` on every mounted filesystem. The commit timer ticks on all of them,
+/// not only the active one
+pub fn for_each_mount<F>(mut f: F)
+where
+    F: FnMut(&mut MikuFS),
+{
+    let mut state = STATE.lock();
+    for slot in 0..MAX_MOUNTS {
+        if state.ready[slot] {
+            f(&mut state.slots[slot]);
+        }
+    }
+}
+
+/// Work on the filesystem a particular vnode belongs to.
+///
+/// `slot` is the vnode's `ext2_slot`. `INVALID_U8` means a vnode no mount
+/// attributed, and falls back to the active slot.
+///
+/// An inode number means nothing without its inode table: resolved against the
+/// wrong filesystem it reads a different file
+pub fn with_ext2_for<F, R>(slot: u8, f: F) -> Option<R>
+where
+    F: FnOnce(&mut MikuFS) -> R,
+{
+    let mut state = STATE.lock();
+    let idx = if (slot as usize) < MAX_MOUNTS && state.ready[slot as usize] {
+        slot as usize
+    } else {
+        state.active_slot
+    };
+    if !state.ready[idx] {
+        return None;
+    }
+    Some(f(&mut state.slots[idx]))
+}
+
 pub fn invalidate_vfs_ext_mounts() {
     let mut dropped_any = false;
 
     crate::fs::vfs::core::with_vfs(|vfs| {
-        for id in 0..crate::fs::vfs::MAX_VNODES {
+        for id in vfs.nodes.ids() {
             if !vfs.nodes[id].active {
                 continue;
             }
@@ -157,6 +337,7 @@ pub fn invalidate_vfs_ext_mounts() {
             vfs.evict_children_recursive(id);
             vfs.nodes[id].fs_type = crate::fs::vfs::FsType::TmpFS;
             vfs.nodes[id].ext2_ino = 0;
+            vfs.nodes[id].ext2_slot = crate::fs::vfs::types::INVALID_U8;
             vfs.nodes[id].children_loaded = false;
             dropped_any = true;
         }
@@ -167,9 +348,8 @@ pub fn invalidate_vfs_ext_mounts() {
     });
 
     if dropped_any {
-        // Anyone holding a cwd inside the vanished subtree has to be told.
-        // The filesystem does not get to know that a shell exists, so it
-        // publishes the event and interested layers subscribe
+        // Anyone holding a cwd inside the vanished subtree has to be told. The
+        // filesystem publishes the event and interested layers subscribe
         if let Some(hook) = *UNMOUNT_HOOK.lock() {
             hook();
         }
@@ -198,7 +378,7 @@ pub fn force_unmount() {
 /// Record which VFS vnode is the root of slot's mount. Called by the
 /// mount shell command after it grafts an ext-family slot onto a VFS
 /// directory.
-pub fn register_mount_vnode(slot: usize, vnode: u16) {
+pub fn register_mount_vnode(slot: usize, vnode: crate::fs::vfs::types::InodeId) {
     if slot >= MAX_MOUNTS { return; }
     let mut state = STATE.lock();
     state.mount_vnode[slot] = vnode;
@@ -206,7 +386,7 @@ pub fn register_mount_vnode(slot: usize, vnode: u16) {
 
 /// Reverse lookup: given a VFS vnode id, return the ext slot whose mount
 /// root is that vnode, or None if the vnode is not a known mountpoint
-pub fn slot_for_vnode(vnode: u16) -> Option<usize> {
+pub fn slot_for_vnode(vnode: crate::fs::vfs::types::InodeId) -> Option<usize> {
     let state = STATE.lock();
     for s in 0..MAX_MOUNTS {
         if state.ready[s] && state.mount_vnode[s] == vnode {
@@ -216,26 +396,27 @@ pub fn slot_for_vnode(vnode: u16) -> Option<usize> {
     None
 }
 
-/// Tear down a specific ext slot. Unlike force_unmount (which always
-/// targets active_slot), this lets umount <path> drop only the slot
-/// owning that path, leaving any sibling mounts intact
+/// Tear down a specific ext slot. Unlike force_unmount (always active_slot),
+/// this lets umount <path> drop only the slot owning that path, leaving sibling
+/// mounts intact
 ///
-/// Caller must already have evicted the corresponding VFS subtree
+/// The caller has already evicted the corresponding VFS subtree
 pub fn unmount_slot(slot: usize) {
     if slot >= MAX_MOUNTS { return; }
     let mut state = STATE.lock();
     if !state.ready[slot] { return; }
 
-    let _ = state.slots[slot].sync();
-    state.slots[slot].mark_clean_unmount();
-    let _ = state.slots[slot].flush_all_dirty_metadata();
+    // A read-only slot has nothing dirty and no mount state to clear
+    if !state.slots[slot].reader.read_only {
+        let _ = state.slots[slot].finish_unmount();
+    }
     state.ready[slot] = false;
     state.slots[slot].block_cache = None;
     state.slots[slot].journal_inode_cached = None;
     state.mount_vnode[slot] = INVALID_VNODE;
 
-    // If we just dropped the active slot, fail over to any other ready slot
-    // so subsequent ext commands keep working without an explicit fs.select
+    // If the active slot was dropped, fail over to any other ready slot, so ext
+    // commands keep working without an explicit fs.select
     if state.active_slot == slot {
         for s in 0..MAX_MOUNTS {
             if state.ready[s] {
@@ -246,12 +427,11 @@ pub fn unmount_slot(slot: usize) {
     }
 }
 
-/// Snapshot every ext slot that currently has a VFS mount attached
-/// Returns up to MAX_MOUNTS (slot, vnode_id, fs_version_tag) tuples;
-/// slots that are mounted at the disk layer but not yet grafted onto the
-/// VFS are skipped
-pub fn mounted_slots_snapshot() -> [Option<(usize, u16, &'static str)>; MAX_MOUNTS] {
-    let mut out: [Option<(usize, u16, &'static str)>; MAX_MOUNTS] = [None; MAX_MOUNTS];
+/// Snapshot every ext slot with a VFS mount attached. Returns up to MAX_MOUNTS
+/// (slot, vnode_id, fs_version_tag) tuples; slots mounted at the disk layer but
+/// not grafted onto the VFS are skipped
+pub fn mounted_slots_snapshot() -> [Option<(usize, crate::fs::vfs::types::InodeId, &'static str)>; MAX_MOUNTS] {
+    let mut out: [Option<(usize, crate::fs::vfs::types::InodeId, &'static str)>; MAX_MOUNTS] = [None; MAX_MOUNTS];
     let state = STATE.lock();
     for s in 0..MAX_MOUNTS {
         if state.ready[s] && state.mount_vnode[s] != INVALID_VNODE {
@@ -298,14 +478,54 @@ pub fn invalidate_drive_mounts(drive_idx: usize, start_lba: u32) {
     }
 }
 
-pub struct ExtProbe {
-    pub drive: usize,
-    pub block_size: u32,
-    pub fs_version: &'static str,
+/// Every ext filesystem this machine can see, whole-disk and in-partition
+/// alike, without mounting any of them. Reads superblocks; writes nothing
+pub fn scan_volumes() -> Vec<FsProbe> {
+    let mut found = Vec::new();
+
+    for drive in 0..crate::fs::vfs::types::MAX_BLOCK_DEVICES {
+        let dev = dev_for_idx(drive);
+
+        // Ask before reading. An empty IDE slot answers every read with a fault
+        // the block layer retries twice, at a hardware timeout each: most of a
+        // second per absent drive. A device that never answered IDENTIFY, or
+        // answered with no sectors, has nothing to probe, as in
+        // gpt_probe_sectors
+        match crate::io::block::info(dev) {
+            Some(i) if i.total_sectors > 0 => {}
+            _ => continue,
+        }
+
+        if let Some(p) = crate::fs::registry::probe(drive, 0) {
+            found.push(p);
+        }
+
+        // A filesystem laid down by 'install' is inside a GPT partition, so LBA
+        // 0 alone would miss it
+        if let Ok(table) = crate::fs::gpt::gpt_read(dev) {
+            for e in table.entries.iter() {
+                if !e.is_used() || e.is_swap() || e.start_lba == 0 {
+                    continue;
+                }
+                let lba = match u32::try_from(e.start_lba) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(p) = crate::fs::registry::probe(drive, lba) {
+                    found.push(p);
+                }
+            }
+        }
+    }
+
+    found
 }
 
-pub fn probe_drive(drive_index: usize, start_lba: u32) -> Option<ExtProbe> {
-    let mut reader = DiskReader::from_dev(dev_for_idx(drive_index), start_lba);
+/// ext's entry in the probe registry (`kernel/fs/registry.rs`).
+///
+/// The superblock is at byte 1024, so sector 2
+pub fn probe_ext(drive_index: usize, start_lba: u32) -> Option<FsProbe> {
+    let mut reader = DiskReader::new_partitioned(KernelHost::new(dev_for_idx(drive_index)), start_lba);
     let mut sector = [0u8; 512];
     if reader.read_sector(2, &mut sector).is_err() {
         return None;
@@ -328,54 +548,250 @@ pub fn probe_drive(drive_index: usize, start_lba: u32) -> Option<ExtProbe> {
     sb.data[0..512].copy_from_slice(&sector);
     sb.data[512..1024].copy_from_slice(&sector2);
 
-    Some(ExtProbe {
+    let name = sb.volume_name();
+    let mut label = [0u8; 16];
+    let label_len = name.len().min(16);
+    label[..label_len].copy_from_slice(&name.as_bytes()[..label_len]);
+
+    Some(FsProbe {
+        fs_type: if sb.is_ext4() {
+            FsType::Ext4
+        } else if sb.is_ext3() {
+            FsType::Ext3
+        } else {
+            FsType::Ext2
+        },
         drive: drive_index,
+        start_lba,
         block_size,
-        fs_version: sb.fs_version_str(),
+        version: sb.fs_version_str(),
+        label,
+        label_len: label_len as u8,
     })
 }
 
+/// What the boot line asked for as a root
+enum RootSpec {
+    /// 'root=<drive>[:<lba>]': the disk by its number on this machine
+    Numeric { drive: usize, lba: u32 },
+    /// 'root=LABEL=<name>': the disk by what is written inside it, which
+    /// survives a move to another port
+    Label { name: [u8; 16], len: usize },
+}
+
+/// Parse 'root=' off the boot command line. There is no default: a physical
+/// disk is touched only when the boot line names it, by number or by label
+fn root_from_cmdline() -> Option<RootSpec> {
+    let mut buf = [0u8; 64];
+    let n = crate::arch::x86_64::grub::cmdline_arg("root", &mut buf)?;
+    let val = core::str::from_utf8(&buf[..n]).ok()?;
+
+    if let Some(rest) = val.strip_prefix("LABEL=") {
+        // The superblock holds 16 bytes, so a longer name could never match;
+        // refused, not truncated
+        if rest.is_empty() || rest.len() > 16 {
+            serial_println!(
+                "[miku_extfs] root=LABEL= wants 1 to 16 characters, got {}", rest.len()
+            );
+            return None;
+        }
+        let mut name = [0u8; 16];
+        name[..rest.len()].copy_from_slice(rest.as_bytes());
+        return Some(RootSpec::Label { name, len: rest.len() });
+    }
+
+    let (drive_str, lba_str) = match val.split_once(':') {
+        Some((d, l)) => (d, l),
+        None => (val, ""),
+    };
+    let drive: usize = drive_str.parse().ok()?;
+    if drive >= crate::fs::vfs::types::MAX_BLOCK_DEVICES {
+        return None;
+    }
+    let lba: u32 = if lba_str.is_empty() { 0 } else { lba_str.parse().ok()? };
+    Some(RootSpec::Numeric { drive, lba })
+}
+
+/// Why the boot line's root was not mounted, kept for the console.
+///
+/// `mount_root_disk` runs long before the console exists, when a refusal
+/// reaches only a serial cable
+static ROOT_TROUBLE: Mutex<Vec<alloc::string::String>> = Mutex::new(Vec::new());
+
+fn trouble(line: alloc::string::String) {
+    serial_println!("{}", line);
+    ROOT_TROUBLE.lock().push(line);
+}
+
+/// Hand over what went wrong with the root, once. The shell prints it under
+/// its banner
+pub fn take_root_trouble() -> Vec<alloc::string::String> {
+    core::mem::take(&mut *ROOT_TROUBLE.lock())
+}
+
+/// Resolve 'root=LABEL=<name>' to the one volume that answers to it.
+///
+/// One match is the boot line naming a disk. None and several are both
+/// refusals: picking one of two disks called 'mikuos' would be auto-selection
+fn root_from_label(name: &str) -> Option<(usize, u32)> {
+    let all = scan_volumes();
+    let mut hits = all.iter().filter(|p| p.label_str() == name);
+
+    let first = match hits.next() {
+        Some(p) => p,
+        None => {
+            trouble(alloc::format!("  no filesystem here is labelled '{}'", name));
+            if all.is_empty() {
+                trouble(alloc::format!("  no ext filesystem found on any drive at all"));
+            } else {
+                trouble(alloc::format!("  what is here:"));
+                for p in &all {
+                    trouble(alloc::format!(
+                        "    drive {}:{} - {} labelled '{}'",
+                        p.drive, p.start_lba, p.version, p.label_str()
+                    ));
+                }
+            }
+            trouble(alloc::format!(
+                "  edit root= at the GRUB menu, or mount one with 'ext2mount <drive> <lba>'"
+            ));
+            return None;
+        }
+    };
+
+    if let Some(second) = hits.next() {
+        trouble(alloc::format!(
+            "  more than one filesystem is labelled '{}' - not guessing:", name
+        ));
+        trouble(alloc::format!("    drive {}:{}", first.drive, first.start_lba));
+        trouble(alloc::format!("    drive {}:{}", second.drive, second.start_lba));
+        for p in hits {
+            trouble(alloc::format!("    drive {}:{}", p.drive, p.start_lba));
+        }
+        trouble(alloc::format!(
+            "  boot the 'root by number' menu entry, or edit root= at the GRUB menu"
+        ));
+        return None;
+    }
+
+    Some((first.drive, first.start_lba))
+}
+
+/// Bring up the root filesystem at boot.
+///
+/// Two rules. Nothing is auto-selected: a physical disk is mounted only when
+/// the boot line says 'root=<drive>'. Nothing is mounted read-write: mounting
+/// rw stamps the superblock mount counter, replays the journal and cleans
+/// orphans, and reading a file off it (exec of /bin/mikudo) stamps atime.
+/// 'fs.rw' opts in
 pub fn mount_root_disk() -> bool {
-    // Prefer a firmware GRUB module (RAM-backed): a single boot medium then
-    // carries the kernel and /lib/firmware with no second disk. Fall back to
-    // ATA drive 1 (the QEMU disk.img layout) when no module is present.
+    // The firmware GRUB module is RAM-backed, the boot medium and not a user's
+    // disk, so it comes up without being named. Read-only as well: writes to it
+    // are lost at reboot
     if let Some((start, end)) = crate::arch::x86_64::grub::module("firmware") {
         let dev = crate::io::block::register_ramdisk(start, end - start);
-        if dev != crate::fs::vfs::types::INVALID_U8 && mount_dev(dev) {
+        if dev != crate::fs::vfs::types::INVALID_U8 && mount_dev_ro(dev) {
             serial_println!(
-                "[miku_extfs] firmware store mounted from GRUB module (dev {})", dev
+                "[miku_extfs] firmware store mounted read-only from GRUB module (dev {})", dev
             );
             return true;
         }
-        serial_println!(
-            "[miku_extfs] firmware GRUB module present but ext mount failed; trying ATA drive 1"
-        );
+        serial_println!("[miku_extfs] firmware GRUB module present but ext mount failed");
     }
-    if STATE.lock().is_already_mounted(1, 0) {
-        return true;
+
+    mount_root_from_cmdline()
+}
+
+/// Mount whatever `root=` on the boot line names.
+///
+/// For two cases: no GRUB module, so this is the only root; and a module
+/// supplying /lib/firmware with the boot line asking for a persistent /bin and
+/// /etc. Nothing is mounted unless `root=` names it, and nothing is writable
+/// unless `rootrw` says so
+pub fn mount_root_from_cmdline() -> bool {
+    match root_from_cmdline() {
+        Some(spec) => {
+            let (drive, lba) = match spec {
+                RootSpec::Numeric { drive, lba } => {
+                    serial_println!("[miku_extfs] boot line asks for root={}:{}", drive, lba);
+                    (drive, lba)
+                }
+                RootSpec::Label { name, len } => {
+                    let name = match core::str::from_utf8(&name[..len]) {
+                        Ok(s) => s,
+                        Err(_) => return false,
+                    };
+                    serial_println!("[miku_extfs] boot line asks for root=LABEL={}", name);
+                    match root_from_label(name) {
+                        Some(found) => {
+                            serial_println!(
+                                "[miku_extfs] label '{}' -> drive {} lba {}",
+                                name, found.0, found.1
+                            );
+                            found
+                        }
+                        None => return false,
+                    }
+                }
+            };
+            if STATE.lock().is_already_mounted(drive, lba) {
+                return true;
+            }
+            // 'rootrw' next to 'root=' is the boot-line spelling of fs.rw
+            let rw = crate::arch::x86_64::grub::cmdline_flag("rootrw");
+            serial_println!(
+                "[miku_extfs] mounting drive {} lba {} {}",
+                drive, lba, if rw { "read-write" } else { "read-only" }
+            );
+            if rw { try_mount(drive, lba) } else { try_mount_ro(drive, lba) }
+        }
+        None => {
+            serial_println!(
+                "[miku_extfs] no root= on the boot line; no disk mounted automatically \
+                 (use 'ext2mount <drive>' to pick one)"
+            );
+            false
+        }
     }
-    try_mount(1, 0)
 }
 
 pub fn try_mount(drive_index: usize, start_lba: u32) -> bool {
-    try_mount_on(dev_for_idx(drive_index), drive_index, start_lba)
+    try_mount_on(dev_for_idx(drive_index), drive_index, start_lba, false)
+}
+
+/// Same, mounted read-only: no write reaches the medium until 'remount_rw'
+pub fn try_mount_ro(drive_index: usize, start_lba: u32) -> bool {
+    try_mount_on(dev_for_idx(drive_index), drive_index, start_lba, true)
 }
 
 /// Mount an ext filesystem directly from a registered block-device id, keying
-/// the mount bookkeeping on 'dev'. Used by the firmware loader to mount the
-/// RAM-backed GRUB-module store, whose id is a dynamically-registered device
-/// rather than a fixed 0-3 ATA slot. No-ops if already mounted
+/// the mount bookkeeping on 'dev'. Used by the firmware loader for the
+/// RAM-backed GRUB-module store, whose id is dynamically registered, not a
+/// fixed 0-3 ATA slot. No-op if already mounted
 pub fn mount_dev(dev: crate::fs::vfs::types::BlockDevId) -> bool {
     if STATE.lock().is_already_mounted(dev as usize, 0) {
         return true;
     }
-    try_mount_on(dev, dev as usize, 0)
+    try_mount_on(dev, dev as usize, 0, false)
+}
+
+/// Read-only variant of 'mount_dev', used by the boot path
+pub fn mount_dev_ro(dev: crate::fs::vfs::types::BlockDevId) -> bool {
+    if STATE.lock().is_already_mounted(dev as usize, 0) {
+        return true;
+    }
+    try_mount_on(dev, dev as usize, 0, true)
 }
 
 /// Core mount path: read the superblock + group-descriptor table from an
 /// already-resolved block device 'dev', recording the mount under the
 /// bookkeeping key 'drive_index'/'start_lba'.
-fn try_mount_on(dev: crate::fs::vfs::types::BlockDevId, drive_index: usize, start_lba: u32) -> bool {
+fn try_mount_on(
+    dev: crate::fs::vfs::types::BlockDevId,
+    drive_index: usize,
+    start_lba: u32,
+    read_only: bool,
+) -> bool {
     let mut state = STATE.lock();
 
     if state.is_already_mounted(drive_index, start_lba) {
@@ -392,42 +808,42 @@ fn try_mount_on(dev: crate::fs::vfs::types::BlockDevId, drive_index: usize, star
     };
 
     state.ready[slot] = false;
-    state.slots[slot].reader = DiskReader::from_dev(dev, start_lba);
-    state.slots[slot].block_cache = None;
-    state.slots[slot].journal_inode_cached = None;
 
-    let mut sector = [0u8; 512];
+    // Read, validate and bring up the filesystem. The checks that keep a
+    // corrupted or foreign volume from panicking this kernel are in the crate,
+    // under `cargo test` against hostile images
+    let fs = match MikuFS::open(KernelHost::new(dev), start_lba, read_only) {
+        Ok(fs) => fs,
+        Err(MountError::Io(_)) => {
+            serial_println!(
+                "[miku_extfs] drive {} lba {} - cannot read the superblock",
+                drive_index, start_lba
+            );
+            return false;
+        }
+        Err(MountError::Rejected(why)) => {
+            match why {
+                MountReject::BadMagic(m) => serial_println!(
+                    "[miku_extfs] drive {} lba {} - bad magic 0x{:04X}, skip",
+                    drive_index, start_lba, m
+                ),
+                MountReject::UnsupportedIncompat(bits) => print_error!(
+                    "  miku_extfs: volume uses incompatible features 0x{:X} this driver does \
+                     not implement - refusing to mount rather than misread it",
+                    bits
+                ),
+                other => print_error!(
+                    "  miku_extfs: unusable superblock on drive {} lba {}: {:?}",
+                    drive_index, start_lba, other
+                ),
+            }
+            return false;
+        }
+    };
 
-    if state.slots[slot].reader.read_sector(2, &mut sector).is_err() {
-        serial_println!(
-            "[miku_extfs] drive {} lba {} - cannot read sector 2",
-            drive_index, start_lba
-        );
-        return false;
-    }
-    state.slots[slot].superblock.data[0..512].copy_from_slice(&sector);
+    state.slots[slot] = fs;
 
-    let magic_lo = u16::from_le_bytes([sector[56], sector[57]]);
-    if magic_lo != EXT2_MAGIC {
-        serial_println!(
-            "[miku_extfs] drive {} lba {} - bad magic 0x{:04X}, skip",
-            drive_index, start_lba, magic_lo
-        );
-        return false;
-    }
-
-    if state.slots[slot].reader.read_sector(3, &mut sector).is_err() {
-        serial_println!(
-            "[miku_extfs] drive {} lba {} - cannot read sector 3",
-            drive_index, start_lba
-        );
-        return false;
-    }
-    state.slots[slot].superblock.data[512..1024].copy_from_slice(&sector);
-
-    // Report the flavour the superblock actually describes. The driver has
-    // always distinguished ext2/ext3/ext4 internally (fs_version_str), but
-    // every log line said "ext2", so an ext4 root looked like an ext2 one
+    // Log the flavour the superblock describes (fs_version_str)
     {
         let sb = &state.slots[slot].superblock;
         serial_println!(
@@ -440,80 +856,19 @@ fn try_mount_on(dev: crate::fs::vfs::types::BlockDevId, drive_index: usize, star
         );
     }
 
-    let block_size       = state.slots[slot].superblock.block_size();
-    let inodes_per_group = state.slots[slot].superblock.inodes_per_group();
-    let blocks_per_group = state.slots[slot].superblock.blocks_per_group();
-    let blocks_count     = state.slots[slot].superblock.blocks_count();
-    let first_data_block = state.slots[slot].superblock.first_data_block();
-    let usable           = blocks_count.saturating_sub(first_data_block);
-    let group_count      = if blocks_per_group == 0 { 0 }
-        else { (usable + blocks_per_group - 1) / blocks_per_group };
-    let gd_size          = state.slots[slot].superblock.group_desc_size() as usize;
+    let block_size   = state.slots[slot].block_size;
+    let blocks_count = state.slots[slot].superblock.blocks_count();
+    let group_count  = state.slots[slot].group_count;
 
-    // Sanity bound only - the group tables are heap-allocated now, so volume
-    // size is limited by the filesystem, not by a fixed array. The old
-    // [GroupDesc; 32] rejected anything past 32 groups, i.e. 4 GiB at a 4 KiB
-    // block size and 256 MiB at 1 KiB
-    const MAX_BLOCK_GROUPS: u32 = 1 << 20; // 128 TiB at 4 KiB blocks
-    if group_count > MAX_BLOCK_GROUPS {
+    // A volume with unimplemented read-only-compat features comes up read-only
+    // whether or not asked: readable, but writing would leave structures we do
+    // not maintain inconsistent
+    let forced_ro = state.slots[slot].reader.read_only;
+    if forced_ro && !read_only {
         print_error!(
-            "  miku_extfs: implausible block group count ({}), refusing to mount",
-            group_count
+            "  miku_extfs: volume uses read-only features this driver does not maintain \
+             - mounted read-only"
         );
-        return false;
-    }
-
-    state.slots[slot].block_size       = block_size;
-    state.slots[slot].inodes_per_group = inodes_per_group;
-    state.slots[slot].blocks_per_group = blocks_per_group;
-    state.slots[slot].group_count      = group_count;
-
-    let gc = group_count as usize;
-    state.slots[slot].groups.clear();
-    state.slots[slot].groups.resize(gc, GroupDesc { data: [0; 64] });
-    state.slots[slot].groups_dirty.clear();
-    state.slots[slot].groups_dirty.resize(gc, false);
-    state.slots[slot].alloc_hint.clear();
-    state.slots[slot].alloc_hint.resize(gc, 0);
-
-    let gdt_block      = if block_size == 1024 { 2 } else { 1 };
-    let spb            = block_size / 512;
-    let gdt_start_lba  = gdt_block * spb;
-    let total_gd_bytes = group_count as usize * gd_size;
-    let total_sectors  = ((total_gd_bytes + 511) / 512) as u32;
-
-    let mut carry     = [0u8; 64];
-    let mut carry_len = 0usize;
-    let mut gd_idx    = 0usize;
-
-    for s in 0..total_sectors {
-        if state.slots[slot].reader.read_sector(gdt_start_lba + s, &mut sector).is_err() {
-            serial_println!("[miku_extfs] gdt read error at lba {}", gdt_start_lba + s);
-            return false;
-        }
-        let mut pos = 0usize;
-        if carry_len > 0 {
-            let need = gd_size - carry_len;
-            carry[carry_len..gd_size].copy_from_slice(&sector[..need]);
-            if gd_idx < group_count as usize {
-                state.slots[slot].groups[gd_idx].data[..gd_size]
-                    .copy_from_slice(&carry[..gd_size]);
-                gd_idx += 1;
-            }
-            pos = need;
-            carry_len = 0;
-        }
-        while pos + gd_size <= 512 && gd_idx < group_count as usize {
-            state.slots[slot].groups[gd_idx].data[..gd_size]
-                .copy_from_slice(&sector[pos..pos + gd_size]);
-            gd_idx += 1;
-            pos    += gd_size;
-        }
-        if pos < 512 && gd_idx < group_count as usize {
-            let remaining = 512 - pos;
-            carry[..remaining].copy_from_slice(&sector[pos..]);
-            carry_len = remaining;
-        }
     }
 
     state.ready[slot]     = true;
@@ -521,40 +876,38 @@ fn try_mount_on(dev: crate::fs::vfs::types::BlockDevId, drive_index: usize, star
     state.start_lba[slot] = start_lba;
     state.active_slot     = slot;
 
-    state.slots[slot].init_cache();
-    let _ = state.slots[slot].init_journal();
     let _ = state.slots[slot].warm_cache();
 
-    if state.slots[slot].journal_active
-        && !state.slots[slot]
-            .read_journal_superblock()
-            .map(|j| j.is_clean())
-            .unwrap_or(true)
-    {
-        match state.slots[slot].ext3_recover() {
-            Ok(0) => {}
-            Ok(n) => serial_println!("[ext3] slot {} recovery: replayed {} blocks", slot, n),
-            Err(e) => serial_println!("[ext3] slot {} recovery failed: {:?}", slot, e),
+    // Journal replay, orphan cleanup and the mount-state stamp all write. A
+    // read-only mount defers them to 'remount_rw', so mounting alone never
+    // touches the medium
+    if forced_ro {
+        serial_println!(
+            "[miku_extfs] slot {} mounted read-only (no journal replay, no orphan cleanup, \
+             no mount-state stamp) - 'fs.rw {}' to opt in",
+            slot, slot
+        );
+    } else {
+        match state.slots[slot].activate() {
+            Ok((0, 0)) => {}
+            Ok((replayed, orphans)) => serial_println!(
+                "[miku_extfs] slot {}: replayed {} journal blocks, cleaned {} orphan inodes",
+                slot, replayed, orphans
+            ),
+            Err(e) => serial_println!("[miku_extfs] slot {} activation failed: {:?}", slot, e),
         }
     }
-
-    // cleanup orphan inodes left by unclean shutdown
-    match state.slots[slot].cleanup_orphans() {
-        Ok(0) => {}
-        Ok(n) => serial_println!("[mount] cleaned {} orphan inodes", n),
-        Err(e) => serial_println!("[mount] orphan cleanup failed: {:?}", e),
-    }
-
-    // update mount state in superblock
-    state.slots[slot].update_mount_state();
-    let _ = state.slots[slot].flush_all_dirty_metadata();
 
     let total_inodes = state.slots[slot].superblock.inodes_count();
     let free_blocks  = state.slots[slot].superblock.free_blocks_count();
     let free_inodes  = state.slots[slot].superblock.free_inodes_count();
     let version      = state.slots[slot].superblock.fs_version_str();
 
-    print_success!("  {} mounted -> slot {} (drive {} lba={})", version, slot, drive_index, start_lba);
+    let mode = if read_only { "read-only" } else { "read-write" };
+    print_success!(
+        "  {} mounted {} -> slot {} (drive {} lba={})",
+        version, mode, slot, drive_index, start_lba
+    );
     println!("  Block:   {} bytes", block_size);
     println!("  Blocks:  {} total, {} free", blocks_count, free_blocks);
     println!("  Inodes:  {} total, {} free", total_inodes, free_inodes);
@@ -564,11 +917,11 @@ fn try_mount_on(dev: crate::fs::vfs::types::BlockDevId, drive_index: usize, star
     true
 }
 
-/// Graft a top-level directory of the mounted root filesystem onto the VFS
-/// at the same name (e.g. disk:/bin -> /bin). The root disk is otherwise
-/// only reachable through the firmware graft, so ring-3 binaries living in
-/// /bin were invisible to 'resolve_path'. Returns false when the mount or
-/// the directory is missing - callers treat that as "not provisioned"
+/// Graft a top-level directory of the mounted root filesystem onto the VFS at
+/// the same name (e.g. disk:/bin -> /bin). The root disk is otherwise reachable
+/// only through the firmware graft, and ring-3 binaries in /bin would be
+/// invisible to 'resolve_path'. Returns false when the mount or the directory
+/// is missing, which callers treat as "not provisioned"
 pub fn graft_root_dir(name: &str) -> bool {
     let mut abs = [0u8; 64];
     abs[0] = b'/';

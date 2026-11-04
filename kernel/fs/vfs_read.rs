@@ -2,10 +2,26 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-// Big chunks amortize the per-call ext2 lock + path/inode lookup. A typical
-// ELF binary is several hundred KB, so 64 KiB cuts the round-trip count
-// roughly 16× compared with single-page reads.
+// Amortizes the per-call ext2 lock + path/inode lookup. Typical ELF binaries
+// run several hundred KB, so 64 KiB cuts round trips ~16x vs single-page reads.
 const READ_CHUNK: usize = 64 * 1024;
+
+/// Ceiling on a whole-file read. These functions allocate the entire file in
+/// the kernel heap (`mm::heap`), and the size comes from an on-disk inode. The
+/// ELF loader's own 64 MiB cap applies only after the read has allocated, so
+/// without this a large file is an unbounded kernel-heap allocation reachable
+/// from ring 3
+pub const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
+
+fn too_big(path: &str, total: usize) -> bool {
+    if total > MAX_FILE_BYTES {
+        crate::serial_println!(
+            "[vfs_read] '{}' is {} bytes, over the {} byte limit", path, total, MAX_FILE_BYTES,
+        );
+        return true;
+    }
+    false
+}
 
 pub fn read_file(path: &str) -> Option<Vec<u8>> {
     let path_clean = path.trim_end_matches('\0');
@@ -22,11 +38,11 @@ pub fn read_file_or_solib(path: &str) -> Option<Vec<u8>> {
 
     if path_clean.ends_with(".so") || path_clean.contains(".so.") {
         if let Some(data) = crate::process::solib::resolve_path(path_clean) {
-            return Some(data);
+            return Some((*data).clone());
         }
         let soname = path_clean.rsplit('/').next().unwrap_or(path_clean);
         if let Some(data) = crate::process::solib::resolve(soname) {
-            return Some(data);
+            return Some((*data).clone());
         }
     }
 
@@ -39,7 +55,7 @@ pub fn read_from_vfs(path: &str) -> Option<Vec<u8>> {
         let fl = OpenFlags(OpenFlags::READ);
         let fd = vfs.open(0, path, fl, FileMode::default_file()).ok()?;
         let size = vfs.fstat(fd).ok()?.size as usize;
-        if size == 0 {
+        if size == 0 || too_big(path, size) {
             let _ = vfs.close(fd);
             return None;
         }
@@ -64,6 +80,9 @@ pub fn read_from_ext2(path: &str) -> Option<Vec<u8>> {
         let total = inode.size() as usize;
         if total == 0 {
             return Ok(Vec::new());
+        }
+        if too_big(path, total) {
+            return Err(FsError::IoError);
         }
         let mut buf = vec![0u8; total];
         let mut offset = 0usize;
@@ -111,6 +130,9 @@ pub fn read_file_strict(path: &str) -> Result<Vec<u8>, ReadError> {
         crate::serial_println!("[vfs_read] '{}' ino={} size={} blocks={}", path, ino, total, inode.blocks());
         if total == 0 {
             return Ok(Vec::new());
+        }
+        if too_big(path, total) {
+            return Err(FsError::IoError);
         }
         let mut buf = vec![0u8; total];
         let mut offset = 0usize;

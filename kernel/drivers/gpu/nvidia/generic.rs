@@ -1,44 +1,43 @@
 // Generic host-side bring-up for any NVIDIA GPU
 //
-// gtx1650 is the one chip with an embedded firmware bundle, so it runs the
-// full GSP-RM offload pipeline. Every other NVIDIA card (other Turing SKUs,
-// Ampere, Ada, ...) has no firmware shipped in this tree, but the host-side
-// register map is generic across the whole GSP era. This module brings such
-// a card up as far as is possible without firmware and registers it so the
-// shell can inspect it:
+// A chip with an embedded firmware bundle runs the full GSP-RM offload
+// pipeline. Every other NVIDIA card has no firmware shipped in this tree, but
+// the host-side register map is generic across the GSP era. This brings such a
+// card up as far as possible without firmware and registers it for the shell:
 //
 //   1) validate + map BAR0
 //   2) enable memory decode + bus mastering, mask legacy INTx
 //   3) read PMC_BOOT_0 / PMC_BOOT_42, decode the chip, resolve its profile
 //   4) walk PCI MSI / MSI-X capabilities
 //   5) read-only PMC_ENABLE snapshot + PTIMER liveness
-//   6) on Turing, mask top-level interrupts and read the on-die thermal
-//      sensor (the interrupt tree and PTHERM layout moved on Ampere, so we
-//      do NOT poke those offsets on later families; reads of an unmodelled
-//      register could be meaningless and a *write* to the wrong offset is
-//      not worth the risk for a card we are only probing)
-//   7) probe every Falcon engine in the profile for liveness (HWCFG reads
-//      only - safe on any architecture)
+//   6) on Turing, mask top-level interrupts and read the on-die thermal sensor
+//      (the interrupt tree and PTHERM layout moved on Ampere, and a write to
+//      the wrong offset is not worth it on a card only being probed)
+//   7) probe every Falcon engine in the profile for liveness (HWCFG reads only,
+//      safe on any architecture)
 //
-// Nothing here writes to an engine or to PMC_ENABLE: this is a pure
-// recognition + diagnostics path. The full firmware pipeline stays behind
-// the per-chip bundle gate in 'ChipProfile::has_firmware'
+// Nothing here writes to an engine or to PMC_ENABLE. The firmware pipeline
+// stays behind the per-chip bundle gate in 'ChipProfile::has_firmware'
 
 use alloc::vec::Vec;
 use spin::Mutex;
 
 use crate::drivers::gpu::nvidia::chip::{Architecture, ChipId, PMC_BOOT_0};
-use crate::drivers::gpu::nvidia::gtx1650::falcon::Engine;
-use crate::drivers::gpu::nvidia::gtx1650::regs::{PMC_BOOT_42, PTIMER_TIME_0};
-use crate::drivers::gpu::nvidia::gtx1650::{pmc, therm};
+use crate::drivers::gpu::nvidia::falcon::Engine;
+use crate::drivers::gpu::nvidia::regs::{PMC_BOOT_42, PTIMER_TIME_0};
+use crate::drivers::gpu::nvidia::pmc;
+// PTHERM is Turing-shaped, so it stays in the Turing driver and is reached only
+// from the Turing branch below
+use crate::drivers::gpu::nvidia::turing::therm;
 use crate::drivers::gpu::nvidia::mmio::MmioRegion;
-use crate::drivers::gpu::nvidia::msi::{self, Capabilities};
+use crate::drivers::bus::msi::{self, Capabilities};
 use crate::drivers::gpu::nvidia::pci::{self, GpuDevice};
 use crate::drivers::gpu::nvidia::profile::ChipProfile;
 use crate::serial_println;
 
-/// A non-GTX1650 NVIDIA GPU brought up to host-side level. Pinned in the
-/// registry so the shell can inspect it later
+/// A non-Turing-bundle NVIDIA GPU brought up to host-side level, pinned in the
+/// registry for the shell to inspect
+#[allow(dead_code)]
 pub struct GenericGpu {
     pub pci: GpuDevice,
     pub bar0: MmioRegion,
@@ -85,9 +84,9 @@ pub fn bringup(gpu: &GpuDevice) -> Result<&'static str, &'static str> {
     let profile = ChipProfile::resolve(&chip);
 
     serial_println!(
-        "[nvidia/generic] {:04x}:{:04x} PMC_BOOT_0={:#010x} -> {} ({}, impl={:#x} rev={}.{} step={})",
+        "[nvidia/generic] {:04x}:{:04x} PMC_BOOT_0={:#010x} -> {} ({}, impl={:#x} rev={}.{})",
         gpu.vendor, gpu.device, boot0, chip.codename(), profile.arch.name(),
-        chip.implementation, chip.major_rev, chip.minor_rev, chip.stepping
+        chip.implementation, chip.major_rev, chip.minor_rev
     );
     serial_println!("[nvidia/generic] PMC_BOOT_42={:#010x} model: {}", boot42, profile.model_hint);
 
@@ -99,8 +98,8 @@ pub fn bringup(gpu: &GpuDevice) -> Result<&'static str, &'static str> {
     }
 
     // 4) MSI / MSI-X discovery (PCI config reads only)
-    let caps = msi::read_caps(gpu);
-    msi::log_capabilities(&caps);
+    let caps = msi::read_caps(gpu.pci_fn());
+    msi::log_capabilities("nvidia", &caps);
 
     // 5) Read-only PMC_ENABLE snapshot + PTIMER liveness (stable offsets
     //    across the GSP era; both are pure reads)
@@ -113,12 +112,11 @@ pub fn bringup(gpu: &GpuDevice) -> Result<&'static str, &'static str> {
     if t1 != t0 {
         serial_println!("[nvidia/generic] PTIMER alive ({} -> {})", t0, t1);
     } else {
-        serial_println!("[nvidia/generic] warn: PTIMER did not advance");
+        crate::kwarn!("[nvidia/generic] warn: PTIMER did not advance");
     }
 
     // 6) Turing-only writes: mask the top-level interrupt tree and read the
-    //    on-die thermal sensor. The interrupt tree and PTHERM layout changed
-    //    on Ampere, so we skip both there rather than poke unmodelled offsets
+    //    on-die thermal sensor. Both layouts changed on Ampere
     if matches!(chip.arch, Architecture::Turing) {
         pmc::mask_all_interrupts(&bar0_region);
         serial_println!("[nvidia/generic] top-level interrupts masked");
@@ -161,9 +159,9 @@ pub fn bringup(gpu: &GpuDevice) -> Result<&'static str, &'static str> {
     Ok(codename)
 }
 
-/// Probe every Falcon engine in the profile and log its liveness. Pure
-/// HWCFG reads, safe regardless of whether the base is correct for this
-/// exact chip (a wrong base reads the PRI sentinel and is reported gated)
+/// Probe every Falcon engine in the profile and log its liveness. Pure HWCFG
+/// reads, safe even with the wrong base for this chip (it reads the PRI
+/// sentinel and is reported gated)
 fn probe_falcons(bar0: &MmioRegion, profile: &ChipProfile) {
     let engines = [
         ("sec2",   profile.engines.sec2),

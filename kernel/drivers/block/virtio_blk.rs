@@ -1,16 +1,16 @@
 // virtio-blk driver (legacy/transitional virtio-pci, port I/O transport)
 //
 // Same transport style as 'net/virtio.rs', but the ring layout is computed at
-// runtime from the device-reported queue size, as the legacy spec requires -
-// the device derives the avail/used ring offsets from its queue size, so a
-// driver-side fixed layout only works by accident.
+// runtime from the device-reported queue size, as the legacy spec requires: the
+// device derives the avail/used ring offsets from it.
 //
-// I/O model: one synchronous request at a time through a driver-owned DMA
-// bounce buffer (64 KiB max per request), polled to completion. The block layer above chunks larger transfers
+// One synchronous request at a time through a driver-owned DMA bounce buffer
+// (64 KiB max per request), polled to completion. The block layer above chunks
+// larger transfers
 
 extern crate alloc;
 
-use alloc::boxed::Box;
+use crate::mm::dma::DmaBox;
 use spin::Mutex as SpinMutex;
 use x86_64::instructions::port::Port;
 
@@ -82,13 +82,17 @@ struct DmaMem {
     status: u8,
 }
 
+// SAFETY: bytes only
+unsafe impl crate::mm::dma::Zeroed for RingMem {}
+unsafe impl crate::mm::dma::Zeroed for DmaMem {}
+
 pub struct VirtioBlk {
     io_base:   u16,
     queue_num: usize,
     avail_off: usize,
     used_off:  usize,
-    ring:      Box<RingMem>,
-    dma:       Box<DmaMem>,
+    ring:      DmaBox<RingMem>,
+    dma:       DmaBox<DmaMem>,
     avail_idx: u16,
     last_used: u16,
     capacity:  u64,
@@ -113,43 +117,14 @@ fn mfence() {
     unsafe { core::arch::asm!("mfence", options(nostack, nomem)); }
 }
 
-/// Scan the PCI bus for legacy/transitional virtio-blk functions
-/// 'pci::scan()' only collects network-class devices, so walk the bus here
+/// Every legacy/transitional virtio-blk function on the bus. `pci::scan()`
+/// keeps network-class devices only, so this asks the shared enumeration for
+/// the id directly
 pub fn find_devices(out: &mut [PciDevice; 4]) -> usize {
-    let mut count = 0usize;
-    for bus in 0..=255u8 {
-        for dev in 0..32u8 {
-            for func in 0..8u8 {
-                let id = pci_read32(bus, dev, func, 0x00);
-                if (id & 0xFFFF) as u16 == 0xFFFF {
-                    if func == 0 { break; }
-                    continue;
-                }
-                let vendor = (id & 0xFFFF) as u16;
-                let device = (id >> 16) as u16;
-                if vendor == VENDOR_VIRTIO && device == DEV_VIRTIO_BLK && count < 4 {
-                    let mut bars = [0u32; 6];
-                    for i in 0..6 {
-                        bars[i] = pci_read32(bus, dev, func, 0x10 + (i as u8) * 4);
-                    }
-                    let class_rev = pci_read32(bus, dev, func, 0x08);
-                    out[count] = PciDevice {
-                        bus, dev, func,
-                        vendor, device,
-                        class: (class_rev >> 24) as u8,
-                        subclass: (class_rev >> 16) as u8,
-                        bars,
-                        irq: pci_read8(bus, dev, func, 0x3C),
-                    };
-                    count += 1;
-                }
-                if func == 0 && (pci_read8(bus, dev, func, 0x0E) & 0x80) == 0 {
-                    break;
-                }
-            }
-        }
-    }
-    count
+    crate::drivers::bus::pci::find_all(
+        |d| d.vendor == VENDOR_VIRTIO && d.device == DEV_VIRTIO_BLK,
+        out,
+    )
 }
 
 impl VirtioBlk {
@@ -190,8 +165,10 @@ impl VirtioBlk {
             queue_num,
             avail_off,
             used_off,
-            ring: Box::new(RingMem([0u8; 3 * 4096])),
-            dma:  Box::new(DmaMem { data: [0u8; BOUNCE_SIZE], hdr: [0u8; 16], status: 0 }),
+            // Anywhere: descriptors carry 64-bit addresses, and the ring's
+            // 32-bit page number reaches 16 TiB
+            ring: DmaBox::new().ok()?,
+            dma:  DmaBox::new().ok()?,
             avail_idx: 0,
             last_used: 0,
             capacity:  0,
@@ -202,7 +179,7 @@ impl VirtioBlk {
             max_wz: 0,
         };
 
-        let ring_phys = crate::net::virt_to_phys(drv.ring.0.as_ptr() as u64);
+        let ring_phys = drv.ring.phys_of(drv.ring.0.as_ptr());
         iow32!(io_base, REG_QUEUE_ADDRESS, (ring_phys / 4096) as u32);
 
         iow8!(io_base, REG_DEVICE_STATUS,
@@ -245,9 +222,9 @@ impl VirtioBlk {
         self.dma.hdr[8..16].copy_from_slice(&sector.to_le_bytes());
         self.dma.status = 0xFF;
 
-        let hdr_phys    = crate::net::virt_to_phys(self.dma.hdr.as_ptr() as u64);
-        let data_phys   = crate::net::virt_to_phys(self.dma.data.as_ptr() as u64);
-        let status_phys = crate::net::virt_to_phys((&self.dma.status as *const u8) as u64);
+        let hdr_phys    = self.dma.phys_of(self.dma.hdr.as_ptr());
+        let data_phys   = self.dma.phys_of(self.dma.data.as_ptr());
+        let status_phys = self.dma.phys_of(&self.dma.status as *const u8);
 
         let with_data = data_len > 0;
         unsafe {

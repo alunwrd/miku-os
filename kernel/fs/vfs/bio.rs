@@ -5,7 +5,7 @@ use crate::fs::vfs::types::*;
 pub enum BioDirection {
     Read = 0,
     Write = 1,
-    /// TRIM/deallocate - carries no data, only a sector range
+    /// TRIM/deallocate: carries no data, only a sector range
     Discard = 2,
 }
 
@@ -37,7 +37,7 @@ impl BioRequest {
             device_id: INVALID_U8,
             block_num: 0,
             block_count: 0,
-            buffer_page: INVALID_ID,
+            buffer_page: INVALID_PAGE,
             active: false,
         }
     }

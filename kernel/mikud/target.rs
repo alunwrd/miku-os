@@ -1,4 +1,4 @@
-// mikuD targets - runlevels for service activation
+// mikuD targets: runlevels for service activation
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

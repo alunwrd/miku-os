@@ -1,15 +1,14 @@
-// Shared buffer cache for the block layer - MikuOS's analogue of the Linux
-// page cache, sitting below every filesystem and raw consumer.
+// Shared buffer cache for the block layer, below every filesystem and raw
+// consumer.
 //
 //   Granularity: 4 KiB chunks (8 sectors), keyed by '(device, chunk index)'.
-//   Policy: write-through. Writes always reach the device before the call
-//   returns, so journal ordering and crash durability are exactly as
-//   without the cache; only reads get faster.
-//   Organization: 8-way set-associative with per-set LRU - lookup touches
+//   Policy: a plain write stays dirty here until 'flush'; write-through and
+//   barrier writes reach the device before the call returns.
+//   Organization: 8-way set-associative with per-set LRU: lookup touches
 //   at most 8 entries, no global scans.
 //
-// Coherence is by construction: every disk access in the kernel goes
-// through 'crate::io::block', so there is no second path that could observe  stale data
+// Coherent by construction: every disk access in the kernel goes through
+// 'crate::io::block'.
 
 extern crate alloc;
 
@@ -23,8 +22,15 @@ pub const CHUNK_SECTORS: u64 = 8;
 pub const CHUNK_BYTES: usize = CHUNK_SECTORS as usize * 512;
 
 const WAYS: usize = 8;
-const SETS: usize = 64;
-const ENTRIES: usize = WAYS * SETS; // 512 chunks = 2 MiB of data
+
+/// How much of the machine the cache takes: a 128th of its memory, between 2
+/// and 16 MiB. File data is cached a layer up (`fs::vfs::filecache`), and here
+/// is metadata (inode tables, directories, extent and journal blocks), so the
+/// ceiling is low; it also bounds the scans for dirty chunks below, which walk
+/// every entry
+const SHARE_DIVISOR: usize = 128;
+const MIN_BYTES: usize = 2 << 20;
+const MAX_BYTES: usize = 16 << 20;
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -42,7 +48,9 @@ impl Entry {
 }
 
 pub struct BufferCache {
-    data:    Vec<u8>, // ENTRIES * CHUNK_BYTES
+    /// Sets of `WAYS` entries; fixed once the cache is made
+    sets:    usize,
+    data:    Vec<u8>, // entries.len() * CHUNK_BYTES
     entries: Vec<Entry>,
     tick:    u64,
     /// Last chunk touched per device, for sequential-access detection
@@ -59,13 +67,18 @@ pub struct BufferCache {
 
 impl BufferCache {
     pub fn new() -> Self {
+        let (_, frames) = crate::mm::pmm::stats();
+        let bytes = (frames * 4096 / SHARE_DIVISOR).clamp(MIN_BYTES, MAX_BYTES);
+        let sets = bytes / (CHUNK_BYTES * WAYS);
+        let entries = sets * WAYS;
         crate::serial_println!(
             "[bcache] {} chunks x {} B = {} KB ({}-way x {} sets)",
-            ENTRIES, CHUNK_BYTES, ENTRIES * CHUNK_BYTES / 1024, WAYS, SETS
+            entries, CHUNK_BYTES, entries * CHUNK_BYTES / 1024, WAYS, sets
         );
         Self {
-            data:    vec![0u8; ENTRIES * CHUNK_BYTES],
-            entries: vec![Entry::empty(); ENTRIES],
+            sets,
+            data:    vec![0u8; entries * CHUNK_BYTES],
+            entries: vec![Entry::empty(); entries],
             tick:    0,
             last_chunk: [u64::MAX; crate::fs::vfs::types::MAX_BLOCK_DEVICES],
             streak:     [0u32; crate::fs::vfs::types::MAX_BLOCK_DEVICES],
@@ -76,10 +89,10 @@ impl BufferCache {
         }
     }
 
-    /// Record an access to 'chunk' and report whether it directly follows
-    /// the previous access on this device - the readahead trigger
-    /// Returns the current sequential-streak length for this device
-    /// (0 = random access), which sizes the readahead window
+    /// Record an access to 'chunk' and report whether it directly follows the
+    /// previous access on this device: the readahead trigger. Returns the
+    /// current sequential-streak length for this device (0 = random access),
+    /// which sizes the readahead window
     pub fn advance(&mut self, dev: BlockDevId, chunk: u64) -> u32 {
         let slot = dev as usize % self.last_chunk.len();
         if self.last_chunk[slot] == chunk.wrapping_sub(1) {
@@ -92,15 +105,15 @@ impl BufferCache {
     }
 
     #[inline]
-    fn set_base(dev: BlockDevId, chunk: u64) -> usize {
+    fn set_base(&self, dev: BlockDevId, chunk: u64) -> usize {
         // Cheap mix of device id and chunk index into a set number
         let h = chunk ^ (chunk >> 13) ^ ((dev as u64) << 7);
-        (h as usize % SETS) * WAYS
+        (h as usize % self.sets) * WAYS
     }
 
     /// Copy a cached chunk into 'out'. Returns false on miss
     pub fn get(&mut self, dev: BlockDevId, chunk: u64, out: &mut [u8]) -> bool {
-        let base = Self::set_base(dev, chunk);
+        let base = self.set_base(dev, chunk);
         for i in base..base + WAYS {
             let e = self.entries[i];
             if e.valid && e.dev == dev && e.chunk == chunk {
@@ -117,10 +130,10 @@ impl BufferCache {
     }
 
     /// Pick the slot a (dev, chunk) insert should use: its own entry if
-    /// present, else a free way, else the set's LRU way - preferring clean
+    /// present, else a free way, else the set's LRU way, preferring clean
     /// victims over dirty ones so inserts rarely force a writeback
     fn pick_slot(&self, dev: BlockDevId, chunk: u64) -> usize {
-        let base = Self::set_base(dev, chunk);
+        let base = self.set_base(dev, chunk);
         let mut victim = base;
         let mut best = (2u8, u64::MAX); // (class: 0 own/free, 1 clean, 2 dirty; age)
         for i in base..base + WAYS {
@@ -168,9 +181,9 @@ impl BufferCache {
         let slot = self.pick_slot(dev, chunk);
         let e = self.entries[slot];
         if e.valid && e.dev == dev && e.chunk == chunk && e.dirty {
-            // Resident and dirty: the cache holds newer content than the
-            // disk data being inserted (e.g. a readahead window overlapping
-            // a pending write). Never overwrite it...
+            // Resident and dirty: the cache holds newer content than the disk
+            // data being inserted (a readahead window overlapping a pending
+            // write). Not overwritten
             return None;
         }
         let out = self.take_if_dirty_foreign(slot, dev, chunk, evicted);
@@ -178,7 +191,7 @@ impl BufferCache {
         out
     }
 
-    /// Insert a chunk as dirty (write-back). Same eviction contract as  'insert'
+    /// Insert a chunk as dirty (write-back). Same eviction contract as 'insert'
     pub fn insert_dirty(
         &mut self,
         dev: BlockDevId,
@@ -219,7 +232,7 @@ impl BufferCache {
         sector_in_chunk: u64,
         data: &[u8],
     ) -> bool {
-        let base = Self::set_base(dev, chunk);
+        let base = self.set_base(dev, chunk);
         for i in base..base + WAYS {
             let e = self.entries[i];
             if e.valid && e.dev == dev && e.chunk == chunk {
@@ -236,19 +249,19 @@ impl BufferCache {
 
     /// Look up the cache slot holding a dirty copy of (dev, chunk)
     fn find_dirty(&self, dev: BlockDevId, chunk: u64) -> Option<usize> {
-        let base = Self::set_base(dev, chunk);
+        let base = self.set_base(dev, chunk);
         (base..base + WAYS).find(|&i| {
             let e = self.entries[i];
             e.valid && e.dirty && e.dev == dev && e.chunk == chunk
         })
     }
 
-    /// Pop an ascending run of contiguous dirty chunks for 'dev', starting
-    /// at the lowest dirty chunk at or after 'after_chunk': up to 'max'
-    /// chunks are copied back-to-back into 'out' and marked clean. Repeated
-    /// calls walk the device's dirty set in ascending LBA order - the
-    /// elevator sweep used by 'flush' - and contiguous chunks merge into
-    /// one driver command (writeback request merging)
+    /// Pop an ascending run of contiguous dirty chunks for 'dev', starting at
+    /// the lowest dirty chunk at or after 'after_chunk': up to 'max' chunks are
+    /// copied back-to-back into 'out' and marked clean. Repeated calls walk the
+    /// device's dirty set in ascending LBA order, the elevator sweep of
+    /// 'flush', and contiguous chunks merge into one driver command (writeback
+    /// request merging)
     pub fn pop_dirty_run(
         &mut self,
         dev: BlockDevId,
@@ -257,7 +270,7 @@ impl BufferCache {
         max: usize,
     ) -> Option<(u64, usize)> {
         let mut best: Option<(usize, u64)> = None;
-        for i in 0..ENTRIES {
+        for i in 0..self.entries.len() {
             let e = self.entries[i];
             if e.valid && e.dirty && e.dev == dev && e.chunk >= after_chunk {
                 if best.map_or(true, |(_, c)| e.chunk < c) {
@@ -288,11 +301,10 @@ impl BufferCache {
         self.entries.iter().filter(|e| e.valid && e.dirty).count()
     }
 
-    /// Drop every cached chunk lying fully inside a discarded sector range -
-    /// dirty ones included, since their content is dead by definition (this
-    /// is what keeps writeback from re-materializing discarded sectors).
-    /// Edge chunks only partially covered stay resident: their out-of-range
-    /// sectors are still live data
+    /// Drop every cached chunk fully inside a discarded sector range, dirty
+    /// ones included: their content is dead, and writeback must not
+    /// re-materialize discarded sectors. Edge chunks only partially covered
+    /// stay resident: their out-of-range sectors are live data
     pub fn invalidate_covered(&mut self, dev: BlockDevId, lba: u64, count: u32) {
         let end = lba + count as u64;
         // First chunk fully inside the range, and one past the last
@@ -301,10 +313,10 @@ impl BufferCache {
         if first >= last_excl {
             return;
         }
-        if last_excl - first >= ENTRIES as u64 {
-            // Range spans more chunks than the cache holds (e.g. a whole-
-            // device discard) - one scan over the entries is cheaper than
-            // a per-chunk set lookup
+        if last_excl - first >= self.entries.len() as u64 {
+            // Range spans more chunks than the cache holds (e.g. a whole-device
+            // discard): one scan over the entries is cheaper than a per-chunk
+            // set lookup
             for e in self.entries.iter_mut() {
                 if e.valid && e.dev == dev && e.chunk >= first && e.chunk < last_excl {
                     e.valid = false;
@@ -314,7 +326,7 @@ impl BufferCache {
             return;
         }
         for chunk in first..last_excl {
-            let base = Self::set_base(dev, chunk);
+            let base = self.set_base(dev, chunk);
             for i in base..base + WAYS {
                 let e = self.entries[i];
                 if e.valid && e.dev == dev && e.chunk == chunk {
@@ -325,14 +337,14 @@ impl BufferCache {
         }
     }
 
-    /// Drop any cached chunks overlapping the range - used after a failed
-    /// write, when the on-disk contents are unknown
+    /// Drop any cached chunks overlapping the range: after a failed write, when
+    /// the on-disk contents are unknown
     pub fn invalidate_range(&mut self, dev: BlockDevId, lba: u64, count: u32) {
         let end = lba + count as u64;
         let first_chunk = lba / CHUNK_SECTORS;
         let last_chunk  = (end - 1) / CHUNK_SECTORS;
         for chunk in first_chunk..=last_chunk {
-            let base = Self::set_base(dev, chunk);
+            let base = self.set_base(dev, chunk);
             for i in base..base + WAYS {
                 let e = self.entries[i];
                 if e.valid && e.dev == dev && e.chunk == chunk {
@@ -351,7 +363,7 @@ impl BufferCache {
         let last_chunk  = (end - 1) / CHUNK_SECTORS;
 
         for chunk in first_chunk..=last_chunk {
-            let base = Self::set_base(dev, chunk);
+            let base = self.set_base(dev, chunk);
             for i in base..base + WAYS {
                 let e = self.entries[i];
                 if !(e.valid && e.dev == dev && e.chunk == chunk) {

@@ -1,7 +1,7 @@
-// mikuD timer units - periodic service activation (like cron/systemd timers)
+// mikuD timer units: periodic service activation (like cron/systemd timers)
 //
-// Timers trigger service starts at regular intervals or after a delay.
-// Each timer is associated with a service name and fires on schedule.
+// Timers trigger service starts at regular intervals or after a delay. Each
+// timer is associated with a service name and fires on schedule.
 
 extern crate alloc;
 use alloc::vec::Vec;

@@ -1,0 +1,21 @@
+# The kernel heap's slab and magazine layers, tested on the build host
+#
+# `slab.rs` and `magazine.rs` take no lock and know no kernel, so this crate
+# compiles them as they are, by `#[path]`, over pages from the host's own
+# allocator, and checks them against a model (`src/lib.rs`).
+#
+#     cd kernel/mm/heap/hosttest && cargo test
+[package]
+name    = "kheap-hosttest"
+version = "0.1.0"
+edition = "2021"
+
+# Its own workspace, and `exclude`d by the repository root, for the reason
+# `lib/libmiku/hosttest/Cargo.toml` gives
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[profile.test]
+opt-level = 2

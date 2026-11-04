@@ -1,5 +1,5 @@
 use crate::drivers::bus::pci::PciDevice;
-use crate::net::NetworkDriver;
+use crate::net::{NetworkDriver, RxMeta};
 use alloc::boxed::Box;
 use core::sync::atomic::{fence, Ordering};
 
@@ -7,6 +7,25 @@ const E1000_CTRL: u32 = 0x0000;
 const E1000_STATUS: u32 = 0x0008;
 const E1000_EERD: u32 = 0x0014;
 const E1000_ICR: u32 = 0x00C0;
+/// Interrupt throttling: the shortest gap between two interrupts, in 256 ns
+/// units
+const E1000_ITR: u32 = 0x00C4;
+/// About 130 us: at most 7600 interrupts a second, near Linux's e1000e cap;
+/// with no limit the card raises one per frame. No speed gain in QEMU, whose
+/// e1000e moves 30-50 MB/s polled or not, but a frame storm is a bounded number
+/// of interrupts
+const ITR_GAP: u32 = 512;
+
+// Interrupt causes the card is asked to raise (IMS)
+const IMS_LSC: u32 = 1 << 2;
+const IMS_RXDMT0: u32 = 1 << 4;
+const IMS_RXO: u32 = 1 << 6;
+const IMS_RXT0: u32 = 1 << 7;
+
+/// In the interrupt handler: ICR is read-to-clear
+fn ack_icr(mmio: u64) {
+    unsafe { core::ptr::read_volatile((mmio + E1000_ICR as u64) as *const u32) };
+}
 const E1000_IMS: u32 = 0x00D0;
 const E1000_IMC: u32 = 0x00D8;
 const E1000_RCTL: u32 = 0x0100;
@@ -26,8 +45,12 @@ const E1000_MTA: u32 = 0x5200;
 const E1000_RAL0: u32 = 0x5400;
 const E1000_RAH0: u32 = 0x5404;
 
-const RX_DESC_N: usize = 16;
-const TX_DESC_N: usize = 16;
+// Ring depth is how long a burst the card can hold between drains. At line rate
+// a shallow ring overruns and loses whole runs of segments, which TCP recovers
+// from badly, not the single loss it recovers from cheaply. 256 descriptors is
+// 384 KB of headroom
+const RX_DESC_N: usize = 256;
+const TX_DESC_N: usize = 64;
 const BUF_SIZE: usize = 2048;
 
 #[repr(C)]
@@ -66,11 +89,11 @@ unsafe fn alloc_dma_zeroed<T>() -> *mut T {
     let size = core::mem::size_of::<T>();
     let frames = (size + 4095) / 4096;
     let phys = crate::mm::pmm::alloc_frames(frames).expect("PMM OOM during DMA alloc");
-    
-    crate::net::map_mmio(phys, (frames * 4096) as u64);
-    
+
+    // Not mapped uncacheable. DMA is cache-coherent on x86, and UC would make
+    // every packet copy out of the 512 KB of receive buffers read from memory
     let virt = crate::arch::x86_64::grub::phys_to_virt(phys);
-    crate::serial_println!(
+    crate::trace_println!(
         "[e1000] alloc_dma: phys={:#x} virt={:#x} size={:#x} frames={}",
         phys, virt, size, frames
     );
@@ -143,11 +166,11 @@ impl E1000 {
         let rx_bufs = self.rx_bufs;
         let tx_bufs = self.tx_bufs;
 
-        crate::serial_println!("[e1000] init: 1 IMC");
+        crate::trace_println!("[e1000] init: 1 IMC");
         self.write32(E1000_IMC, 0xFFFFFFFF);
         let _ = self.read32(E1000_ICR);
 
-        crate::serial_println!("[e1000] init: 2 CTRL reset");
+        crate::trace_println!("[e1000] init: 2 CTRL reset");
         self.write32(E1000_CTRL, self.read32(E1000_CTRL) | (1 << 26));
         for _ in 0..1_000_000 {
             if self.read32(E1000_CTRL) & (1 << 26) == 0 {
@@ -156,7 +179,7 @@ impl E1000 {
             core::hint::spin_loop();
         }
 
-        crate::serial_println!("[e1000] init: 3 IMC+SLU");
+        crate::trace_println!("[e1000] init: 3 IMC+SLU");
         self.write32(E1000_IMC, 0xFFFFFFFF);
         let _ = self.read32(E1000_ICR);
         self.write32(E1000_CTRL, self.read32(E1000_CTRL) | (1 << 6));
@@ -165,7 +188,7 @@ impl E1000 {
             core::hint::spin_loop();
         }
 
-        crate::serial_println!("[e1000] init: 4 EEPROM");
+        crate::trace_println!("[e1000] init: 4 EEPROM");
         for i in 0u32..3 {
             self.write32(E1000_EERD, 1 | (i << 8));
             for _ in 0..100_000 {
@@ -197,12 +220,12 @@ impl E1000 {
             self.mac[3], self.mac[4], self.mac[5]
         );
 
-        crate::serial_println!("[e1000] init: 5 MTA");
+        crate::trace_println!("[e1000] init: 5 MTA");
         for i in 0..128u32 {
             self.write32(E1000_MTA + i * 4, 0);
         }
 
-        crate::serial_println!("[e1000] init: 6 RX");
+        crate::trace_println!("[e1000] init: 6 RX");
         unsafe {
             for i in 0..RX_DESC_N {
                 let buf_virt = (*rx_bufs).0[i].as_ptr() as u64;
@@ -228,7 +251,7 @@ impl E1000 {
         self.write32(E1000_RDT, self.rx_tail as u32);
         self.write32(E1000_RCTL, (1 << 1) | (1 << 15) | (1 << 26) | (1 << 4));
 
-        crate::serial_println!("[e1000] init: 7 TX");
+        crate::trace_println!("[e1000] init: 7 TX");
         unsafe {
             for i in 0..TX_DESC_N {
                 let buf_virt = (*tx_bufs).0[i].as_ptr() as u64;
@@ -260,7 +283,7 @@ impl E1000 {
         let _ = self.read32(E1000_ICR);
 
         fence(Ordering::SeqCst);
-        crate::serial_println!("[e1000] init: done");
+        crate::trace_println!("[e1000] init: done");
         Some(())
     }
 }
@@ -293,7 +316,7 @@ impl NetworkDriver for E1000 {
         true
     }
 
-    fn recv(&mut self, handler: &mut dyn FnMut(&[u8])) {
+    fn recv(&mut self, handler: &mut dyn FnMut(&[u8], RxMeta) -> bool) {
         loop {
             let next = (self.rx_tail + 1) % RX_DESC_N;
             fence(Ordering::SeqCst);
@@ -308,9 +331,12 @@ impl NetworkDriver for E1000 {
             let len = unsafe {
                 core::ptr::read_volatile(&(*self.rx_ring).0[next].length) as usize
             };
+            let mut go_on = true;
             if len > 0 && len <= BUF_SIZE {
                 let buf = unsafe { &(&(*self.rx_bufs).0[next])[..len] };
-                handler(buf);
+                // No checksum offload is enabled in init(): the frame carries
+                // the sender's checksums, and software checks them
+                go_on = handler(buf, RxMeta::default());
             }
 
             unsafe {
@@ -318,6 +344,12 @@ impl NetworkDriver for E1000 {
             }
             self.rx_tail = next;
             self.write32(E1000_RDT, self.rx_tail as u32);
+
+            // The frame above was taken; the rest stays in the ring for the
+            // next call
+            if !go_on {
+                break;
+            }
         }
         let _ = self.read32(E1000_ICR);
     }
@@ -334,6 +366,22 @@ impl NetworkDriver for E1000 {
 
     fn link_up(&self) -> bool {
         self.read32(E1000_STATUS) & (1 << 1) != 0
+    }
+
+    /// MSI, where the part has it (82574L; not the 82540EM QEMU defaults to).
+    /// Received frames, the ring running low, an overrun and a link change
+    /// raise it; reading ICR in the handler clears the causes and lets the next
+    /// one through
+    fn enable_irq(&mut self, f: crate::drivers::bus::msi::PciFn) -> bool {
+        if !crate::net::irq::has_msi(f) {
+            return false;
+        }
+        if !crate::net::irq::enable(f, None, Some((ack_icr, self.mmio))) {
+            return false;
+        }
+        self.write32(E1000_ITR, ITR_GAP);
+        self.write32(E1000_IMS, IMS_RXT0 | IMS_RXDMT0 | IMS_RXO | IMS_LSC);
+        true
     }
 
     fn get_mac(&self) -> [u8; 6] {

@@ -57,46 +57,45 @@ pub extern "C" fn ap_entry(cpu_index: u64) -> ! {
         core::arch::asm!("mov {}, cr4", out(reg) cr4);
         core::arch::asm!("mov cr4, {}", in(reg) cr4 | (1u64 << 9) | (1u64 << 10));
 
-        // 5) Program syscall MSRs (STAR/LSTAR/SFMASK) on this CPU
+        // 5) The protection bits are per-core: an AP skipping this runs with
+        //    SMEP/SMAP/WP off
+        crate::arch::x86_64::cpu::init_protections();
+        // This core's identity for RDTSCP, how the vDSO answers getcpu without
+        // a syscall
+        crate::arch::x86_64::cpu::init_tsc_aux(idx as u32);
+
+        // 6) Program syscall MSRs (STAR/LSTAR/SFMASK) on this CPU
         crate::syscall::init();
+
+        // 7) Same page-attribute table as the BSP. The PAT is per-core, and a
+        //    thread migrating here would find the write-combining slot meaning
+        //    UC-
+        crate::mm::vmm::init_pat();
     }
 
-    // 6) Bring the LAPIC online
+    // 8) Bring the LAPIC online
     apic::init_ap();
     let lid = apic::lapic_id();
     percpu::mark_online(idx, lid);
 
-    // 7) Register the per-CPU idle thread so the scheduler has a fallback
+    // 8) Register the per-CPU idle thread so the scheduler has a fallback
     crate::sched::init_ap_idle(idx);
 
-    // 8) Start this CPU's LAPIC timer using the BSP calibration
+    // 9) Start this CPU's LAPIC timer using the BSP calibration
     apic::start_ap_timer(apic::bsp_ticks_per_hz());
 
     crate::serial_println!("[smp] AP#{} online lapic_id={}", idx, lid);
 
-    // 9) Enable interrupts and idle
-    //
-    // The timer alone does NOT drive scheduling here: the timer handler is a
-    // plain 'extern "x86-interrupt"' function, which cannot replace the
-    // interrupted stack the way a context switch needs to, so 'yield_now()'
-    // is the only entry into the scheduler. An AP that merely halted in a
-    // loop therefore never picked up a single task - the machine reported
-    // "4/4 cpus online" while everything actually ran on the BSP, and a
-    // process queued to an AP (a forked child, for one) starved forever
-    //
-    // Halting waits for the next interrupt; yielding right after it lets
-    // this CPU take whatever landed in its run queue meanwhile
-    x86_64::instructions::interrupts::enable();
-    loop {
-        x86_64::instructions::interrupts::enable_and_hlt();
-        crate::sched::yield_now();
-    }
+    // 10) Enable interrupts and idle: watch the run queue, halt, and yield to
+    //     whatever lands in it (`sched::idle`)
+    crate::sched::idle::run()
 }
 
 // BSP startup //
 
-// Start all APs found in ACPI MADT. Must run after acpi::init(), apic::init_bsp(),           //
-// apic::init_timer(), and sched::init_main_thread() have completed                           //
+// Start all APs found in ACPI MADT. Must run after acpi::init(),
+// apic::init_bsp(), apic::init_timer(), and sched::init_main_thread() have
+// completed
 pub fn start_aps() {
     let (cpus, ticks_per_hz) = {
         let topo_lock = acpi::topology();
@@ -143,14 +142,31 @@ pub fn start_aps() {
 
     let mut skipped_wide = 0usize;
 
+    // INIT everything addressable first, then wait once.
+    //
+    // The 10ms between INIT and SIPI belongs to the INIT pulse, so one wait
+    // covers all of them. The SIPI handshake still goes one AP at a time: every
+    // AP reads its stack pointer and entry point from the same `ApParams` block
+    // at the bottom of the trampoline. An AP INITed here and never SIPI'd (no
+    // memory for its stack, say) stays in wait-for-SIPI
+    let mut initted = 0usize;
+    for cpu in &cpus {
+        if !cpu.enabled || cpu.lapic_id > 0xFE || cpu.lapic_id == bsp_lapic {
+            continue;
+        }
+        apic::send_init(cpu.lapic_id);
+        initted += 1;
+    }
+    if initted > 0 {
+        crate::kcore::time::mdelay(apic::INIT_TO_SIPI_MS);
+    }
+
     for cpu in &cpus {
         if !cpu.enabled { continue; }
-        // CPUs described by a Local x2APIC MADT entry used to be dropped on
-        // the floor. Firmware on wider machines commonly describes some or
-        // all cores that way even when their APIC IDs are small, so those
-        // cores silently never came online. init_bsp puts the LAPIC in xAPIC
-        // mode, where the ICR destination field is 8 bits - so a small ID is
-        // perfectly addressable and only genuinely wide IDs are out of reach
+        // Firmware on wider machines commonly describes some or all cores with
+        // a Local x2APIC MADT entry, even when their APIC IDs are small.
+        // init_bsp puts the LAPIC in xAPIC mode, where the ICR destination
+        // field is 8 bits, so only wide IDs are out of reach
         if cpu.lapic_id > 0xFE {
             skipped_wide += 1;
             crate::serial_println!(
@@ -162,10 +178,9 @@ pub fn start_aps() {
         if cpu.lapic_id == bsp_lapic { continue; }
         if cpu_idx as usize >= percpu::MAX_CPUS { break; }
 
-        // Kernel stack for this AP, fenced by a guard page like every other
-        // thread stack. APs never exit, so the allocation is deliberately
-        // leaked rather than tracked - dropping it would unmap the stack the
-        // CPU is running on
+        // Kernel stack for this AP, fenced by a guard page like every thread
+        // stack. APs never exit, so the allocation is leaked: dropping it would
+        // unmap the stack the CPU runs on
         let stack = match crate::mm::kstack::KernelStack::new(AP_STACK_PAGES * 4096) {
             Some(s) => s,
             None => {
@@ -196,7 +211,7 @@ pub fn start_aps() {
 
         crate::serial_println!("[smp] starting AP lapic_id={} cpu_idx={}", cpu.lapic_id, cpu_idx);
 
-        apic::send_init_sipi(cpu.lapic_id, TRAMPOLINE_PHYS);
+        apic::send_sipi(cpu.lapic_id, TRAMPOLINE_PHYS);
 
         // Wait up to 100ms for AP to signal ready
         let params = (TRAMPOLINE_PHYS as u64 + PARAM_OFFSET as u64 + hhdm) as *mut ApParams;
@@ -238,20 +253,18 @@ pub fn start_aps() {
     }
     if cpus.len() > percpu::MAX_CPUS {
         crate::serial_println!(
-            "[smp] firmware reports {} cpus but MAX_CPUS is {} - the rest stay offline",
+            "[smp] firmware reports {} cpus but MAX_CPUS is {}, the rest stay offline",
             cpus.len(), percpu::MAX_CPUS
         );
     }
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////////
-//                                  AP trampoline                                           // 
-//                                                                                          //
-// The trampoline lives in its own ELF section. Build emits a blob of                       //
-// position-independent real-mode -> long-mode bootstrap code followed by an                //
-// ApParams block at offset 0xF00. We memcpy the whole blob to physical 0x8000              //
-// before firing the SIPIs - APs start at CS:IP = 0x800:0                                   //
-//////////////////////////////////////////////////////////////////////////////////////////////
+// AP trampoline
+//
+// The trampoline lives in its own ELF section: position-independent real-mode
+// -> long-mode bootstrap code followed by an ApParams block at offset 0xF00.
+// The whole blob is copied to physical 0x8000 before the SIPIs; APs start at
+// CS:IP = 0x800:0
 core::arch::global_asm!(r#"
 .section .ap_trampoline, "ax"
 .code16
@@ -298,10 +311,14 @@ ap_pm32:
     mov    (0x8F00), %eax
     mov    %eax, %cr3
 
-    // Enable LM in EFER MSR
+    // Enable LM in EFER MSR, and NX with it. Without NXE the NX bit is a
+    // reserved bit, and the first page an AP touched that had it set faulted
+    // with no IDT to take the fault: a triple fault, and the AP gone. Kernel
+    // stacks in the mapped area are no-execute (`mm::kstack`), and this
+    // AP's is the first thing it pushes to
     mov    $0xC0000080, %ecx
     rdmsr
-    or     $(1 << 8), %eax
+    or     $((1 << 8) | (1 << 11)), %eax
     wrmsr
 
     // Enable paging (CR0.PG=1, PE already set)

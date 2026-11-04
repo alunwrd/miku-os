@@ -1,11 +1,10 @@
 // HID boot-protocol keyboard: 8-byte reports -> PS/2 Set-1 scancodes
 //
 // The shell's input path is pc-keyboard decoding Set-1 scancodes popped from
-// the stdin ring (fed by the PS/2 IRQ on machines that have one). Instead of
-// teaching the shell a second input format, this module diffs consecutive
-// HID boot reports and synthesizes the exact Set-1 make/break byte stream a
-// PS/2 keyboard would have produced. stdin::push is lock-free and
-// single-producer-friendly; the usbd thread is the only USB-side producer
+// the stdin ring (fed by the PS/2 IRQ on machines that have one). This module
+// diffs consecutive HID boot reports and synthesizes the Set-1 make/break byte
+// stream a PS/2 keyboard would produce. stdin::push is lock-free; the usbd
+// thread is the only USB-side producer.
 //
 // Boot report layout (HID 1.11 appendix B.1):
 //   byte 0: modifier bitmap (LCtrl, LShift, LAlt, LGui, RCtrl, ...)
@@ -171,8 +170,8 @@ impl KbdState {
     /// Diff a fresh boot report against the previous one and emit Set-1
     /// make/break codes for every change
     pub fn process_report(&mut self, cur: &[u8; 8]) {
-        // phantom state: every key slot reads 0x01 when the keyboard cannot
-        // resolve the chord; keep the old state, emit nothing
+        // Phantom state: every key slot reads 0x01 when the keyboard cannot
+        // resolve the chord; old state kept, nothing emitted
         if cur[2..8].iter().all(|&k| k == 0x01) {
             return;
         }
@@ -185,13 +184,13 @@ impl KbdState {
             }
         }
 
-        // releases: keys in last but not in cur
+        // Releases: keys in last but not in cur
         for &k in &self.last[2..8] {
             if k > 0x03 && !cur[2..8].contains(&k) {
                 push_key(k, false);
             }
         }
-        // presses: keys in cur but not in last
+        // Presses: keys in cur but not in last
         for &k in &cur[2..8] {
             if k > 0x03 && !self.last[2..8].contains(&k) {
                 push_key(k, true);

@@ -1,0 +1,204 @@
+crates/crashes: no minidumps on MikuOS.
+
+crash-handler and minidumper (ptrace, minidump-writer) leave the MikuOS
+build; src/lib.rs picks upstream's crashes.rs or src/miku.rs, which has the
+same API. An unhandled fault gets the kernel's report instead.
+
+diff --git a/crates/crashes/Cargo.toml b/crates/crashes/Cargo.toml
+index 7d873b0..3e80780 100644
+--- a/crates/crashes/Cargo.toml
++++ b/crates/crashes/Cargo.toml
+@@ -7,15 +7,19 @@ license = "GPL-3.0-or-later"
+ 
+ [dependencies]
+ async-process.workspace = true
+-crash-handler.workspace = true
+ log.workspace = true
+-minidumper.workspace = true
+ parking_lot.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+ system_specs.workspace = true
+ zstd.workspace = true
+ 
++# Minidumps: signal handlers and a sidecar that ptraces the crashed process.
++# MikuOS reports a fault from the kernel instead (src/miku.rs)
++[target.'cfg(not(target_os = "miku"))'.dependencies]
++crash-handler.workspace = true
++minidumper.workspace = true
++
+ [target.'cfg(target_os = "linux")'.dependencies]
+ libc.workspace = true
+ 
+@@ -29,5 +33,5 @@ windows.workspace = true
+ workspace = true
+ 
+ [lib]
+-path = "src/crashes.rs"
++path = "src/lib.rs"
+ doctest = false
+diff --git a/crates/crashes/src/lib.rs b/crates/crashes/src/lib.rs
+new file mode 100644
+index 0000000..8571548
+--- /dev/null
++++ b/crates/crashes/src/lib.rs
+@@ -0,0 +1,10 @@
++// The minidump crash handler everywhere it exists, and MikuOS's own report
++// where it does not
++#[cfg(not(target_os = "miku"))]
++#[path = "crashes.rs"]
++mod imp;
++#[cfg(target_os = "miku")]
++#[path = "miku.rs"]
++mod imp;
++
++pub use imp::*;
+diff --git a/crates/crashes/src/miku.rs b/crates/crashes/src/miku.rs
+new file mode 100644
+index 0000000..4c6399d
+--- /dev/null
++++ b/crates/crashes/src/miku.rs
+@@ -0,0 +1,143 @@
++// Crash reporting on MikuOS
++//
++// Elsewhere a crash is a minidump: signal handlers in the process and a
++// sidecar (`--crash-handler`) that ptraces it and writes the dump. MikuOS has
++// no ptrace and no minidump writer. What it has is the kernel's own report of
++// a fault nobody handled (`kernel/process/crash.rs`): the signal, the
++// registers and the frame-pointer backtrace, and a core in /tmp. So nothing
++// here catches a crash. A fault gets the kernel's report; a panic is logged
++// with its location and aborts, and the parent sees a SIGABRT death.
++//
++// The API is the one `crashes.rs` exports, so Zed's callers are unchanged:
++// `init` hands back a `Client` that delivers nothing, and `crash_server`
++// returns at once, since there is never a dump to wait for. The records
++// (`CrashInfo` and the rest) are the same shapes, because `zed` reads crash
++// files other platforms write.
++
++use serde::{Deserialize, Serialize};
++use std::{
++    collections::BTreeMap,
++    env,
++    panic::{self, Location},
++    path::{Path, PathBuf},
++    pin::Pin,
++    process,
++    sync::Arc,
++    time::Duration,
++};
++use system_specs::GpuSpecs;
++
++/// The connection to a crash server. There is none on MikuOS
++pub struct Client(());
++
++/// Force a backtrace to be printed on panic.
++pub fn force_backtrace() {
++    let old_hook = panic::take_hook();
++    panic::set_hook(Box::new(move |info| {
++        unsafe { env::set_var("RUST_BACKTRACE", "1") };
++        old_hook(info);
++    }));
++}
++
++/// Install the panic hook. No sidecar is spawned, so `spawn` and
++/// `socket_path` go unused.
++pub fn init<F, S, C, P>(
++    _crash_init: InitCrashHandler,
++    _spawn: S,
++    _socket_path: P,
++    _wait_timer: C,
++) -> impl Future<Output = Arc<Client>> + use<F, C, S, P>
++where
++    F: Future<Output = ()> + Send + Sync + 'static,
++    C: (Fn(Duration) -> F) + Send + Sync + 'static,
++    S: FnOnce(Pin<Box<dyn Future<Output = ()> + Send + 'static>>),
++    P: FnOnce(u32) -> PathBuf,
++{
++    async move {
++        let client = Arc::new(Client(()));
++        panic::set_hook({
++            let client = client.clone();
++            Box::new(move |payload| {
++                panic_hook(
++                    client.clone(),
++                    payload.payload_as_str().unwrap_or("Box<Any>"),
++                    payload.location(),
++                )
++            })
++        });
++        log::info!("panic handler registered; faults are reported by the kernel");
++        client
++    }
++}
++
++#[derive(Debug, Deserialize, Serialize, Clone)]
++pub struct CrashInfo {
++    pub init: InitCrashHandler,
++    pub panic: Option<CrashPanic>,
++    pub minidump_error: Option<String>,
++    #[serde(default)]
++    pub abort_message: Option<String>,
++    pub gpus: Vec<system_specs::GpuInfo>,
++    pub active_gpu: Option<system_specs::GpuSpecs>,
++    #[serde(default)]
++    pub tags: BTreeMap<String, String>,
++}
++
++#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
++pub struct AbortMessageLocation {
++    pub pid: u32,
++    pub address: u64,
++}
++
++#[derive(Debug, Deserialize, Serialize, Clone)]
++pub struct InitCrashHandler {
++    pub session_id: String,
++    pub zed_version: String,
++    pub binary: String,
++    pub release_channel: String,
++    pub commit_sha: String,
++}
++
++#[derive(Deserialize, Serialize, Debug, Clone)]
++pub struct CrashPanic {
++    pub message: String,
++    pub span: String,
++}
++
++pub const SENTRY_USER_ID: &str = "sentry[user][id]";
++
++#[derive(Debug, Clone)]
++pub struct UserInfo {
++    pub metrics_id: Option<String>,
++    pub is_staff: Option<bool>,
++}
++
++// What the crash server would record. With no server there is nobody to
++// tell; the calls stay so the callers do not change
++
++pub fn set_gpu_info(_crash_client: &Arc<Client>, _specs: GpuSpecs) {}
++
++pub fn set_user_info(_crash_client: &Arc<Client>, _info: UserInfo) {}
++
++pub fn set_tag(_crash_client: &Arc<Client>, _key: impl Into<String>, _value: Option<String>) {}
++
++pub fn set_tags<K>(_crash_client: &Arc<Client>, _tags: impl IntoIterator<Item = (K, Option<String>)>)
++where
++    K: Into<String>,
++{
++}
++
++pub fn shutdown_crash_handler(_crash_client: &Arc<Client>) {}
++
++pub fn panic_hook(_crash_client: Arc<Client>, message: &str, location: Option<&Location>) {
++    let thread = std::thread::current();
++    let thread_name = thread.name().unwrap_or("<unnamed>");
++    let location = location.map_or_else(|| "<unknown>".to_owned(), |location| location.to_string());
++    log::error!("thread '{thread_name}' panicked at {location}:\n{message}...");
++    process::abort();
++}
++
++/// The `--crash-handler` sidecar. Nothing ever connects to it on MikuOS
++pub fn crash_server(_socket: &Path, _logs_dir: PathBuf) {
++    log::info!("no crash server on MikuOS; the kernel reports faults");
++}

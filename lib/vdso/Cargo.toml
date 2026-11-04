@@ -1,0 +1,11 @@
+[package]
+name    = "vdso"
+version = "0.2.10"
+edition = "2021"
+
+# As in lib/ld-miku: a [profile] here is ignored for a workspace member, so the
+# release profile that applies is the workspace root's.
+
+[[bin]]
+name = "vdso"
+path = "src/main.rs"

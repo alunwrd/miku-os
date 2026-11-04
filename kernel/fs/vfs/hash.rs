@@ -13,20 +13,6 @@ pub fn name_hash(name: &str) -> u32 {
     fnv32(name.as_bytes())
 }
 
-#[inline]
-pub fn dentry_hash(parent: u16, name: &str) -> u32 {
-    let mut h: u32 = 0x811c9dc5;
-    let pb = parent.to_le_bytes();
-    for &b in &pb {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x01000193);
-    }
-    for &b in name.as_bytes() {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x01000193);
-    }
-    h
-}
 
 pub fn content_hash(data: &[u8]) -> [u8; 32] {
     let mut result = [0u8; 32];

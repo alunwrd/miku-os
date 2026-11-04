@@ -18,19 +18,51 @@ Builder стейджит каждую папку отсюда в `/lib/firmware/
 | `gtx1650/` | GTX 1650 / 1660 (TU116/TU117) | `/lib/firmware/nvidia/tu116/` | нет (gitignore) |
 | `rtx5060ti/` | RTX 5060 Ti / 5060 (GB206) | `/lib/firmware/nvidia/gb206/` | нет (gitignore) |
 
+> Имена каталогов здесь — SKU (`gtx1650/`, `rtx5060ti/`), а модули драйвера
+> называются по архитектуре (`turing/`, `blackwell/`). Расхождение намеренное:
+> эти имена зашиты в `NVIDIA_FW_CARDS` (`builder/src/main.rs`), а сами блобы
+> лежат вне git, так что переименование каталогов ничего не улучшает и ломает
+> раскладку файлов на диске.
+
 ## Наполнение rtx5060ti/
 
-Нужны три файла из linux-firmware >= 20250509 (ветка 570.144) - тот же
-набор, что макрос NVKM_GSP_FIRMWARE_FMC в nouveau:
+Драйвер говорит с одной версией GSP-RM - 615.78.08 (`dev/gsp-615.md`), и
+файлы должны быть ровно этой версии. В linux-firmware для GB20x пока только
+570.144, поэтому все четыре файла берутся из пакета драйвера той же версии
+(на Arch - `/usr/lib/firmware/nvidia/615.78.08/` из nvidia-open/nvidia-utils)
+и из исходников open-gpu-kernel-modules 615.78.08:
 
 ```
-rtx5060ti/gsp/fmc-570.144.bin          # GSP-FMC (chain of trust, ELF32, ~200 KB)
-rtx5060ti/gsp/bootloader-570.144.bin   # RM RISC-V monitor (~200 KB)
-rtx5060ti/gsp/gsp-570.144.bin          # GSP-RM (~61 MB)
+rtx5060ti/gsp/fmc-615.78.08.bin          # GSP-FMC (chain of trust, ELF32, ~280 KB)
+rtx5060ti/gsp/bootloader-615.78.08.bin   # RM RISC-V monitor (~285 KB)
+rtx5060ti/gsp/gsp-615.78.08.bin          # GSP-RM, gsp_ga10x.bin пакета (~27 MB)
+rtx5060ti/gsp/ucodes-615.78.08.bin       # контейнер NVUCODES, ucodes_ga10x.bin пакета (~58 MB)
 ```
 
-Например из git: `https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git`,
-каталог `nvidia/gb206/gsp/`.
+Собирает их `dev/nvidia/fw_extract.py`: FMC и bootloader он строит из
+bindata дерева OpenRM (в linux-firmware-раскладке, которую читают
+`FmcImage::parse` и `parse_gsp_bootloader`), GSP-RM и ucodes копирует из
+пакета:
+
+```
+python3 -I dev/nvidia/fw_extract.py --tree refsrc/openrm \
+    --driver /usr/lib/firmware/nvidia/615.78.08 \
+    --out kernel/drivers/gpu/nvidia/firmware/rtx5060ti/gsp
+```
+
+Файлы 570.144 из папки убраны (builder кладёт на образ всё, что в ней
+лежит) и хранятся в `refsrc/firmware-570.144/`. Образ, собранный с этими
+файлами, - для своей машины: перед публикацией нужно прочитать лицензию
+пакета.
+
+## Другие GB20x (GB202/203/205/207)
+
+Чип опознаётся по `PMC_BOOT_42` (`blackwell/chips.rs`), и каждый ищет свой
+каталог, как в linux-firmware: `nvidia/gb202`, `nvidia/gb203`, `nvidia/gb205`,
+`nvidia/gb207`. Файлы у всего семейства одни и те же: `gsp_ga10x.bin` - общий
+образ, подпись GB20x в секции `.fwsignature_gb20x`. Для такой карты нужна
+своя папка с теми же четырьмя файлами и строка в `NVIDIA_FW_CARDS`, например
+`("rtx5090", "nvidia/gb202")`.
 
 ## Добавление новой карточки
 

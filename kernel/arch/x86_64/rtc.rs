@@ -1,13 +1,8 @@
 // CMOS/MC146818 real-time clock
 //
-// The kernel had no RTC driver at all: wall-clock time only ever arrived
-// from NTP. On a machine with no network - or before DHCP finishes - the
-// system genuinely did not know the date, and since the ext driver stamps
-// inode times from the wall clock, every file created during that window
-// got a timestamp of 0. Journal recovery and fsck both look at those times
-//
-// Reading the CMOS is a handful of port accesses, so there is no reason for
-// the machine to be blind about the date until a DHCP lease shows up
+// Otherwise wall-clock time comes only from NTP: with no network, or before
+// DHCP finishes, the ext driver stamps inode times of 0, which journal recovery
+// and fsck both key off.
 
 use x86_64::instructions::port::Port;
 
@@ -41,8 +36,7 @@ pub struct DateTime {
 }
 
 /// The high bit of the CMOS address port disables NMI. Boot code clears it
-/// deliberately, so preserve whatever state it is in rather than turning NMI
-/// back on behind the caller's back
+/// deliberately, so its state is preserved
 unsafe fn cmos_read(reg: u8) -> u8 {
     let mut addr: Port<u8> = Port::new(CMOS_ADDR);
     let mut data: Port<u8> = Port::new(CMOS_DATA);
@@ -73,13 +67,13 @@ unsafe fn read_raw() -> DateTime {
 
 /// Read the wall-clock date/time out of the CMOS
 ///
-/// The chip updates its registers once a second and does not latch them, so
-/// a naive read can catch a rollover mid-way (23:59:59 -> 00:00:00 gives
-/// 23:00:00). The standard cure, used here: wait out any update in progress,
-/// then read twice and only accept a pair of identical samples
+/// The chip updates its registers once a second and does not latch them, so a
+/// read can catch a rollover mid-way (23:59:59 -> 00:00:00 gives 23:00:00).
+/// Wait out any update in progress, then read twice and accept only identical
+/// samples
 pub fn read() -> Option<DateTime> {
     unsafe {
-        // Bounded wait - a missing or wedged RTC must not hang the boot
+        // Bounded wait: a missing or wedged RTC must not hang the boot
         let mut spins = 0u32;
         while update_in_progress() {
             spins += 1;

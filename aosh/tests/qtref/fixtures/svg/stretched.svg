@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Strokes through a viewBox that stretches one way more than the other:
+     Qt outlines them in the document's units, however thin they end up -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 30">
+  <path d="M3 3 H45" stroke="#2c3e50" stroke-width="0.3"/>
+  <path d="M3 6.5 L20 12 L3 17" fill="#ecf0f1" stroke="#c0392b" stroke-width="0.5"/>
+  <path d="M24 6 C30 6 36 16 44 16" fill="none" stroke="#27ae60" stroke-width="0.8"/>
+  <path d="M24 20 H44" stroke="#8e44ad" stroke-width="2" stroke-linecap="round"/>
+  <path d="M4 25 H44" stroke="#16a085" stroke-width="1" stroke-dasharray="3 2"/>
+  <rect x="26.5" y="9.5" width="6" height="3" fill="none" stroke="#2980b9" stroke-width="0.6" stroke-linejoin="round"/>
+</svg>

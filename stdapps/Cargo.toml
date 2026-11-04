@@ -1,0 +1,122 @@
+# Programs written against Rust's `std`.
+#
+# A crate of its own, built by the builder's `std` step (`builder/src/stdport/`;
+# by hand: `cd builder && cargo run --release -- std stdapps`), which hands the
+# linker `lib/miku/linker.ld` and the link stubs by absolute path.
+#
+# It does not depend on the `miku` crate: the `miku_*` symbols the PAL calls are
+# resolved from the link stubs at `lib/miku/stubs/`, which that step names the
+# same way it names `linker.ld`. A program written against this `std` is an
+# ordinary Rust program with an ordinary `Cargo.toml`.
+[package]
+name = "miku-stdapps"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+# LTO is off. With it on, a link against a stale stub library succeeded and left
+# the call out of the binary: a missing symbol becomes a missing call rather
+# than a link error.
+lto = false
+
+[[bin]]
+name = "stdhello"
+path = "src/stdhello.rs"
+
+[[bin]]
+name = "stdthreads"
+path = "src/stdthreads.rs"
+
+[[bin]]
+name = "stdfs"
+path = "src/stdfs.rs"
+
+[[bin]]
+name = "stdbench"
+path = "src/stdbench.rs"
+
+[[bin]]
+name = "stdproc"
+path = "src/stdproc.rs"
+
+[[bin]]
+name = "stdpoll"
+path = "src/stdpoll.rs"
+
+[[bin]]
+name = "stdasync"
+path = "src/stdasync.rs"
+
+[[bin]]
+name = "stdtokio"
+path = "src/stdtokio.rs"
+
+[[bin]]
+name = "stdc"
+path = "src/stdc.rs"
+
+[[bin]]
+name = "stdsignal"
+path = "src/stdsignal.rs"
+
+[[bin]]
+name = "stdwatch"
+path = "src/stdwatch.rs"
+
+[[bin]]
+name = "stddns"
+path = "src/stddns.rs"
+
+[[bin]]
+name = "stdpty"
+path = "src/stdpty.rs"
+
+[[bin]]
+name = "stdremote"
+path = "src/stdremote.rs"
+
+# The `libc` crate has to be the MikuOS one here too.
+#
+# The builder's overlay (`builder/src/stdport/overlay.rs`) patches it for the
+# `std` build through `library/Cargo.toml`, but a program's own dependency graph
+# resolves `libc` separately, and `rustix`, which `polling` and `async-io` are
+# built on, pulls it in. Every crate built against this `std` needs this line
+# until MikuOS support is upstream; `lib/rust-libc/README.md` says why.
+[build-dependencies]
+# `c/stdc.c`, through the same `cc` every C crate uses
+cc = "1"
+
+[dependencies]
+polling = "3"
+smol = "2"
+# `stdc` holds its C layouts against this one
+libc = "0.2"
+# C, through `cc` and `lib/c/miku-cc`: the versions Zed's lock file has
+libsqlite3-sys = { version = "0.30.1", features = ["bundled"] }
+zstd = "0.13"
+# The crate `notify`'s inotify backend is built on, at the version it asks for
+inotify = { version = "0.11", default-features = false }
+mio = { version = "1", features = ["os-poll", "os-ext"] }
+# What Zed's terminal opens its pty with, and the termios it sets it up by
+rustix-openpty = "0.2"
+rustix = { version = "1", features = ["termios"] }
+tree-sitter = "0.25"
+tree-sitter-json = "0.24"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync", "process", "fs", "signal"] }
+
+[patch.crates-io]
+libc = { path = "../target/rust-src-miku/libc-miku" }
+# And `rustix`, for the arms it has no MikuOS name in
+# (`builder/src/stdport/arms.rs`). Assembled by the builder's overlay, so this
+# path exists only after that has run, which every `std` build does first.
+rustix = { path = "../target/rust-src-miku/rustix-miku" }
+# And tokio, `mio` and `socket2` (`builder/src/stdport/arms.rs`)
+mio = { path = "../target/rust-src-miku/mio-miku" }
+socket2 = { path = "../target/rust-src-miku/socket2-miku" }
+tokio = { path = "../target/rust-src-miku/tokio-miku" }
+inotify = { path = "../target/rust-src-miku/inotify-miku" }

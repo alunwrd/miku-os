@@ -118,7 +118,8 @@ pub fn cmd_ext4_extinfo(path: &str)             { cmd_ext4_extent_info(path); }
 pub fn cmd_ext4_info() {
     let result = with_ext2_pub(|fs| {
         let info = fs.fs_info();
-        cprintln!(57, 197, 187, "  ext4 Filesystem Info");
+        // The heading is the filesystem mounted, not the command typed
+        cprintln!(57, 197, 187, "  {} Filesystem Info", info.version.to_ascii_uppercase());
         println!("  Version:   {}", info.version);
         println!("  Extents:   {}", if info.has_extents { "enabled" } else { "disabled" });
         println!("  Journal:   {}", if info.has_journal { "enabled" } else { "disabled" });
@@ -230,17 +231,6 @@ pub fn cmd_fiemap(path: &str) {
     }
 }
 
-pub fn cmd_ext4_fsck() {
-    let result = with_ext2_pub(|fs| fs.ext2_fsck());
-    match result {
-        Some(r) => {
-            if !r.checked { print_error!("  fsck failed"); return; }
-            cprintln!(57, 197, 187, "  ext4 filesystem check");
-            println!("  Blocks: {} / {} free", r.free_blocks, r.total_blocks);
-            println!("  Inodes: {} used / {} total", r.used_inodes, r.total_inodes);
-            if r.errors == 0 { print_success!("  filesystem ok"); }
-            else             { print_error!("  {} errors found", r.errors); }
-        }
-        None => print_error!("  not mounted"),
-    }
+pub fn cmd_ext4_fsck(repair: bool) {
+    super::ext_cmds_common::impl_fsck(repair);
 }

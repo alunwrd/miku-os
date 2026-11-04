@@ -1,0 +1,189 @@
+--- a/assets/settings/default.json
++++ b/assets/settings/default.json
+@@ -2870,6 +2870,12 @@
+   "linux": {},
+   // Settings overrides to use when using macOS.
+   "macos": {},
++  // Settings overrides to use when using MikuOS. It has no desktop portal,
++  // so the file dialogs are Zed's own; asking the system first would only
++  // ever come back cancelled
++  "miku": {
++    "use_system_path_prompts": false,
++  },
+   // Settings overrides to use when using Windows.
+   "windows": {
+     "languages": {
+--- a/crates/call/Cargo.toml
++++ b/crates/call/Cargo.toml
+@@ -31,7 +31,7 @@
+ fs.workspace = true
+ futures.workspace = true
+ feature_flags.workspace = true
+-gpui = { workspace = true, features = ["screen-capture"] }
++gpui.workspace = true
+ gpui_tokio.workspace = true
+ language.workspace = true
+ livekit_client.workspace = true
+@@ -44,6 +44,11 @@
+ util.workspace = true
+ workspace.workspace = true
+ 
++# Screen capture where there is some: MikuOS has none, and `scap` has no
++# implementation it could compile
++[target.'cfg(not(target_os = "miku"))'.dependencies]
++gpui = { workspace = true, features = ["screen-capture"] }
++
+ [dev-dependencies]
+ client = { workspace = true, features = ["test-support"] }
+ collections = { workspace = true, features = ["test-support"] }
+--- a/crates/cli/Cargo.toml
++++ b/crates/cli/Cargo.toml
+@@ -47,6 +47,13 @@
+ exec.workspace = true
+ fork.workspace = true
+ 
++# MikuOS has no descriptor passing over a Unix socket, which ipc-channel's
++# unix backend is built on; its in-process backend compiles everywhere. What
++# that costs: `zed <path>` from a second process cannot hand the path to a
++# running Zed (the CLI's channel), so each launch is its own instance
++[target.'cfg(target_os = "miku")'.dependencies]
++ipc-channel = { version = "0.19", features = ["force-inprocess"] }
++
+ [target.'cfg(target_os = "macos")'.dependencies]
+ core-foundation.workspace = true
+ core-services = "1"
+--- a/crates/livekit_client/Cargo.toml
++++ b/crates/livekit_client/Cargo.toml
+@@ -26,7 +26,7 @@
+ collections.workspace = true
+ cpal.workspace = true
+ futures.workspace = true
+-gpui = { workspace = true, features = ["screen-capture", "x11", "wayland"] }
++gpui.workspace = true
+ gpui_tokio.workspace = true
+ http_client_tls.workspace = true
+ image.workspace = true
+@@ -43,7 +43,13 @@
+ ui.workspace = true
+ util.workspace = true
+ 
+-[target.'cfg(not(any(all(target_os = "windows", target_env = "gnu"), target_os = "freebsd")))'.dependencies]
++# Screen capture where there is some: MikuOS has none, and `scap` has no
++# implementation it could compile
++[target.'cfg(not(target_os = "miku"))'.dependencies]
++gpui = { workspace = true, features = ["screen-capture", "x11", "wayland"] }
++
++# No WebRTC build for these, so calls are the mock client. MikuOS is one of them
++[target.'cfg(not(any(all(target_os = "windows", target_env = "gnu"), target_os = "freebsd", target_os = "miku")))'.dependencies]
+ libwebrtc.workspace = true
+ livekit.workspace = true
+ 
+--- a/crates/settings_content/src/settings_content.rs
++++ b/crates/settings_content/src/settings_content.rs
+@@ -462,7 +462,7 @@
+ settings_overrides! {
+     #[with_fallible_options]
+     #[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize, JsonSchema, MergeFrom)]
+-    pub struct PlatformOverrides { macos, linux, windows }
++    pub struct PlatformOverrides { macos, linux, windows, miku }
+ }
+ 
+ /// Determines what settings a profile starts from before applying its overrides.
+--- a/crates/title_bar/Cargo.toml
++++ b/crates/title_bar/Cargo.toml
+@@ -43,7 +43,7 @@
+ db.workspace = true
+ 
+ git_ui_core.workspace = true
+-gpui = { workspace = true, features = ["screen-capture"] }
++gpui.workspace = true
+ icons.workspace = true
+ livekit_client.workspace = true
+ project.workspace = true
+@@ -64,6 +64,11 @@
+ zed_actions.workspace = true
+ arrayvec = "0.7.6"
+ 
++# Screen capture where there is some: MikuOS has none, and `scap` has no
++# implementation it could compile
++[target.'cfg(not(target_os = "miku"))'.dependencies]
++gpui = { workspace = true, features = ["screen-capture"] }
++
+ [dev-dependencies]
+ call = { workspace = true, features = ["test-support"] }
+ client = { workspace = true, features = ["test-support"] }
+--- a/crates/zed/build.rs
++++ b/crates/zed/build.rs
+@@ -18,8 +18,13 @@
+             }
+         }
+ 
+-        for dir in &rpath_dirs {
+-            println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
++        // The `cfg` above is the host's: a build for another system from
++        // Linux gets here too, and links no webrtc-sys to need these (nor
++        // takes `-Wl,` - MikuOS links with rust-lld directly)
++        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
++            for dir in &rpath_dirs {
++                println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
++            }
+         }
+     }
+ 
+--- a/crates/zed/Cargo.toml
++++ b/crates/zed/Cargo.toml
+@@ -121,12 +121,7 @@
+ git_ui_core.workspace = true
+ go_to_line.workspace = true
+ gpui = { workspace = true, features = ["profiler", "stacker"] }
+-gpui_platform = { workspace = true, features = [
+-    "screen-capture",
+-    "font-kit",
+-    "wayland",
+-    "x11",
+-] }
++gpui_platform = { workspace = true, features = ["font-kit"] }
+ gpui_tokio.workspace = true
+ hdrhistogram.workspace = true
+ image = { workspace = true, optional = true }
+@@ -244,11 +239,22 @@
+ [build-dependencies]
+ windows_resources = { path = "../windows_resources" }
+ 
++# Screen capture and the two Linux display servers where they exist. MikuOS has
++# its own display server, which `gpui_platform` picks for it, and no capture
++[target.'cfg(not(target_os = "miku"))'.dependencies]
++gpui_platform = { workspace = true, features = ["screen-capture"] }
++
+ [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
++gpui_platform = { workspace = true, features = ["wayland", "x11"] }
+ gpui = { workspace = true, features = ["profiler", "wayland", "x11"] }
+ ashpd.workspace = true
+ image.workspace = true
+ 
++# The window icon `zed.rs` decodes for the Linux desktop, which MikuOS is
++# there (`builder/src/stdport/arms.rs`); the rest of that block is D-Bus and X11/Wayland
++[target.'cfg(target_os = "miku")'.dependencies]
++image.workspace = true
++
+ [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.build-dependencies]
+ image.workspace = true
+ 
+--- a/crates/zed/src/main.rs
++++ b/crates/zed/src/main.rs
+@@ -367,6 +367,15 @@
+             crate::zed::listen_for_cli_connections(open_listener.clone()).is_err()
+         }
+ 
++        // The Linux check binds a Unix datagram socket, which MikuOS does not
++        // have, and would read that as another Zed holding it. The CLI's
++        // channel is in-process here too (`crates/cli/Cargo.toml`), so there
++        // is no running instance a second launch could hand its paths to
++        #[cfg(target_os = "miku")]
++        {
++            false
++        }
++
+         #[cfg(target_os = "windows")]
+         {
+             !crate::zed::windows_only_instance::handle_single_instance(open_listener.clone(), &args)

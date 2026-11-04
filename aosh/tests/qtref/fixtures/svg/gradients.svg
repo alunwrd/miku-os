@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Gradients: in user space through a gradientTransform, in the box of what
+     they fill (the default), stops from attributes and from style, one
+     gradient taking another's stops by href, and radial ones -->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="48" height="48">
+  <defs>
+    <linearGradient id="u" x1="10" y1="40" x2="40" y2="10" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0.5,0,0,0.5,2,2)">
+      <stop stop-color="#2c3e50"/>
+      <stop offset="1" stop-color="#ecf0f1" stop-opacity="0.5"/>
+    </linearGradient>
+    <linearGradient id="box">
+      <stop offset="0" style="stop-color:#e74c3c;stop-opacity:1"/>
+      <stop offset="0.5" style="stop-color:#f1c40f"/>
+      <stop offset="1" style="stop-color:#2ecc71;stop-opacity:0.3"/>
+    </linearGradient>
+    <linearGradient id="down" xlink:href="#box" x1="0" y1="0" x2="0" y2="1"/>
+    <radialGradient id="r">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#2980b9"/>
+    </radialGradient>
+    <radialGradient id="ru" cx="36" cy="36" r="10" gradientUnits="userSpaceOnUse">
+      <stop offset="0.2" stop-color="#8e44ad"/>
+      <stop offset="1" stop-color="#8e44ad" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="2" y="2" width="20" height="20" fill="url(#u)"/>
+  <rect x="26" y="2" width="20" height="10" fill="url(#box)"/>
+  <path d="M26 14 h20 v8 h-20 z" fill="url(#down)"/>
+  <circle cx="12" cy="36" r="10" fill="url(#r)"/>
+  <rect x="26" y="26" width="20" height="20" style="fill:url(#ru)"/>
+</svg>

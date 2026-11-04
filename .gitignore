@@ -8,6 +8,7 @@ logs/
 *.log
 .vscode/
 .idea/
+.zed/
 *.swp
 *.tmp
 *.bash
@@ -17,7 +18,22 @@ kernel/drivers/gpu/nvidia/firmware/*/
 src/nvidia/firmware/
 src/nvidia/gtx1650/tu116/
 *.bin
-!src/lib/ld_miku/ld-miku.bin
+!lib/ld-miku/ld-miku.bin
+!lib/extfs/tests/data/*.bin
 firmware.img
 iso_root/
+dev/
 /refsrc/
+/NVIDIA-Linux-*/
+docs/miku_old.png
+docs/screenshots/old/
+# Generated link stubs: one .so per miku library, built by lib/miku/build.rs
+# and named by the target spec so a `std` program can link without depending
+# on the `miku` crate
+lib/miku/stubs/
+# Built by the builder, one per line of lib/mikulibs/libs.list
+lib/mikulibs/libs/
+
+# Local files for the negi desktop: stickers, notes, config, the password
+# hash. Never committed (dev/aosh-negi.md)
+/personal/

@@ -1,4 +1,4 @@
-// mikuD socket activation - inetd-style service on-demand start
+// mikuD socket activation: inetd-style service on-demand start
 //
 // Associates a port with a service. When a connection arrives on the port,
 // mikuD starts the associated service. The socket is passed to the service.
@@ -116,7 +116,7 @@ impl SocketTable {
 
 static SOCKETS: Mutex<SocketTable> = Mutex::new(SocketTable::new());
 
-// -- public API --
+// public API
 
 pub fn register_socket(
     name: &'static str,

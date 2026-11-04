@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Elliptical arcs: both flags each way, rotated, and one with radii too
+     small for its ends -->
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48">
+  <path d="M4 12 A8 8 0 0 1 20 12 Z" fill="#2980b9"/>
+  <path d="M26 12 A10 6 0 1 0 44 12" fill="none" stroke="#c0392b" stroke-width="2"/>
+  <path d="M4 30 a10 5 30 0 1 16 8" fill="none" stroke="#27ae60" stroke-width="2"/>
+  <path d="M26 26 A10 10 0 1 1 26 27 z" fill="#8e44ad" fill-opacity="0.6"/>
+  <path d="M4 44 A1 1 0 0 0 20 44" fill="none" stroke="#f39c12" stroke-width="1.5"/>
+</svg>

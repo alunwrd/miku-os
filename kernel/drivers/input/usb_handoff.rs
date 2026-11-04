@@ -1,16 +1,14 @@
 //                           USB BIOS-to-OS handoff
 //
-// On legacy-BIOS boot from a USB stick, the firmware keeps USB Legacy
-// Support active. Every USB poll the firmware does triggers an SMI,
-// and the SMM handler runs invisibly to the OS 
+// On legacy-BIOS boot from a USB stick, the firmware keeps USB Legacy Support
+// active. Every USB poll the firmware does triggers an SMI, and the SMM handler
+// runs invisibly to the OS.
 //
-// The fix is to claim ownership of every USB host controller via the
-// BIOS-OS handoff protocol defined in the EHCI/XHCI specs, and to
-// clear all SMI enables in UHCI legacy-support registers. Once that
-// is done the firmware stops poking USB, no more SMIs fire, and 'sti'
-// becomes safe
+// This claims every USB host controller via the BIOS-OS handoff protocol of the
+// EHCI/XHCI specs, and clears all SMI enables in UHCI legacy-support registers.
+// The firmware then stops polling USB, no more SMIs fire, and 'sti' is safe.
 //
-// Called from 'kernel_main' between 'apic::init_bsp()' and the final 'sti'
+// Called from 'kernel_main' between 'apic::init_bsp()' and the final 'sti'.
 //
 // Spec references:
 //   xHCI 1.2 sec 7.1.1 (USBLEGSUP), sec 7.2 (xECP traversal)
@@ -93,37 +91,23 @@ fn bar_mem(bus: u8, dev: u8, func: u8, idx: u8) -> Option<u64> {
     }
 }
 
-/// Top-level entry point. Scans every PCI function, dispatches to the
-/// per-controller handler. Idempotent and safe to re-run
+/// Scans every PCI function and dispatches to the per-controller handler.
+/// Idempotent
 pub fn run() {
-    let mut count = 0u32;
-    for bus in 0..=255u16 {
-        let bus = bus as u8;
-        for dev in 0..32u8 {
-            for func in 0..8u8 {
-                let id = pci_read32(bus, dev, func, 0x00);
-                if (id & 0xFFFF) as u16 == 0xFFFF {
-                    if func == 0 { break; }
-                    continue;
-                }
-                let class_rev = pci_read32(bus, dev, func, 0x08);
-                let class    = (class_rev >> 24) as u8;
-                let subclass = (class_rev >> 16) as u8;
-                let progif   = (class_rev >> 8)  as u8;
-
-                if class == PCI_CLASS_SERIAL_BUS && subclass == PCI_SUBCLASS_USB {
-                    handoff_one(bus, dev, func, progif, id);
-                    count += 1;
-                }
-
-                if func == 0 && (pci_read8(bus, dev, func, 0x0E) & 0x80) == 0 {
-                    break;
-                }
-            }
-        }
-        if bus == 255 { break; }
+    // Copied out of the shared enumeration: `handoff_one` writes config space,
+    // and iterating in place would hold the device list's lock for the whole
+    // handoff
+    let usb: alloc::vec::Vec<_> = crate::drivers::bus::pci::with_devices(|devs| {
+        devs.iter()
+            .filter(|d| d.class == PCI_CLASS_SERIAL_BUS && d.subclass == PCI_SUBCLASS_USB)
+            .copied()
+            .collect()
+    });
+    for d in &usb {
+        let id = (d.vendor as u32) | ((d.device as u32) << 16);
+        handoff_one(d.bus, d.dev, d.func, d.prog_if, id);
     }
-    crate::serial_println!("[usb-handoff] processed {} usb controllers", count);
+    crate::serial_println!("[usb-handoff] processed {} usb controllers", usb.len());
 }
 
 fn handoff_one(bus: u8, dev: u8, func: u8, progif: u8, id: u32) {
@@ -149,10 +133,10 @@ fn handoff_one(bus: u8, dev: u8, func: u8, progif: u8, id: u32) {
     }
 }
 
-// UHCI: legacy-support register lives at PCI config offset 0xC0.
-// Bits 13:0 are SMI enables/status. Writing 0x8F00 acknowledges all
-// pending SMI status bits and clears every enable, which permanently
-// stops the firmware from emulating PS/2 over UHCI
+// UHCI: legacy-support register at PCI config offset 0xC0. Bits 13:0 are SMI
+// enables/status. Writing 0x8F00 acknowledges all pending SMI status bits and
+// clears every enable, permanently stopping the firmware's PS/2 emulation over
+// UHCI
 fn uhci_handoff(bus: u8, dev: u8, func: u8) {
     let before = pci_read16(bus, dev, func, 0xC0);
     pci_write16(bus, dev, func, 0xC0, 0x8F00);
@@ -163,10 +147,10 @@ fn uhci_handoff(bus: u8, dev: u8, func: u8) {
     );
 }
 
-// OHCI: HcControl is at MMIO BAR0 offset 0x04. If bit 8 (IR =
-// InterruptRouting) is set, the controller is BIOS-owned via SMI. We
-// request ownership change by setting bit 3 (OwnershipChangeRequest)
-// of HcCommandStatus (offset 0x08), then poll IR until it clears
+// OHCI: HcControl at MMIO BAR0 offset 0x04. If bit 8 (IR = InterruptRouting) is
+// set, the controller is BIOS-owned via SMI. Ownership change is requested with
+// bit 3 (OwnershipChangeRequest) of HcCommandStatus (offset 0x08), then IR is
+// polled until it clears
 fn ohci_handoff(bus: u8, dev: u8, func: u8) {
     let mmio_phys = match bar_mem(bus, dev, func, 0) {
         Some(p) if p != 0 => p,
@@ -189,8 +173,8 @@ fn ohci_handoff(bus: u8, dev: u8, func: u8) {
             // BIOS-owned via SMI. Request ownership change
             core::ptr::write_volatile(hc_cmdstat, 1 << 3);
 
-            // Poll for IR=0. Per spec, BIOS responds within millisec
-            // Cap at ~100ms equivalent (bounded busy-loop, no timer yet)
+            // Poll for IR=0. Per spec, BIOS responds within milliseconds. Cap
+            // at ~100 ms (bounded busy-loop, no timer yet)
             let mut spins = 0u32;
             while core::ptr::read_volatile(hc_control) & (1 << 8) != 0 {
                 spins += 1;
@@ -198,7 +182,8 @@ fn ohci_handoff(bus: u8, dev: u8, func: u8) {
                     crate::serial_println!(
                         "[usb-handoff]   OHCI: BIOS handoff timed out, forcing"
                     );
-                    // Force: just clear IR in HcControl directly. BIOS is broken; we take the device anyway
+                    // Force: clear IR in HcControl directly and take the device
+                    // from a broken BIOS
                     let v = core::ptr::read_volatile(hc_control);
                     core::ptr::write_volatile(hc_control, v & !(1 << 8));
                     break;
@@ -207,15 +192,15 @@ fn ohci_handoff(bus: u8, dev: u8, func: u8) {
             }
         }
 
-        // Disable all interrupts the BIOS may have left enabled (HcInterruptDisable @ 0x14, write all-1s)
+        // Disable all interrupts the BIOS may have left enabled
+        // (HcInterruptDisable @ 0x14, write all-1s)
         core::ptr::write_volatile(mmio.add(5), 0xFFFF_FFFF);
     }
 }
 
-// EHCI: legacy-support cap is in the PCI extended capability list
-// reachable via EECP, an 8-bit field at HCCPARAMS bits [15:8]
-// HCCPARAMS lives at MMIO BAR0 offset = CAPLENGTH(0x00 byte) + 0x08
-// Actually HCCPARAMS is a fixed offset of 0x08 in capability registers
+// EHCI: the legacy-support cap is in the PCI extended capability list, reached
+// via EECP, an 8-bit field at HCCPARAMS bits [15:8]. HCCPARAMS is at offset
+// 0x08 in the capability registers
 fn ehci_handoff(bus: u8, dev: u8, func: u8) {
     let mmio_phys = match bar_mem(bus, dev, func, 0) {
         Some(p) if p != 0 => p,
@@ -240,9 +225,9 @@ fn ehci_handoff(bus: u8, dev: u8, func: u8) {
         return; // no extended capability list
     }
 
-    // Walk the EECP-rooted PCI capability chain. Each cap header is
-    // 32 bits at PCI cfg offset 'cap': ID in [7:0], NEXT in [15:8]
-    // We look for cap ID 0x01 (USB Legacy Support)
+    // Walk the EECP-rooted PCI capability chain. Each cap header is 32 bits at
+    // PCI cfg offset 'cap': ID in [7:0], NEXT in [15:8]. Looking for cap ID
+    // 0x01 (USB Legacy Support)
     let mut cap = eecp;
     let mut hops = 0u32;
     while cap != 0 && hops < 16 {
@@ -260,10 +245,10 @@ fn ehci_handoff(bus: u8, dev: u8, func: u8) {
     crate::serial_println!("[usb-handoff]   EHCI: no Legacy Support cap");
 }
 
-// XHCI: extended capability list rooted at xECP, bits [31:16] of
-// HCCPARAMS1 (offset 0x10 in MMIO capability registers), 
-// expressed as 32-bit dword offsets from the start of capability registers
-fn xhci_handoff(bus: u8, dev: u8, func: u8) {
+// XHCI: extended capability list rooted at xECP, bits [31:16] of HCCPARAMS1
+// (offset 0x10 in MMIO capability registers), in 32-bit dwords from the start
+// of the capability registers
+pub(crate) fn xhci_handoff(bus: u8, dev: u8, func: u8) {
     let mmio_phys = match bar_mem(bus, dev, func, 0) {
         Some(p) if p != 0 => p,
         _ => {
@@ -271,9 +256,18 @@ fn xhci_handoff(bus: u8, dev: u8, func: u8) {
             return;
         }
     };
-    // xHCI MMIO can extend to many KiB; the cap+legacy region we touch
-    // sits in the first 4KiB of capability space, so 64KiB is safe 
-    crate::mm::vmm::map_mmio_uc(mmio_phys, 0x1_0000);
+    // Memory decode has to be on first. With it off every load returns
+    // all-ones, and an all-ones HCCPARAMS1 yields an xECP offset of 0x3FFFC,
+    // past the mapped window
+    let cmd = pci_read32(bus, dev, func, 0x04);
+    if cmd & 0x2 == 0 {
+        pci_write32(bus, dev, func, 0x04, cmd | 0x2);
+    }
+
+    // xHCI MMIO can extend to many KiB; the cap+legacy region used here is in
+    // the first 4 KiB of capability space, so 64 KiB is safe
+    const MMIO_WINDOW: u64 = 0x1_0000;
+    crate::mm::vmm::map_mmio_uc(mmio_phys, MMIO_WINDOW);
     let mmio_virt = mmio_phys + grub::hhdm();
 
     let hccparams1 = unsafe {
@@ -284,21 +278,26 @@ fn xhci_handoff(bus: u8, dev: u8, func: u8) {
         "[usb-handoff]   XHCI HCCPARAMS1={:#x} xECP_dwords={:#x}",
         hccparams1, xecp_dwords
     );
+    if hccparams1 == 0xFFFF_FFFF {
+        crate::serial_println!("[usb-handoff]   XHCI: MMIO reads as all-ones, skipping");
+        return;
+    }
     if xecp_dwords == 0 {
         return;
     }
 
-    // Walk the xECP-rooted MMIO capability chain. Each header is at
-    // mmio_virt + cap_off (in bytes). NEXT is in dwords from the cap
-    // header; 0 terminates the chain
+    // Walk the xECP-rooted MMIO capability chain. Each header is at mmio_virt +
+    // cap_off (in bytes). NEXT is in dwords from the cap header; 0 terminates
+    // the chain
     let mut cap_off = (xecp_dwords as u64) * 4;
     let mut hops = 0u32;
-    while cap_off != 0 && hops < 32 {
+    while cap_off != 0 && cap_off + 8 <= MMIO_WINDOW && hops < 32 {
         let header_addr = mmio_virt + cap_off;
         let header = unsafe { core::ptr::read_volatile(header_addr as *const u32) };
         let id   = (header & 0xFF) as u8;
         let next = ((header >> 8) & 0xFF) as u8;
 
+        if header == 0xFFFF_FFFF || header == 0 { break; }
         if id == 0x01 {
             xhci_legacy_handoff(header_addr);
             return;
@@ -311,8 +310,8 @@ fn xhci_handoff(bus: u8, dev: u8, func: u8) {
 }
 
 // XHCI USBLEGSUP layout (cap header at offset 0):
-//   +0x00 USBLEGSUP    - bit 16 = HC_BIOS_OWNED, bit 24 = HC_OS_OWNED
-//   +0x04 USBLEGCTLSTS - SMI enables/status
+//   +0x00 USBLEGSUP    : bit 16 = HC_BIOS_OWNED, bit 24 = HC_OS_OWNED
+//   +0x04 USBLEGCTLSTS : SMI enables/status
 
 fn xhci_legacy_handoff(usblegsup_virt: u64) {
     unsafe {
@@ -344,23 +343,19 @@ fn xhci_legacy_handoff(usblegsup_virt: u64) {
                     "[usb-handoff]   XHCI handoff timed out, forcing (USBLEGSUP={:#x})",
                     v
                 );
-                // Force: clear BIOS-owned bit. Some BIOSes never release; we take the device
+                // Force: clear the BIOS-owned bit. Some BIOSes never release
                 core::ptr::write_volatile(legsup, (v & !(1 << 16)) | (1 << 24));
                 break;
             }
             core::hint::spin_loop();
         }
 
-        // Clear ALL SMI enables (bits 0,4,13,14,15,16) and acknowledge
-        // any latched RWC status bits (bits 17..=21,29..=31). Writing
-        // 1s to RWC bits clears them; writing 0s to RW bits disables
-        // Easiest: clear bits 0,4,13..21 (SMI enables and statuses) by
-        // writing 0x0000_E1F0 to status side and 0 to enable side
-        // Simplest correct sequence: write 0 to clear all enables,
-        // then write the status mask back to ack
+        // SMI enables are bits 0,4,13,14,15,16; RWC status bits 17..=21,29..=31
+        // (write 1 to clear). All enables are written 0, then the status mask
+        // is written back to ack
         let cs0 = core::ptr::read_volatile(legctlsts);
-        // Clear all enable bits (0, 4, 13..=15) by AND-NOT, then write
-        // back the status bits as-is (they are RWC, write-1-to-clear)
+        // Clear all enable bits (0, 4, 13..=15) by AND-NOT, then write back the
+        // status bits as-is (RWC)
         let enable_mask: u32 = (1 << 0) | (1 << 4) | (1 << 13) | (1 << 14) | (1 << 15);
         let status_mask: u32 = 0x0000_E1F0; // bits 4..8, 13..15
         let new = (cs0 & !enable_mask) | status_mask;
@@ -372,9 +367,9 @@ fn xhci_legacy_handoff(usblegsup_virt: u64) {
     }
 }
 
-// Shared handler for EHCI legacy-support cap (lives in PCI config
-// space, not MMIO). cap_off is the PCI config offset of the cap
-// header. USBLEGSUP layout matches xHCI: bit 16 = BIOS, bit 24 = OS
+// Shared handler for the EHCI legacy-support cap (in PCI config space, not
+// MMIO). cap_off is the PCI config offset of the cap header. USBLEGSUP layout
+// matches xHCI: bit 16 = BIOS, bit 24 = OS
 fn do_legacy_handoff(bus: u8, dev: u8, func: u8, cap_off: u8, label: &str) {
     let v0 = pci_read32(bus, dev, func, cap_off);
     crate::serial_println!(
@@ -405,7 +400,7 @@ fn do_legacy_handoff(bus: u8, dev: u8, func: u8, cap_off: u8, label: &str) {
         core::hint::spin_loop();
     }
 
-    // USBLEGCTLSTS at cap_off+4: kill SMI enables
+    // USBLEGCTLSTS at cap_off+4: clear SMI enables
     let cs0 = pci_read32(bus, dev, func, cap_off + 4);
     let enable_mask: u32 = (1 << 0) | (1 << 4) | (1 << 13) | (1 << 14) | (1 << 15);
     let status_mask: u32 = 0x0000_E1F0;

@@ -1,7 +1,5 @@
-////////////////////////////////////////////////////////////////////////
-//                          ACPI parser                               //
-//    read RSDP/RSDT/XSDT to locate MADT, enumerate LAPIC/IOAPIC      //
-////////////////////////////////////////////////////////////////////////
+// ACPI parser: RSDP/RSDT/XSDT to the MADT for LAPIC/IOAPIC, and MCFG's windows
+// onto PCIe extended config space
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -116,6 +114,24 @@ impl AcpiTopology {
 }
 
 static TOPOLOGY: Mutex<Option<AcpiTopology>> = Mutex::new(None);
+
+/// One window of the ACPI `MCFG` table: PCIe enhanced configuration space
+/// (ECAM) for a range of buses in one segment. Bus `b`, device `d`,
+/// function `f` starts at `base + ((b - start_bus) << 20 | d << 15 | f << 12)`
+#[derive(Debug, Clone, Copy)]
+pub struct EcamRegion {
+    pub base: u64,
+    pub segment: u16,
+    pub start_bus: u8,
+    pub end_bus: u8,
+}
+
+static ECAM: Mutex<Vec<EcamRegion>> = Mutex::new(Vec::new());
+
+/// The ECAM windows `MCFG` described, empty when there was no table
+pub fn ecam_regions() -> Vec<EcamRegion> {
+    ECAM.lock().clone()
+}
 static INIT_DONE: AtomicBool = AtomicBool::new(false);
 
 pub fn topology() -> spin::MutexGuard<'static, Option<AcpiTopology>> {
@@ -216,6 +232,7 @@ pub fn init() -> Result<(), &'static str> {
     let entries_base = sdt_phys + hhdm + 36;
 
     let mut madt_phys: u64 = 0;
+    let mut mcfg_phys: u64 = 0;
 
     for i in 0..entry_count {
         let addr = entries_base + (i * entry_size) as u64;
@@ -226,10 +243,27 @@ pub fn init() -> Result<(), &'static str> {
         };
         let hdr = unsafe { &*((ent_phys + hhdm) as *const SdtHeader) };
         let sig = hdr.signature;
-        if &sig == b"APIC" {
+        if &sig == b"APIC" && madt_phys == 0 {
             madt_phys = ent_phys;
-            break;
+        } else if &sig == b"MCFG" && mcfg_phys == 0 {
+            mcfg_phys = ent_phys;
         }
+    }
+
+    // Not an error to lack: without MCFG a machine has only the legacy 256
+    // bytes of config space per function, and callers of the extended space
+    // (`drivers::bus::pci::read32_ext`) are told so
+    if mcfg_phys != 0 {
+        let regions = unsafe { parse_mcfg(mcfg_phys) };
+        for r in &regions {
+            crate::serial_println!(
+                "[acpi] mcfg: segment {} buses {:#04x}-{:#04x} at {:#x}",
+                r.segment, r.start_bus, r.end_bus, r.base
+            );
+        }
+        *ECAM.lock() = regions;
+    } else {
+        crate::serial_println!("[acpi] no MCFG - PCIe extended config space is not reachable");
     }
 
     if madt_phys == 0 {
@@ -246,19 +280,19 @@ pub fn init() -> Result<(), &'static str> {
         topo.cpus.len(), topo.ioapics.len(), topo.overrides.len(), topo.lapic_phys,
     );
     for cpu in &topo.cpus {
-        crate::serial_println!(
+        crate::trace_println!(
             "[acpi]   cpu uid={} lapic_id={} enabled={} x2apic={}",
             cpu.acpi_uid, cpu.lapic_id, cpu.enabled, cpu.is_x2apic
         );
     }
     for ia in &topo.ioapics {
-        crate::serial_println!(
+        crate::trace_println!(
             "[acpi]   ioapic id={} addr={:#x} gsi_base={}",
             ia.id, ia.addr, ia.gsi_base
         );
     }
     for iso in &topo.overrides {
-        crate::serial_println!(
+        crate::trace_println!(
             "[acpi]   iso bus={} irq={} gsi={} flags={:#x}",
             iso.bus, iso.irq, iso.gsi, iso.flags
         );
@@ -267,6 +301,34 @@ pub fn init() -> Result<(), &'static str> {
     *TOPOLOGY.lock() = Some(topo);
     INIT_DONE.store(true, Ordering::Release);
     Ok(())
+}
+
+/// `MCFG`: the standard header, eight reserved bytes, then 16-byte entries of
+/// base address (u64), segment (u16), start bus, end bus and four reserved
+/// bytes (PCI Firmware Specification 3.x, 4.1.2). A table with a bad checksum
+/// is ignored
+unsafe fn parse_mcfg(mcfg_phys: u64) -> Vec<EcamRegion> {
+    let hhdm = grub::hhdm();
+    let hdr = &*((mcfg_phys + hhdm) as *const SdtHeader);
+    let total = core::ptr::addr_of!(hdr.length).read_unaligned() as usize;
+    let mut out = Vec::new();
+    if total < 44 || !checksum((mcfg_phys + hhdm) as *const u8, total) {
+        crate::serial_println!("[acpi] MCFG is too short or fails its checksum - ignored");
+        return out;
+    }
+    let mut p = mcfg_phys + hhdm + 44;
+    let end = mcfg_phys + hhdm + total as u64;
+    while p + 16 <= end {
+        let base = (p as *const u64).read_unaligned();
+        let segment = (p.wrapping_add(8) as *const u16).read_unaligned();
+        let start_bus = *(p.wrapping_add(10) as *const u8);
+        let end_bus = *(p.wrapping_add(11) as *const u8);
+        if base != 0 && end_bus >= start_bus {
+            out.push(EcamRegion { base, segment, start_bus, end_bus });
+        }
+        p += 16;
+    }
+    out
 }
 
 unsafe fn parse_madt(madt_phys: u64, topo: &mut AcpiTopology) -> Result<(), &'static str> {

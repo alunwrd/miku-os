@@ -1,15 +1,13 @@
 // RAM-backed block device
 //
 // Backs a block device with a physically-contiguous span of RAM, addressed
-// through the HHDM. The driver of record is a GRUB multiboot2 module: the
-// bootloader loads the firmware image into memory before the kernel runs,
-// and this exposes that image as a mountable ext block device. A single boot
-// medium (the ISO/USB) then carries both the kernel and /lib/firmware, with
-// no second disk and no QEMU-specific drive layout (see fwload::init)
+// through the HHDM. In practice a GRUB multiboot2 module: the bootloader loads
+// the firmware image into memory, and this exposes it as a mountable ext block
+// device, so one boot medium (the ISO/USB) carries both the kernel and
+// /lib/firmware (see fwload::init).
 //
-// Writes land in RAM and are NOT persisted - the backing store is reclaimable
-// boot memory. That is fine for a read-mostly firmware store: ext metadata
-// the filesystem dirties only lives for the session
+// Writes land in RAM and are not persisted: ext metadata the filesystem dirties
+// lives for the session
 
 use crate::io::block::driver::{BlkError, BlockDevInfo, BlockDriver};
 
@@ -28,6 +26,16 @@ impl RamBlockDev {
     pub fn new(phys_base: u64, len: u64) -> Self {
         Self {
             virt_base: crate::arch::x86_64::grub::phys_to_virt(phys_base),
+            len: len & !(SECTOR - 1),
+        }
+    }
+
+    /// The same device over memory already mapped, a heap allocation say. The
+    /// driver uses only the virtual address, and this skips the HHDM
+    /// translation
+    pub fn from_virt(virt_base: u64, len: u64) -> Self {
+        Self {
+            virt_base,
             len: len & !(SECTOR - 1),
         }
     }

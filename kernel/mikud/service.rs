@@ -1,7 +1,7 @@
-// mikuD service types - state machine, restart policy, service table
+// mikuD service types: state machine, restart policy, service table
 //
-// Full service model with watchdog, notify, conditions,
-// masking, dependency types, lifecycle hooks, and resource limits
+// Full service model with watchdog, notify, conditions, masking, dependency
+// types, lifecycle hooks, and resource limits
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -129,9 +129,9 @@ impl RestartPolicy {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DepType {
-    Requires,  // hard dep - fail if dep fails
-    Wants,     // soft dep - continue if dep fails
-    After,     // ordering only - start after dep
+    Requires,  // hard dep: fail if dep fails
+    Wants,     // soft dep: continue if dep fails
+    After,     // ordering only: start after dep
     Conflicts, // stop this if dep starts
 }
 
@@ -159,6 +159,14 @@ pub enum ConditionType {
     PathExists,
     ServiceActive,
     TargetActive,
+    /// Nobody is logged in on the seat `arg` names
+    ///
+    /// The greeter's condition. The login screen exits when somebody logs in,
+    /// and `Restart=always` puts it back when they log out. Without this it
+    /// would come back at once over the desktop, and without a lock, because
+    /// the compositor refuses one to an overlay while a session owns the seat.
+    /// A greeter exiting on its own would be restarted in a loop
+    SeatFree,
 }
 
 #[derive(Clone, Copy)]
@@ -183,6 +191,10 @@ impl Condition {
                     .map(|t| super::daemon::target_at_least(t))
                     .unwrap_or(false)
             }
+            ConditionType::SeatFree => {
+                let seat: u8 = self.arg.parse().unwrap_or(crate::process::session::SEAT0);
+                !crate::process::session::seat_has_session(seat)
+            }
         };
         if self.negate { !result } else { result }
     }
@@ -206,6 +218,11 @@ pub struct ServiceFlags {
     pub notify_ready: bool,  // notify-type: service reported ready
     pub remain_after_exit: bool, // keep "active" state after exit (oneshot)
     pub was_signal_kill: bool,   // last death was signal, not clean exit
+    /// This service is stopped and the journal has already said so
+    ///
+    /// Supervision does not un-stop what somebody suspended, but says so:
+    /// otherwise `kill -STOP` on a service looks like a service that is idle
+    pub noticed_stopped: bool,
 }
 
 impl ServiceFlags {
@@ -217,6 +234,7 @@ impl ServiceFlags {
             notify_ready: false,
             remain_after_exit: false,
             was_signal_kill: false,
+            noticed_stopped: false,
         }
     }
 }
@@ -239,6 +257,12 @@ pub struct Service {
     pub pid: u64,
     pub entry: Option<fn() -> !>,
     pub exec_start_path: Option<&'static str>, // ELF binary path on disk
+    /// The identity to run as, if not root. `caps` is the other half: a service
+    /// may need one privilege, and root would give it all the others too
+    pub user: Option<(u16, u16)>,
+    /// The capabilities to keep. `None` means all of them, which is what a
+    /// service running as root gets
+    pub caps: Option<u64>,
     pub on_restart: Option<fn()>, // called before re-entering entry on restart
     pub priority: u8,
 
@@ -287,6 +311,8 @@ impl Service {
             pid: 0,
             entry: None,
             exec_start_path: None,
+            user: None,
+            caps: None,
             on_restart: None,
             priority: 5,
             target: Target::MultiUser,
@@ -396,6 +422,12 @@ impl ServiceTable {
 
     pub fn find_by_name(&self, name: &str) -> Option<usize> {
         self.services.iter().position(|s| s.active && s.name == name)
+    }
+
+    /// The service whose main process is `pid`
+    pub fn find_by_pid(&self, pid: u64) -> Option<usize> {
+        if pid == 0 { return None; }
+        self.services.iter().position(|s| s.active && s.pid == pid)
     }
 
     pub fn dependents_of(&self, name: &str) -> Vec<&'static str> {

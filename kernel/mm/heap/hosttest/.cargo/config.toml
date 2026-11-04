@@ -1,0 +1,21 @@
+# The repository root sets `target = "x86_64-unknown-none"` and `build-std` for
+# the kernel, and a cargo config applies to every directory beneath it. This
+# crate is only built for the host: it exists for its tests.
+#
+# `build.target` is overridden to the host. `build-std` cannot be turned off,
+# since cargo merges arrays by union, and with it on `core` gets built from
+# source while the toolchain's `std` brings its own (a duplicate `sized` lang
+# item). Adding `std` to the list puts everything in one source tree. It costs
+# one slow first build and is cached after that.
+#
+# `target-dir` keeps its artifacts away from the root's `target/`, which holds
+# host artifacts built against the toolchain's own `core`
+[build]
+target = "x86_64-unknown-linux-gnu"
+target-dir = "target"
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = []
+
+[unstable]
+build-std = ["std", "panic_unwind", "proc_macro", "test"]

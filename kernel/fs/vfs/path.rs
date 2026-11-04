@@ -5,7 +5,7 @@ pub struct PathWalker;
 
 impl PathWalker {
     pub fn resolve(
-        nodes: &[crate::fs::vfs::vnode::VNode; MAX_VNODES],
+        nodes: &crate::fs::vfs::table::Table<crate::fs::vfs::vnode::VNode>,
         cwd: usize,
         path: &str,
     ) -> VfsResult<usize> {
@@ -54,7 +54,7 @@ impl PathWalker {
     }
 
     fn follow_symlink(
-        nodes: &[crate::fs::vfs::vnode::VNode; MAX_VNODES],
+        nodes: &crate::fs::vfs::table::Table<crate::fs::vfs::vnode::VNode>,
         link_id: usize,
         depth: usize,
     ) -> VfsResult<usize> {
@@ -98,13 +98,13 @@ impl PathWalker {
     }
 
     fn lookup_child(
-        nodes: &[crate::fs::vfs::vnode::VNode; MAX_VNODES],
+        nodes: &crate::fs::vfs::table::Table<crate::fs::vfs::vnode::VNode>,
         parent: usize,
         name: &str,
     ) -> VfsResult<usize> {
         if let Some(id) = nodes[parent].children.find_by_name(name) {
             let cid = id as usize;
-            if cid < MAX_VNODES && nodes[cid].active {
+            if nodes.contains(cid) && nodes[cid].active {
                 return Ok(cid);
             }
         }
@@ -112,7 +112,7 @@ impl PathWalker {
     }
 
     #[inline]
-    pub fn effective_node(_nodes: &[crate::fs::vfs::vnode::VNode; MAX_VNODES], id: usize) -> usize {
+    pub fn effective_node(_nodes: &crate::fs::vfs::table::Table<crate::fs::vfs::vnode::VNode>, id: usize) -> usize {
         id
     }
 

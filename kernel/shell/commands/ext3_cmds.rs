@@ -20,11 +20,12 @@ pub fn cmd_ext3_tree(path: &str)                { common::impl_tree(path, "ext3"
 pub fn cmd_ext3_du(path: &str)                  { common::impl_du(path, "ext3"); }
 
 pub fn cmd_ext3_info() {
-    let result = with_ext2_pub(|fs| fs.scan_journal());
+    let result = with_ext2_pub(|fs| (fs.scan_journal(), fs.superblock.fs_version_str()));
     match result {
-        Some(Ok(info)) => {
+        Some((Ok(info), fs_name)) => {
             if !info.valid { print_error!("  no journal found"); return; }
-            cprintln!(57, 197, 187, "  ext3 Journal Info");
+            // An ext4 root has a journal too: the heading follows the volume
+            cprintln!(57, 197, 187, "  {} Journal Info", fs_name);
             println!("  Version:    {}", if info.version == 2 { "JBD2" } else { "JBD1" });
             println!("  Block size: {} bytes", info.block_size);
             println!("  Total:      {} blocks", info.total_blocks);
@@ -36,8 +37,8 @@ pub fn cmd_ext3_info() {
             else { print_error!("  Status:     dirty ({} transactions)", info.transaction_count); }
             if info.errno != 0 { print_error!("  Errno:      {}", info.errno); }
         }
-        Some(Err(FsError::NoJournal)) => print_error!("  no journal"),
-        Some(Err(e)) => print_error!("  ext3info: {:?}", e),
+        Some((Err(FsError::NoJournal), _)) => print_error!("  no journal"),
+        Some((Err(e), _)) => print_error!("  ext3info: {:?}", e),
         None => print_error!("  no ext2/3/4 filesystem mounted"),
     }
 }

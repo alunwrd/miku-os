@@ -1,29 +1,29 @@
-//////////////////////////////////////////////////////////////////////////
-// mikuD unit file parser - INI-like .service files                     //
-//                                                                      //
-// Format:                                                              //
-//                                                                      //
-// [Unit]                                                               //
-// Description=My service                                               //
-// After=kbd                                                            //
-// Wants=network                                                        //
-//  Conflicts=rescue-shell                                              //
-// ConditionPathExists=/etc/config                                      //
-//                                                                      //
-// [Service]                                                            //
-// Type=simple                                                          //
-// Restart=always                                                       //
-// RestartSec=50                                                        //
-// Priority=5                                                           //
-// WatchdogSec=100                                                      //
-// TimeoutStartSec=250                                                  //
-// TimeoutStopSec=250                                                   //
-// RemainAfterExit=true                                                 //
-// Environment=KEY=VALUE                                                //
-//                                                                      //
-// [Install]                                                            //
-// WantedBy=multi-user                                                  //
-//////////////////////////////////////////////////////////////////////////
+// mikuD unit file parser: INI-like .service files
+//
+// Format:
+//
+// [Unit]
+// Description=My service
+// After=kbd
+// Wants=network
+// Conflicts=rescue-shell
+// ConditionPathExists=/etc/config
+//
+// [Service]
+// Type=simple
+// Restart=always
+// RestartSec=200ms
+// Priority=5
+// WatchdogSec=30
+// TimeoutStartSec=10s
+// TimeoutStopSec=1min
+// RemainAfterExit=true
+// Environment=KEY=VALUE
+// User=greeter
+// Capabilities=may_priv
+//
+// [Install]
+// WantedBy=multi-user
 
 extern crate alloc;
 use alloc::boxed::Box;
@@ -49,6 +49,8 @@ pub struct UnitFile {
     pub service_type: ServiceType,
     pub exec_start: String,
     pub restart: RestartPolicy,
+    // The four times below are timer ticks, as the service table counts
+    // them; the file says seconds and `parse_duration_ticks` converts
     pub restart_sec: u64,
     pub priority: u8,
     pub watchdog_sec: u64,
@@ -57,6 +59,15 @@ pub struct UnitFile {
     pub remain_after_exit: bool,
     pub critical: bool,
     pub env: Vec<(String, String)>,
+    /// The account the service runs as, by name. Resolved against /etc/passwd
+    /// when the unit is registered, not here: the parser is handed text and
+    /// this file does no I/O
+    pub user: String,
+    /// The capabilities named by `Capabilities=`, as a mask, or `None` for a
+    /// unit that did not say. `None` means the default for this user, `Some(0)`
+    /// means none at all, and `Capabilities=` with an empty value means the
+    /// second
+    pub caps: Option<u64>,
     // [Install]
     pub wanted_by: Target,
 }
@@ -103,6 +114,8 @@ impl UnitFile {
             remain_after_exit: false,
             critical: false,
             env: Vec::new(),
+            user: String::new(),
+            caps: None,
             wanted_by: Target::MultiUser,
         }
     }
@@ -167,25 +180,40 @@ impl UnitFile {
                             .ok_or(ParseError::InvalidValue)?;
                     }
                     "RestartSec" => {
-                        unit.restart_sec = parse_u64(value).ok_or(ParseError::InvalidValue)?;
+                        unit.restart_sec = parse_duration_ticks(value).ok_or(ParseError::InvalidValue)?;
                     }
                     "Priority" => {
                         unit.priority = parse_u64(value).ok_or(ParseError::InvalidValue)? as u8;
                     }
                     "WatchdogSec" => {
-                        unit.watchdog_sec = parse_u64(value).ok_or(ParseError::InvalidValue)?;
+                        unit.watchdog_sec = parse_duration_ticks(value).ok_or(ParseError::InvalidValue)?;
                     }
                     "TimeoutStartSec" => {
-                        unit.timeout_start_sec = parse_u64(value).ok_or(ParseError::InvalidValue)?;
+                        unit.timeout_start_sec = parse_duration_ticks(value).ok_or(ParseError::InvalidValue)?;
                     }
                     "TimeoutStopSec" => {
-                        unit.timeout_stop_sec = parse_u64(value).ok_or(ParseError::InvalidValue)?;
+                        unit.timeout_stop_sec = parse_duration_ticks(value).ok_or(ParseError::InvalidValue)?;
                     }
                     "RemainAfterExit" => {
                         unit.remain_after_exit = parse_bool(value);
                     }
                     "Critical" => {
                         unit.critical = parse_bool(value);
+                    }
+                    "User" => unit.user = String::from(value),
+                    // Space- or comma-separated names, spelled as `id` prints
+                    // them. An unknown name is refused rather than ignored
+                    "Capabilities" => {
+                        let mut mask = 0u64;
+                        for word in value.split(|c: char| c.is_whitespace() || c == ',') {
+                            let word = word.trim();
+                            if word.is_empty() { continue; }
+                            match crate::process::cred::CapSet::by_name(word) {
+                                Some(bit) => mask |= 1u64 << bit,
+                                None => return Err(ParseError::InvalidValue),
+                            }
+                        }
+                        unit.caps = Some(mask);
                     }
                     "Environment" => {
                         if let Some((k, v)) = value.split_once('=') {
@@ -227,6 +255,47 @@ enum Section {
 fn parse_list(value: &str, out: &mut Vec<String>) {
     for item in value.split_whitespace() {
         out.push(String::from(item));
+    }
+}
+
+/// Timer ticks per second, for turning a unit file's times into the ticks
+/// the service table counts in. 250 until the LAPIC timer is calibrated
+fn ticks_per_sec() -> u64 {
+    match crate::arch::x86_64::apic::timer_hz() {
+        0 => 250,
+        hz => hz as u64,
+    }
+}
+
+/// A `*Sec=` value, in ticks. A bare number is seconds, as in systemd; `ms`,
+/// `s` and `min` may follow it. `0` stays 0, which means "off" for
+/// `WatchdogSec`. A non-zero time shorter than one tick rounds up to one tick,
+/// so it never turns into "off"
+fn parse_duration_ticks(value: &str) -> Option<u64> {
+    let v = value.trim();
+    let (num, ms_per_unit) = if let Some(n) = v.strip_suffix("ms") {
+        (n, 1u64)
+    } else if let Some(n) = v.strip_suffix("min") {
+        (n, 60_000)
+    } else if let Some(n) = v.strip_suffix('s') {
+        (n, 1_000)
+    } else {
+        (v, 1_000)
+    };
+    let ms = parse_u64(num.trim())?.checked_mul(ms_per_unit)?;
+    if ms == 0 { return Some(0); }
+    let ticks = ms.checked_mul(ticks_per_sec())? / 1_000;
+    Some(ticks.max(1))
+}
+
+/// A tick count as a unit file would write it, for `sv show`: whole seconds
+/// when it is a whole number of them, milliseconds otherwise
+pub fn ticks_as_duration(ticks: u64) -> alloc::string::String {
+    let ms = ticks.saturating_mul(1_000) / ticks_per_sec();
+    if ms % 1_000 == 0 {
+        alloc::format!("{}", ms / 1_000)
+    } else {
+        alloc::format!("{}ms", ms)
     }
 }
 
@@ -288,9 +357,8 @@ pub fn load_unit_file(path: &str) {
     crate::serial_println!("[mikud] loaded unit '{}' from '{}'", unit.name, path);
     crate::println!("  loaded '{}' ({})", unit.name, unit.description);
 
-    // Register with mikuD - note: disk-loaded services don't have a Rust fn() entry point,
-    // they would need ELF loading. For now we register them as metadata-only entries
-    // that can be used for dependency tracking and target ordering.
+    // Registers with mikuD. A disk-loaded service has no Rust fn() entry point;
+    // its ELF path is stored below
     register_unit(&unit);
 }
 
@@ -360,6 +428,25 @@ fn register_unit(unit: &UnitFile) {
     svc.flags.remain_after_exit = unit.remain_after_exit;
     svc.flags.critical = unit.critical;
 
+    // The identity, resolved now against the account files, for
+    // `apply_unit_identity`.
+    //
+    // A `User=` naming an account that does not exist is refused rather than
+    // run as root: a missing account is a reason not to start a service
+    if !unit.user.is_empty() {
+        match crate::syscall::adapters::process::passwd_ids(&unit.user) {
+            Some(ids) => svc.user = Some(ids),
+            None => {
+                crate::serial_println!(
+                    "[mikud] unit '{}' wants User={} and there is no such account - not registering",
+                    unit.name, unit.user);
+                crate::println!("  error: '{}' names no account '{}'", unit.name, unit.user);
+                return;
+            }
+        }
+    }
+    svc.caps = unit.caps;
+
     // Leak dependency lists to get &'static [&'static str]
     // Requires + After combined into deps (hard deps)
     if !unit.requires.is_empty() || !unit.after.is_empty() {
@@ -427,8 +514,7 @@ fn register_unit(unit: &UnitFile) {
     super::api::register_service_ext(svc);
 }
 
-/// Leak a String to get &'static str - used for service names in the kernel table.
-/// In a kernel context with no deallocation, this is acceptable.
+/// Leaks a String to get &'static str, for service names in the kernel table
 fn leak_string(s: &str) -> &'static str {
     let boxed = String::from(s).into_boxed_str();
     Box::leak(boxed)

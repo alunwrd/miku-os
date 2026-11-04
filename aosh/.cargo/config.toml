@@ -1,0 +1,15 @@
+# An alias and nothing else.
+#
+# The repository root's config sets the kernel's target and `build-std` for
+# every directory under it, so a plain `cargo test` here builds for
+# `x86_64-unknown-none`. A `[build]` section here would fix that and break the
+# builder's `std` build of aosh, which runs cargo in this directory too, so the
+# host target is spelled out in an alias:
+#
+#     cd aosh && cargo test-host
+#
+# (`build-std` has to name `std` as in `lib/net/.cargo/config.toml`: the root's
+# list cannot be switched off, only added to.)
+[alias]
+test-host = "test --target x86_64-unknown-linux-gnu -Z build-std=std,panic_unwind,proc_macro,test"
+build-host = "build --target x86_64-unknown-linux-gnu -Z build-std=std,panic_unwind,proc_macro,test"

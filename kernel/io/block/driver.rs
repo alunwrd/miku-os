@@ -1,10 +1,10 @@
-//  Block driver abstraction - the lower edge of the block layer
-// 
-//  Any storage device (ATA/IDE today, AHCI/NVMe/virtio-blk later) implements
-//  'BlockDriver'. The block layer ('super') owns the concrete driver instances
-//  behind a stable 'BlockDevId' and routes every read/write through them, so the
-//  filesystems above never touch a device driver directly - same shape as
-//  Linux's 'block_device' / 'request_queue' separation
+// Block driver abstraction: the lower edge of the block layer
+//
+// Any storage device (ATA/IDE, AHCI, NVMe, virtio-blk) implements
+// 'BlockDriver'. The block layer ('super') owns the concrete driver instances
+// behind a stable 'BlockDevId' and routes every read/write through them, so the
+// filesystems above never touch a device driver directly: the shape of Linux's
+// 'block_device' / 'request_queue' separation
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlkError {
@@ -89,11 +89,11 @@ impl HealthInfo {
 /// The contract every storage backend must satisfy. Units are 512-byte sectors;
 /// 'lba' is 48-bit-capable ('u64') and 'count' is a full request length.
 ///
-/// Methods take '&self': the block layer dispatches I/O concurrently without
-/// holding a device-wide lock, so a driver must be internally synchronized.
-/// Single-queue backends (ATA/AHCI/virtio) serialize on an internal lock;
-/// NVMe spreads requests across several independent queues for real
-/// parallelism. 'Sync' is therefore required as well as 'Send'
+/// Methods take '&self': the block layer dispatches I/O concurrently without a
+/// device-wide lock, so a driver must be internally synchronized. Single-queue
+/// backends (ATA/AHCI/virtio) serialize on an internal lock; NVMe spreads
+/// requests across several independent queues. So 'Sync' is required as well as
+/// 'Send'
 pub trait BlockDriver: Send + Sync {
     fn read_blocks(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlkError>;
     fn write_blocks(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError>;
@@ -103,9 +103,9 @@ pub trait BlockDriver: Send + Sync {
     fn health(&self) -> Option<HealthInfo> {
         None
     }
-    /// Tell the device the sector range no longer holds useful data
-    /// (TRIM / deallocate). Contents of the range become indeterminate;
-    /// the device may unmap it. Advisory - failure must not corrupt data
+    /// Tell the device the sector range no longer holds useful data (TRIM /
+    /// deallocate). Contents of the range become indeterminate; the device may
+    /// unmap it. Advisory: failure must not corrupt data
     fn discard(&self, _lba: u64, _count: u32) -> Result<(), BlkError> {
         Err(BlkError::Unsupported)
     }
@@ -116,11 +116,10 @@ pub trait BlockDriver: Send + Sync {
     fn write_zeroes(&self, _lba: u64, _count: u32) -> Result<(), BlkError> {
         Err(BlkError::Unsupported)
     }
-    /// Write sectors with Force Unit Access: the data is on stable media
-    /// before the command completes, without flushing the whole device
-    /// cache. Used for journal commit / barrier writes. The default is a
-    /// correct (if heavier) fallback - a normal write followed by a full
-    /// cache flush - which backends with a real FUA bit override
+    /// Write sectors with Force Unit Access: the data is on stable media before
+    /// the command completes, without flushing the whole device cache. For
+    /// journal commit / barrier writes. The default is a normal write followed
+    /// by a full cache flush; backends with a real FUA bit override it
     fn write_blocks_fua(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlkError> {
         self.write_blocks(lba, count, buf)?;
         self.flush()

@@ -2,59 +2,88 @@
 
 # Miku OS
 
-**An experimental operating system kernel written in Rust**
+**A full-stack x86_64 operating system written from scratch in Rust**
 
-*Powered by Rust and one developer :D*
+*Powered by Rust and one developer*
 
-<img src="https://raw.githubusercontent.com/alunwrd/miku-os/main/docs/miku.png" width="220" alt="Miku Logo">
+<img src="docs/miku.png" width="220" alt="Miku Logo">
 
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Architecture](https://img.shields.io/badge/arch-x86__64-blue.svg)]()
-[![Status](https://img.shields.io/badge/status-experimental-yellow.svg)]()
-[![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)]()
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)]()
+[![Status](https://img.shields.io/badge/status-beta-yellow.svg)]()
+[![License](https://img.shields.io/badge/license-Apache2.0-red.svg)]()
+
+<div align="center">
+
+### Graphical login (`maygreet`)
+<a href="docs/screenshots/login.png">
+  <img src="docs/screenshots/login.png" alt="Login screen" width="90%" style="border-radius: 8px;">
+</a>
+
+<br><br>
+
+### The desktop: `aosh` + `maywm`, and `msh` in `mayterm` running `info`
+<a href="docs/screenshots/desktop.png">
+  <img src="docs/screenshots/desktop.png" alt="Desktop with msh running info" width="90%" style="border-radius: 8px;">
+</a>
+
+<br><br>
+
+### The `aosh` launcher
+<a href="docs/screenshots/launcher.png">
+  <img src="docs/screenshots/launcher.png" alt="aosh launcher" width="90%" style="border-radius: 8px;">
+</a>
+
+<p><em>(Taken in QEMU, where the desktop is composed on the processor: shadows, rounded corners and
+borders are drawn there too, but the blur and the fades come from the GPU's compute pass on the
+RTX 5060 Ti. Click a screenshot for full resolution.)</em></p>
+
+</div>
 
 </div>
 
 ---
 
-> **Translations:** [Russian](docs/Russian_README.md) · [English](docs/English_README.md) · [Japanese](docs/Japanese_README.md)
-> **ABI reference:** [docs/MikuOS_ABI.md](docs/MikuOS_ABI.md)
-> **GPU notes:** [TU116](docs/Nvidia_tu116.md) · [GB206](docs/Nvidia_gb206.md)
+> **Translations:** [Russian](docs/Russian_README.md), [English](docs/English_README.md), [Japanese](docs/Japanese_README.md)
+> **ABI reference:** [MikuOS_ABI.md](docs/MikuOS_ABI.md) · **Security model:** [MikuOS_Security.md](docs/MikuOS_Security.md)
+> **NVIDIA:** [GB206 / RTX 5060 Ti](docs/Nvidia_gb206.md) · [TU116 / GTX 1650](docs/Nvidia_tu116.md)
+> **Reference documentation:** [WIKI.md](WIKI.md) (the index of [docs/wiki/](docs/wiki/)) · **Working notes (design, decisions, measurements):** [dev/](dev/README.md)
 
 ---
 
 ## About
 
-**Miku OS** is an operating system built from scratch in a `no_std` Rust environment. There is no libc
-underneath it and no host runtime: memory layout, interrupt handling, scheduling, filesystems and drivers
-are all written here.
+**Miku OS** is an operating system built from scratch in a `no_std` Rust environment. There is no C library
+beneath the kernel and no host runtime: memory layout, interrupt handling, scheduling, filesystems, drivers,
+the display server and the GPU driver are all written here. Programs above it get MikuOS's own C library,
+`libc_miku`, written in Rust, and a Rust `std` built on it.
 
-What actually runs today: a preemptive SMP kernel, ring-3 user processes with `fork`/`exec`/`wait` and
-signals, a dynamic linker with shared libraries, an init daemon (mikuD), a VFS with ext2/ext3/ext4, a
-block layer with write-back caching, a TCP/IP stack, and a userspace shell.
+What runs today:
 
-> All code is Rust. Assembly appears only in the boot entry, the syscall bridge, the AP trampoline and
-> the context switch - places where the calling convention has to be exact.
+- a preemptive SMP kernel with processes **and threads**, futexes, Linux-shaped signals and a vDSO;
+- terminals: pseudo-terminals, sessions, process groups and job control, with the shell (`msh`) in ring 3;
+- a VFS over tmpfs, ext2/3/4, btrfs (read-only) and memfs, with a page cache, write-back for disk files
+  and inotify;
+- a TCP/IP stack in the kernel, and DNS, TLS 1.3 and HTTP in ring 3;
+- **Mayland**, a display server and compositor, and a desktop on it: a Hyprland-shaped window manager
+  (`maywm`), a terminal (`mayterm`), and **aosh**, a desktop shell written in QML with real JavaScript;
+- its own **NVIDIA driver** for the RTX 5060 Ti (GB206, Blackwell): GSP-RM boot, DisplayPort output,
+  scanout from video memory, a compute channel that blurs, shades and draws the desktop on the card;
+- a **Rust `std` port**: `std::thread`, `std::sync`, `std::net`, `tokio`, `smol` - and the **Zed editor**
+  runs on it;
+- **its own libc** (`libc_miku.so`, about 540 exported functions, written in Rust) with C headers, so C
+  libraries - SQLite, zstd, tree-sitter, FreeType - build and link against it;
+- login and elevation **without a setuid bit**, through a broker; Argon2id passwords;
+- a package manager (`mikupkg`) and an installer.
 
-**Scale:** ~71 500 lines of kernel across 251 files, plus ~30 700 lines of userspace libraries and programs.
+> All code is Rust, except the vendored C libraries named above. Assembly appears only in the boot entry,
+> the syscall and trap entries, the AP trampoline and the context switch - places where the calling
+> convention has to be exact.
 
----
-
-## Status and honest limitations
-
-This is an experimental system. The list below is what is genuinely missing or provisional, so that the
-feature tables further down are not read as more than they are.
-
-| Area | State |
-|:--|:--|
-| **Preemption** | New. Verified in QEMU on 1-16 CPUs. An earlier naked-asm timer entry wedged real hardware, so it sits behind `PREEMPTIVE_TIMER` in `kernel/arch/x86_64/interrupts.rs` - set it to `false` to fall back to cooperative scheduling if a physical machine hangs after the first tick |
-| **Userspace threads** | Absent. No `clone`, no `futex`. Only the kernel uses multiple CPUs; a user process is single-threaded |
-| **`poll` / `select`** | Absent. A program cannot wait on several descriptors at once |
-| **Terminal** | `termios` (canonical/raw, echo, signal characters) and `ioctl` exist. Sessions, process groups, job control, pty and `/dev/tty` do not |
-| **Shell** | Split. `/bin/msh` runs in ring 3, but most commands still live in the in-kernel shell because they call kernel internals with no syscall equivalent |
-| **TLS** | Implemented inside the kernel. Parsing untrusted network input at ring 0 is not where it belongs |
-| **Tests** | No unit tests. Correctness is guarded by a QEMU boot smoke-test in CI |
-| **NVIDIA** | Bring-up in progress: GSP-RM boot path for TU116/TU117 and GB206. Not a usable display driver yet |
+**Scale:** ~182 000 lines of kernel in 463 files; ~140 000 lines of libraries (the ext and btrfs drivers,
+libmiku, the display protocol, the network protocols, the package manager, the `std` port);
+~66 000 lines of programs (`system/`, `utils/`, `aosh/`, `apps/`, `stdapps/`).
 
 ---
 
@@ -63,113 +92,94 @@ feature tables further down are not read as more than they are.
 | Component | Description |
 |:--|:--|
 | **Architecture** | x86_64, `#![no_std]`, `#![no_main]` |
-| **Boot** | GRUB2 + Multiboot2; framebuffer with BGR/RGB auto-detection |
+| **Boot** | GRUB2 + Multiboot2, BIOS boot (under UEFI, GRUB 2.14's `multiboot2` faults). An early console paints each boot phase into the framebuffer before the real console exists. Every boot step prints its name, and its milliseconds when it takes 5 ms or more; the kernel's own boot takes about 115 ms on QEMU/KVM |
 | **Address space** | Higher-half kernel at `0xFFFFFFFF80000000`, HHDM direct map at `0xFFFF800000000000` |
-| **Protection** | GDT + TSS + IST (double fault, page fault, GPF), ring 0 / ring 3 |
-| **Interrupts** | IDT with timer, keyboard, ATA IRQ 14/15, NMI, MCE, #UD, #NM, #PF, #GP, double fault, LAPIC error, spurious, 3 IPI vectors, 16 MSI vectors |
-| **Interrupt controller** | LAPIC + IO-APIC. The legacy 8259 PIC is initialised and then fully masked |
-| **Timer** | LAPIC timer, 250 Hz, calibrated against PIT channel 2 with a sanity range and a fallback |
-| **SMP** | Up to 64 CPUs (`MAX_CPUS`); ACPI MADT enumeration, INIT/SIPI bring-up, per-CPU GDT/TSS/GS |
-| **Scheduling** | CFS-style vruntime, per-CPU run queues, work stealing, preemptive timer |
-| **SSE** | CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1 |
-| **Kernel heap** | 128 MiB, static in `.bss`, `linked_list_allocator` |
-| **Kernel stacks** | 1 MiB for the BSP, 512 KiB per thread, 64 KiB per AP - all fenced by a guard page |
-| **Syscalls** | 72 (0-71) via `SYSCALL`/`SYSRET` MSRs, naked asm bridge |
-| **Real-time clock** | CMOS/MC146818 read at boot, refined by NTP when the network comes up |
+| **CPU protection** | NX, WP, SMEP and SMAP on; the direction flag is cleared on every entry from ring 3; the FPU/SSE state is part of every task and saved on switch |
+| **Interrupts** | IDT, LAPIC + IO-APIC (the 8259 is masked), MSI and MSI-X for NVMe (a vector per queue), AHCI, virtio-net and the GPU |
+| **Timer** | LAPIC timer at 250 Hz, calibrated against the PIT; per-CPU timer queues for nanosecond sleeps and `poll` timeouts |
+| **SMP** | Up to 64 CPUs; ACPI MADT, INIT/SIPI, per-CPU GDT/TSS/GS. A TLB shootdown goes only to CPUs that have the address space loaded |
+| **Scheduling** | CFS-style vruntime with per-CPU run queues kept as heaps, placement and work stealing, idle polling before `hlt`, up to 32 768 tasks |
+| **Kernel heap** | Size-class slabs with per-CPU magazines; anything over 32 KiB comes from `vmap`; shrinkers give memory back under pressure; `slabdebug` checks every object |
+| **Kernel stacks** | Mapped in `vmap` with guard pages: 128 KiB for a program's task, 512 KiB for a kernel thread |
+| **Syscalls** | 124 (0-123, all assigned) through `SYSCALL`/`SYSRET`; `sigreturn` returns through `iretq` |
+| **vDSO** | `clock_gettime`, `gettimeofday` and `getcpu` without a syscall (`Instant::now` costs 11 ns) |
+| **Clock** | CMOS at boot; `mikudo ntpdate` or `clock_settime` sets it (there is no automatic NTP sync) |
+| **Kernel log** | Leveled records in memory (`klog`), three rings by level so chatter never pushes an error out, read by `dmesg`; `pstore` keeps chosen lines across a warm reboot (the whole log with `klogpstore`); backtraces carry symbol names |
 
-### Boot sequence
+### Locks and waits
 
-Each step is reported as `[boot] ok <name>` on the serial console and the framebuffer:
-
-```
-Physical memory manager → ACPI (RSDP/MADT) → APIC → IO-APIC → LAPIC timer →
-Real-time clock → IRQ routing → Virtual file system → Shared library cache →
-Block device probe → Block device nodes (/dev) → Network subsystem →
-Firmware store → NVIDIA GPU probe → Scheduler → Firmware SMI silence →
-PS/2 keyboard → Interrupts → Timer calibration → SMP (AP bringup) →
-mikuD init daemon
-```
+- **`SchedMutex` / `SchedRwLock`** (`kernel/kcore/sched_lock.rs`) spin briefly, then sleep. The VFS lock
+  and the page cache's are read-write: `stat`, `open`, `getdents`, `close` and cached reads run beside each
+  other. Descriptor reads take no lock at all (a sequence count per slot).
+- **`IrqMutex`** for anything an interrupt handler touches; the timer handler takes no lock at all.
+- **Wait queues** everywhere a task waits. No wait checks a condition and then sleeps on it separately:
+  that is the lost wakeup, and each one found was a 100 ms stall.
+- **`/proc/lockstat`** (with `lockstat` on the boot line): how often each sleeping lock was taken and
+  contended, its hold times by bucket, the longest hold and where it was taken, and the disk reads and
+  writes made while the VFS lock was held.
 
 ### Memory safety of the kernel itself
 
 Each of these exists because it caught a real, hard-to-diagnose bug:
 
-- **Stack guard pages** (`kernel/mm/kstack.rs`) - every thread stack takes `pages + 1` contiguous frames
-  and unmaps the lowest one from the HHDM. Overflow faults on the guard page, at the instruction that did
-  it, and the fault handler names the owning pid. The kernel image is mapped by a single 1 GiB huge page,
-  so without this an overflow silently overwrites whatever the allocator handed out next.
-- **BSP stack canary** (`kernel/kcore/stack_guard.rs`) - a poisoned page below the boot stack, checked
-  after every init step.
-- **`IrqMutex`** (`kernel/kcore/irq_lock.rs`) - disables interrupts for the critical section. Required for
-  every lock an interrupt handler can touch (`PMM`, `SWAP_MAP`, `EMERGENCY_POOL`, `REFCOUNTS`,
-  `MSI_HANDLERS`); a plain spin lock there deadlocks a CPU against itself.
-- **`SchedMutex`** (`kernel/kcore/sched_lock.rs`) - spins briefly, then yields to the scheduler. Used for
-  the VFS lock, which is held across disk I/O where spinning wastes whole timeslices.
+- **Stack guard pages** - an overflow faults at the instruction that did it, and the fault names the task.
+- **`slabdebug`** - poisoned, red-zoned objects: a write past the end, a double free and a write after
+  free are each reported where they happen.
+- **`IrqMutex`** - a plain spin lock taken by an interrupt handler deadlocks a CPU against itself.
+- **Copy-on-write read-only until the shootdown** - a sibling CPU can never write through a stale entry.
 
 ---
 
 ## Memory management
 
-### Physical (`kernel/mm/pmm.rs`)
-
-Bitmap frame allocator with word-parallel scanning, separate hints for single-frame and contiguous
-allocation, refcounting for copy-on-write, and an emergency reserve pool used by the swap-in path.
-
-### Virtual (`kernel/mm/vmm.rs`)
-
-Four-level paging behind an `AddressSpace` type. User address spaces copy PML4 entries 256-511 from the
-kernel tables, so kernel and HHDM mappings are shared and stay in sync. Huge pages are split on demand
-when a 4 KiB mapping is needed (MMIO, guard pages).
-
-### Swap (`kernel/mm/swap.rs`, `swap_map.rs`)
-
-Reverse mapping from physical frame to `(cr3, virt)`, clock-sweep eviction with aging and pinning, and a
-swap PTE encoding that preserves the original flags. Reclaim runs on the **kswapd** thread - the timer
-tick only raises a flag, because eviction performs disk I/O and takes locks that must never be entered
-from an interrupt handler.
-
-### mmap (`kernel/mm/mmap.rs`)
-
-Anonymous and file-backed mappings, demand paging, copy-on-write across `fork`, `mprotect`, `msync`.
+| Part | Detail |
+|:--|:--|
+| **Physical** | Bitmap sized by the highest usable frame; copy-on-write counts are one atomic per frame; per-CPU frame caches for faults |
+| **Virtual** | Four-level paging behind `AddressSpace`; kernel half shared by every address space |
+| **Faults** | Demand paging with fault-around (16 pages when the page before is mapped); copy-on-write across `fork` |
+| **mmap** | Anonymous (private only), file-backed, `MAP_SHARED` of a file (a tmpfs file's own frames), `mprotect`, `msync` |
+| **Swap** | Reverse map, clock-sweep eviction with aging, swap PTEs that keep the original flags; reclaim on the **kswapd** thread. One swap device of up to 256 MiB, and only frames in the first 256 MiB of physical memory can be swapped out |
+| **Page cache** | A disk file's pages, read without the VFS lock on a hit, written back by bdflush, `fsync` or the dirty limit |
 
 ---
 
-## Processes and scheduling
+## Processes, threads and signals
 
 | Feature | Detail |
 |:--|:--|
-| **Model** | One `Process` per thread; kernel threads share the kernel CR3, user processes get their own |
-| **Creation** | `fork` (CoW), `exec`/`execve`, `wait4`, `kill`, zombie reaping |
-| **Scheduler** | CFS-style vruntime with priority weights, per-CPU run queues, min-vruntime selection |
-| **Load balancing** | Placement on the lightest eligible CPU plus work stealing when a queue runs dry |
-| **Preemption** | Timer-driven. The naked stub builds the 15-GPR + iret frame the scheduler expects and resumes on whatever stack it returns |
-| **Affinity** | 64-bit CPU mask per process |
-| **Signals** | User-registered dispatch entry, `sigreturn`, SIGINT/SIGQUIT/SIGTERM/SIGKILL/SIGCHLD |
-| **Worker pool** | Sized from the ACPI CPU count, clamped to 4-32 threads |
-| **Descriptors** | Per-process FD table, cloned on `fork`, released at `exit` rather than at reap |
+| **Model** | A task per thread; threads of a process share a thread group (`tgid`) whose descriptors, memory and credentials resolve through the leader |
+| **Creation** | `fork` (copy-on-write), `exec`/`execve`, `wait4` with a POSIX status word, `thread_create`/`thread_exit`, `gettid` |
+| **Thread limits** | No `clone` with flags; `exec` from a thread other than the leader is refused |
+| **Synchronisation** | `futex` (wait, wake, timeouts; a `MAP_SHARED` tmpfs page is keyed on its frame, so it works across processes), so `std::sync` needs no MikuOS code. No requeue, priority inheritance or robust lists |
+| **Signals** | Signals 1-31 with Linux's `siginfo_t` and `ucontext_t` layout: a handler gets the whole machine and may rewrite it (wasmtime does). `SA_RESTART` is accepted but not acted on. CPU faults are signals - `#PF` is `SIGSEGV`, `#UD` is `SIGILL`, `#DE` is `SIGFPE` - and `sigaltstack` is per thread |
+| **Terminals** | Sessions, process groups, controlling terminals, `SIGTTIN`/`SIGTTOU`, job control |
+| **When a program dies** | A crash report names the fault and the stack with symbols; an ELF core lands in `/tmp` for a debugger |
+| **ELF loader** | Hardened against hostile images; a selftest builds them in memory |
+| **Credentials** | uid/gid, supplementary groups, capabilities (`capget`/`capset`), sessions as kernel objects |
 
 ---
 
 ## System calls
 
-72 entries, dispatched from a naked `SYSCALL` bridge that swaps to the per-CPU kernel stack via `gs`.
+124 numbers (0-123, all assigned); the full table with arguments and errors is in [MikuOS_ABI.md](docs/MikuOS_ABI.md).
 
 | Range | Area |
 |:--|:--|
-| 0-10 | `exit`, `write`, `read`, `mmap`, `munmap`, `mprotect`, `brk`, `getpid`, `getcwd`, `set_tls`, `get_tls` |
-| 11-17 | `open`, `close`, `seek`, `fsize`, `map_lib`, `sleep`, `uptime` |
-| 18-27 | `stat`, `fstat`, `mkdir`, `rmdir`, `unlink`, `readdir`, `rename`, `link`, `chmod`, `chown` |
-| 28-42 | `dup`, `dup2`, `truncate`, `write_file`, `symlink`, `readlink`, `pipe`, `chdir`, `statfs`, `fallocate`, `getxattr`, `setxattr`, `utimensat`, `fsync`, `punch_hole` |
-| 43-47 | `fork`, `wait4`, `kill`, `exec`, `umask` |
-| 48-55 | `getuid`, `getgid`, `geteuid`, `getegid`, `setuid`, `setgid`, `seteuid`, `setegid` |
-| 56-66 | `socket`, `connect`, `send`, `recv`, `mmap_file`, `msync`, `bind`, `listen`, `accept`, `sendto`, `recvfrom` |
-| 67-69 | `execve`, `sigentry`, `sigreturn` |
-| 70-71 | `clock_gettime`, `ioctl` |
+| 0-17 | `exit`, `write`, `read`, `mmap`, `munmap`, `mprotect`, `brk`, `getpid`, `getcwd`, TLS, `open`, `close`, `seek`, `fsize`, `map_lib`, `sleep`, `uptime` |
+| 18-42 | files: `stat`, `fstat`, `mkdir`, `rmdir`, `unlink`, `readdir`, `rename`, `link`, `chmod`, `chown`, `dup`, `dup2`, `write_file`, `truncate`, `symlink`, `readlink`, `pipe`, `chdir`, `statfs`, `fallocate`, xattrs, `utimensat`, `fsync`, `punch_hole` |
+| 43-55 | `fork`, `wait4`, `kill`, `exec`, `umask`, uid/gid calls |
+| 56-59, 62-66, 77, 80, 83-85, 114 | sockets: `socket`, `connect`, `send`, `recv`, `bind`, `listen`, `accept`, `sendto`, `recvfrom`, `socketpair`, socket options, `peercred`, `sendfd`/`recvfd` |
+| 60-61, 67-71 | `mmap_file`, `msync`, `execve`, `sigentry`, `sigreturn`, `clock_gettime`, `ioctl` |
+| 72-76, 78-79, 81-82 | display pools, `klog`, `poll`, `getrandom`, `clock_settime`, xattr list/remove |
+| 86-93 | `setresuid`, `setresgid`, `setgroups`, `getgroups`, `capget`, `capset`, `session`, `power` |
+| 94-98, 121 | GPU: `gpu_info`, `gpu_submit`, `gpu_bind`, `gpu_wait`, `gpu_program`, `gpu_alloc` |
+| 99-105 | `tty`, `sigdisp`, `setpgid`, `getpgid`, `procinfo`, `kcmd`, `proc_path` |
+| 106-120 | threads (`thread_create`, `thread_exit`, `gettid`, `sched_yield`, `futex`), `getdents`, `lstat`, `fcntl`, `getsockopt`, `sigaltstack`, inotify (116-118), `realpath`, `pipe2` |
+| 122-123 | `sleep_ns`, `poll_ns` |
 
-**User pointer validation** (`kernel/syscall/usercopy.rs`): every range must lie in the canonical user
-half, every page is walked to confirm `PRESENT | USER` (and `WRITABLE` where needed), lazy VMA pages are
-faulted in first, and paths are copied into kernel memory before use so they cannot be rewritten after
-validation.
+The high half of a path argument's length names a directory descriptor - that is how the `*at` calls,
+`fchmod` and `F_GETPATH` are expressed; an empty path with a descriptor names the descriptor's own file. Every user pointer is checked page by page, and paths are copied
+into the kernel before use.
 
 ---
 
@@ -177,66 +187,75 @@ validation.
 
 | Property | Value |
 |:--|:--|
-| Vnodes | 256 |
-| Open files per process | 128 |
-| Mount slots | 8 (VFS) / 4 (ext driver) |
-| Name length | 64 bytes |
-| Page cache | 1024 pages × 512 B = 512 KiB |
-| Filesystem types | tmpfs, devfs, procfs, ext2, ext3, ext4, cowfs, pipefs |
+| Vnodes | A dynamic table with an LRU and a shrinker; reclaimed in batches |
+| Names | Directory entries are their own objects: hard-link aliases, an inode cache, negative entries, whiteouts; inode numbers are stable |
+| Open files per process | 512 |
+| Name length | 255 bytes |
+| tmpfs | Frames, up to a quarter of RAM; 4 GiB files |
+| Filesystem types | tmpfs, devfs, procfs, ext2, ext3, ext4, btrfs (read-only), memfs |
 
-Features: hierarchical namespace, hard and symbolic links, permissions with uid/gid/umask, extended
-attributes, file locks, per-process cwd, dentry cache, journal hooks, quota accounting, content-addressed
-storage helpers, and `/dev` block-device nodes generated from the block layer.
-
-`/proc` exposes `uptime`, `meminfo`, `diskstats` and friends; `/dev` carries the console, null, zero,
-random and the block devices; `/lib` holds the ten preloaded shared libraries.
+- **Filesystems behind one trait** (`FileSystem`) and one registry; nothing in the VFS names a format.
+- **Lookups without the lock**: a name the cache does not have is read from the disk with the VFS lock let
+  go, then put in if the directory has not changed meanwhile.
+- **Page cache for disk files**: a cached read takes no VFS lock; writes go into it as dirty pages and are
+  written out by `fsync`, bdflush (pages older than five seconds) or a writer over the dirty limit. A big
+  file's blocks and pages are freed after the lock, not under it.
+- **inotify** with Linux's ABI; pipes are anonymous vnodes; POSIX record locks (`fcntl`).
+- `/proc` has twelve files: `version`, `uptime`, `meminfo`, `mounts`, `cpuinfo`, `stat`, `heap`, `diskstats`,
+  `net`, `clock`, `slabinfo` and `lockstat`. There are no per-process directories.
 
 ---
 
 ## Filesystems
 
-### ext2 / ext3 / ext4 (`kernel/fs/ext/`)
+### ext2 / ext3 / ext4 (`lib/extfs`, mounted by `kernel/fs/ext/`)
 
-The driver detects the on-disk flavour from the superblock feature bits and reports it as such -
-`ext2`, `ext3` or `ext4` - in the mount log, in `statfs()` and in `/proc`:
-
-```
-[miku_extfs] slot 0 drive 1 lba 0 - ext4 (journal=true extents=true 64bit=true
-                                          metadata_csum=true flex_bg=true dir_index=true)
-```
+The driver is a separate crate that knows the on-disk format and nothing about this kernel: it reaches the
+disk through one trait (`BlockHost`, from `lib/fshost`). The point is the test loop - `cd lib/extfs &&
+cargo test` builds a filesystem in memory, corrupts it on purpose, cuts the power mid-transaction and
+checks what the driver does, in seconds rather than a boot.
 
 | Capability | Detail |
 |:--|:--|
 | **Read** | Direct, indirect, double- and triple-indirect blocks; ext4 extent trees; inline data |
-| **Write** | Allocation with per-group hints, truncate, punch hole, fallocate, rename, links |
-| **ext3** | JBD2-style journal: transactions, descriptor and revoke blocks, replay on mount |
-| **ext4** | Extent trees, 64-bit block numbers, flex_bg, metadata checksums (CRC32c), inline data |
-| **Volume size** | Limited by the filesystem, not the driver - block group tables grow on the heap |
-| **Integrity** | fsck, orphan inode cleanup on mount, TRIM/discard, `fiemap` |
-| **mkfs** | ext2/ext3/ext4 creation with a dry-run mode |
+| **Write** | Extents allocated and freed in runs; file data goes straight to the device, a new block's data before the extent that names it; blocks freed by an open transaction are not reused until it commits |
+| **Directories** | Hash-indexed (`dir_index`) read and written: index built on growth, leaves split at a hash boundary, the tree gains a level |
+| **ext3 journal** | JBD2: transactions with handles, descriptor and revoke blocks, write-ahead ordering by pinning, replay on mount, orphan list, crc32c over the log |
+| **ext4** | Extent trees of any depth, unwritten extents for `fallocate`, the `64bit` feature (block numbers are still 32-bit inside), flex_bg, nanosecond and post-2038 times |
+| **Checksums** | crc32c (SSE4.2 when present) over every metadata structure |
+| **Integrity** | A five-pass check and repair (`extfsck`), orphan cleanup, TRIM, `fiemap` |
+| **mkfs** | ext2/ext3/ext4, ext4 with `metadata_csum` |
+
+Checked against e2fsprogs, not against itself: `e2fsck -f -n` on every image the tests make, checksums
+reproduced from `mke2fs` images, a directory index `e2fsck -D` built written into and walked by `debugfs`,
+and a power cut at every write of an operation with each resulting image handed to `e2fsck`.
+
+### btrfs (`lib/btrfs`)
+
+Read-only in the kernel: chunk tree, the filesystem trees, extents, inline files. The crate also has
+copy-on-write transactions, an allocator and commits, tested on the build host against `mkfs.btrfs`
+images.
 
 ### Others
 
-- **tmpfs** - the root filesystem, page-cache backed
-- **devfs**, **procfs** - synthesised
+- **tmpfs** - the root filesystem; **memfs** - a mounted filesystem with no medium, used to test the VFS
+  against a second format; **devfs**, **procfs**
 - **GPT** - partition table parsing, partition nodes, `partprobe`
+- **Installer** - `install plan` / `install go` in the console, or a window that asks the same questions
 
 ---
 
 ## Storage stack
 
 ```
-VFS  →  block layer  →  buffer cache  →  driver  →  device
+VFS → page cache → filesystem → block layer (cache, bdflush) → driver → device
 ```
 
-- **Block layer** (`kernel/io/block/`) - device registry, partition mapping, per-device I/O statistics,
-  discard and write-zeroes, health monitoring (NVMe log pages and ATA SMART), `/proc/diskstats`
-- **Buffer cache** - 512 chunks × 4 KiB, 8-way set associative, write-back with a **bdflush** flusher
-  thread
-- **Queues** - `&self` drivers with lockless dispatch; NVMe uses four per-CPU submission queues
-
-**Drivers** (`kernel/drivers/block/`): `ata` (PIO + bus-master DMA), `ahci`, `nvme`, `virtio_blk`,
-`ramdisk` (used for the firmware image handed over by GRUB).
+- **Block layer** (`kernel/io/block/`): device registry, partitions, per-device statistics, discard and
+  write-zeroes, health (NVMe log pages, ATA SMART), `/proc/diskstats`
+- **Drivers** (`kernel/drivers/block/`): `nvme` (an I/O queue per CPU, an MSI-X vector per queue), `ahci`
+  (MSI), `ata` (PIO + bus-master DMA), `virtio_blk`, `ramdisk` (the firmware image GRUB hands over).
+  A waiter polls for 50 µs and then sleeps.
 
 ---
 
@@ -244,130 +263,299 @@ VFS  →  block layer  →  buffer cache  →  driver  →  device
 
 | Layer | Support |
 |:--|:--|
-| **Drivers** | Intel e1000 (82540EM/82545EM/82574L/82579LM/I217), Realtek RTL8139/8168/8169, virtio-net |
-| **Link** | Ethernet, ARP with cache |
-| **Network** | IPv4, ICMP (ping, traceroute) |
-| **Transport** | UDP, TCP with a full state machine, retransmission and listeners |
-| **Application** | DHCP client, DNS resolver, HTTP/1.1, HTTP/2, NTP |
-| **Security** | TLS 1.2/1.3 client: RSA, ECDHE, AES-GCM, bignum arithmetic - currently in ring 0 |
-| **Sockets** | Per-process socket table; `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `sendto`, `recvfrom` |
+| **Drivers** | Intel e1000 family, Realtek RTL8139 and RTL8111/8168 (PCI id 8169 is handed to the RTL8139 driver), virtio-net (transitional id 1af4:1000) with MSI-X |
+| **Link / network** | Ethernet, ARP, IPv4, ICMP |
+| **Transport** | UDP; TCP with retransmission and listeners (no `TIME_WAIT` or `CLOSING` state yet); RFC 6056 port selection |
+| **In ring 3** (`lib/net`) | DNS (`getaddrinfo`), HTTP/1.1, HTTP/2, NTP, a TLS 1.2/1.3 client with certificate validation against the roots in `/etc/ssl/certs/ca-bundle.pem` - no trust store means no connection |
+| **Sockets** | AF_INET (TCP, UDP, raw ICMP), AF_UNIX with `peercred` and descriptor passing, AF_MAYLAND |
 
-`netd` runs DHCP at boot and brings the link up automatically.
+`netd` runs DHCP at boot. `ping`, `traceroute`, `wget`, `curl`, `host` and `ntpdate` are programs in `/bin`.
+There is no loopback interface, and `shutdown`, `getsockname` and `getpeername` are not implemented yet.
+The full reference is [docs/wiki/network.md](docs/wiki/network.md).
 
 ---
 
-## Input and console
+## Graphics: Mayland, the desktop and the GPU
 
-- **PS/2 keyboard** - controller init, scancode set 1, lock-free ring buffer
-- **USB** - xHCI controller, HID keyboard, BIOS/EHCI handoff
-- **Console** - framebuffer text console with colour, scrolling and a JetBrains Mono bitmap font generated
-  at build time. All console output is mirrored to the serial port, which is what makes headless boots and
-  CI logs useful
-- **Terminal** (`kernel/io/input/user_stdin.rs`) - line discipline with canonical and raw modes, echo
-  control, Ctrl-C → SIGINT, Ctrl-\ → SIGQUIT, Ctrl-D → EOF, Ctrl-U → kill line. Settings are reachable
-  from ring 3 through `ioctl` (`TCGETS`, `TCSETS`, `TIOCGWINSZ`)
+### Mayland (`kernel/mayland/`, `lib/mayland/`)
+
+A display server and compositor. Its protocol uses Wayland's wire format over its own socket family;
+shared memory is a kernel handle, the keymap a table. One copy of the protocol and the font renderer is
+compiled into both the server and every client (`libmay`).
+
+- **Compositing**: damage tracking, windows with rounded squircle corners, borders, shadows and blur,
+  animations on curves, the afterimage of a closing window, layers above and below windows, popups,
+  the clipboard, a hardware cursor plane.
+- **Window management** is a program: **`maywm`** reads a Hyprland-shaped config (`/etc/mayland/default.d/*.conf`, then `may.conf`, then
+  `conf.d/*.conf`; a later line wins): tiling,
+  workspaces, rules, binds, `exec-once`, monitors. A line nobody recognised is reported, not dropped.
+- **Outputs**: modes from the monitor's EDID; the desktop is composed on one output (a second head is
+  written but has not run yet); a display layer (`kms`) above the drivers
+  takes atomic, test-first requests, and `maywm`'s `monitor =` lines are Hyprland's.
+- **Clients**: `mayterm` (a window that hosts a shell on its own pty), `maygreet` (the login screen),
+  `maysession`, the installer, `maydemo`, Zed.
+
+### aosh - the desktop shell (`aosh/`, `etc/aosh/`)
+
+aosh is to MikuOS what quickshell is to Hyprland: one program that reads a directory of QML files and draws
+the bar, the launcher, the overview and the popups from them. The language is a subset
+of QML; every expression and function is real JavaScript (QuickJS). Text is rendered with FreeType and
+rustybuzz and matches Qt's glyphs pixel for pixel; rectangles, glyphs, Canvas and effects
+render the way Qt Quick renders them (within 1-2/255 of Qt) - on the card through a compute program, on
+the processor otherwise. It ships with a port of a real quickshell configuration (`etc/aosh/negi`, run
+with `aosh -c negi`). Your own config goes in `~/.config/aosh`, because `/etc` is the read-only boot
+image. See [docs/wiki/aosh.md](docs/wiki/aosh.md) and [docs/wiki/mayland.md](docs/wiki/mayland.md).
+
+### On the card
+
+On the RTX 5060 Ti the compositor runs on the GPU's compute engine: blur, shadows, rounded corners and
+window composition are GPU programs, every window is kept in video memory (copied there by the copy
+engine; `notex` turns this off), and aosh's own drawing is a GPU program too. A surface the compute pass
+cannot take is blended by the processor. That is the driver's job, below.
+
+---
+
+## NVIDIA GPU driver (`kernel/drivers/gpu/nvidia/`)
+
+A driver of its own for the **GeForce RTX 5060 / 5060 Ti (GB206, Blackwell)**, about 52 000 lines in 130
+files, written by reading the published `nvidia-open` source (OpenRM) function by function. It is not a
+port: no C, no Linux shims. It boots the card's GSP-RM firmware and talks to it the way OpenRM does, and
+the display, memory and compute paths above that are this kernel's own. The design notes are in
+[`dev/`](dev/README.md) (`gsp-foundation.md`, `gsp-615.md`, `gb206-display.md`, `gpu-memory-compute.md`,
+`kms-architecture.md`, `gpu-perf.md`); the user-facing notes are [Nvidia_gb206.md](docs/Nvidia_gb206.md).
+
+### Bring-up
+
+```
+PCI probe → BAR0/BAR1 → FSP chain of trust (MCTP over EMEM) → GSP-FMC → GSP-RM 615 running
+          → RPC transport up → system info, registry, static info → RM object tree → engines
+```
+
+- **FSP boot** (`blackwell/fsp.rs`, `fmc.rs`, `gspboot.rs`): on Blackwell the host does not run the falcons
+  itself. It stages GSP-FMC and the GSP-RM image in system memory and sends the FSP one chain-of-trust
+  message; FSP verifies FMC, FMC carves the protected region and starts GSP-RM.
+- **One firmware release**: the driver speaks GSP-RM **615.78.08** - the firmware and the code that talks to
+  it come from the same release, as in OpenRM. GSP-RM and the ucodes are extracted from NVIDIA's driver
+  package, and FMC and the bootloader are built from OpenRM 615.78.08's bindata (`dev/nvidia/fw_extract.py`
+  with `--tree refsrc/openrm`); all of it is packed into an ext2 image and handed over as a GRUB module.
+
+### Talking to GSP-RM (`gsp_common/`)
+
+- **Transport** (`rpc/`): the 615 message queue (MSGQ 2.0 with MCTP/NVDM framing), one receive path with
+  OpenRM's boot allow-list, header checks (MCTP version, vendor, magic, size), replies matched by function
+  and sequence, and a sanity check before every call.
+- **Lifecycle** (`kgsp/`): an interrupt handler that only touches atomics and a worker thread as its bottom
+  half; events, health checks, **unload and reload without rebooting the machine**, CrashCat reports.
+- **RM API** (`rmapi.rs`): every object is allocated through an RM client with real parents - client,
+  device, subdevice, memory, channels, display - the tree GSP-RM expects.
+- **Logs**: GSP-RM's own log is decoded (`logdecode.rs`); every RPC and RM call with its status goes to the
+  kernel log at debug level, robust-channel errors, Xids and CrashCat at error level (`nvidia log`).
+
+### Memory
+
+- **GPU MMU of its own** (`gmmu.rs`, `vaspace.rs`): page tables built here, with 4K, 64K and 2M pages and
+  TLB invalidation; BAR1 mapped for the processor's stores into video memory.
+- **Video-memory allocator** (`gsp_common/vram.rs`) and **pools a program can map** (`gpu_alloc`): a window
+  whose buffer is video memory is read in place by the compositor - MikuOS's DMA-BUF.
+
+### Channels, copies and compute
+
+- GPFIFO channels with push buffers and semaphores; a **copy engine** for uploads and window copies; a
+  **compute channel** that launches programs through QMDs (`qmd.rs`), several of them in one submission.
+- **GPU programs** are CUDA C (`shaders/*.cu`: blur, composite, fill, over, paint), compiled by `nvcc` at
+  build time and read by MikuOS's own cubin parser (`cubin.rs`) - the same parser checks them at build time
+  and loads them in the kernel.
+- **User programs**: `gpu_program` (98) loads a program a process supplies, under `CAP_GPU`; `gpu_submit`,
+  `gpu_bind`, `gpu_wait` and `gpu_info` complete the interface (`apps/gpudemo`).
+
+### Display (`blackwell/display.rs`, `gsp_common/modeset/`, `kernel/drivers/gpu/kms/`)
+
+- **DisplayPort** link training, **HDMI**, IMP (the display's bandwidth and clock check), heads and
+  windows, scanout out of video memory, modes from the monitor's EDID.
+- **The colour pipeline**: input LUT, colour-space conversion, output LUT, dither and clamp, in hardware
+  order. The input LUT is half-float - the screen was black for weeks while it was written as 16-bit fixed
+  point.
+- **Cursor plane** by default, window flips with a flip semaphore; a **second head** and VRR are written
+  but have not run on a panel yet.
+- **KMS** (`kms/`): a layer above the driver with DRM's objects and atomic, test-only requests; outputs are
+  named as nvidia-drm names them (`DP-1`, `HDMI-A-1`), so a Hyprland `monitor =` line works unchanged
+  (QEMU-verified; not yet run on the card).
+
+### Power and clocks (`gsp_common/perf/`)
+
+The firmware reclocks the card; the driver reads what it reports - clocks, load, power and temperatures
+from the page GSP-RM writes them into, and the PMU's history - and asks for boost, a clock lock or a floor
+the way the client OS does in OpenRM.
+
+### Diagnostics and escape hatches
+
+- `run=nvidia_selftest` - 184 cases, headless; `run=` also drives an unattended **GSP unload/reload test**
+  whose log survives a warm reboot (`pstore`).
+- Kernel shell: `nvidia` (`gb206`, `log`, `perf`, `rm-tree`, `gsp unload` / `gsp load` / `gsp reset`,
+  `selftest`), `display`, `mayland status`. Every subcommand is in
+  [Nvidia_gb206.md](docs/Nvidia_gb206.md#commands).
+- GRUB flags: `nogpu` (leave the card alone), `nointr` (every GPU wait polls), `nononstall` (fences poll),
+  `nobar1` (stores through PRAMIN), `gpu4k` (4K pages only), `notex` (windows read from system memory),
+  `nohwcursor` (software cursor), `noflipsema`, `nobackdrop` (no backdrop blur), and the boot-order hatches
+  `gspbase`, `pciebase`, `coldhead` and `edidbase`. The complete table is in
+  [Nvidia_gb206.md](docs/Nvidia_gb206.md#boot-flags).
+
+### Turing
+
+The **TU116 / GTX 1650** path (`turing/`) does host bring-up and stages the GSP-RM image at boot. The full
+six-stage GSP-RM boot (FWSEC, WPR2, SEC2, booter) runs only on request (`nvidia gsp-rm-boot-full`) and is
+not expected to finish yet; it has never run on a Turing card. TU117 gets host bring-up only. It has no
+display or compute ([Nvidia_tu116.md](docs/Nvidia_tu116.md)).
+
+---
+
+## Input and terminals
+
+- **Keyboard** - PS/2 and USB HID (xHCI, a HID report parser); layouts of its own; key repeat from the
+  hardware's typematic (PS/2 only: a held key on a USB keyboard does not repeat yet).
+- **Mouse** - PS/2 and USB.
+- **Terminals** (`kernel/io/tty/`) - a pty table with masters as descriptors (`/dev/ptmx`, `/dev/ptsN`),
+  `termios` per terminal (canonical and raw modes, echo, signal characters), window sizes, `/dev/tty`,
+  hangup. Eight terminals in all: the console and seven ptys. See
+  [docs/wiki/input-and-terminals.md](docs/wiki/input-and-terminals.md).
+- **Console** - a framebuffer text console that never reads the framebuffer back, mirrored to the serial
+  port. When the desktop is up the kernel console is serial only; panics still paint.
 
 ---
 
 ## mikuD - init daemon
 
-PID 1. Owns service lifecycle, dependencies and restarts.
+PID 1: a kernel thread with a fixed table of 32 services. It owns their lifecycle, dependencies and restarts.
 
 | Concept | Values |
 |:--|:--|
 | **Targets** | `SysInit`, `MultiUser`, `Graphical`, `Rescue` |
 | **Restart policies** | `Always`, `Never`, `OnFailure`, `OnSuccess`, `OnAbnormal` |
-| **Service entry** | A kernel `fn()` or an ELF binary path on disk |
-| **Extras** | Dependency graph, ordering, watchdogs, restart delays, masking, journal, timer units, socket activation, `.service` unit files |
+| **Service entry** | A kernel `fn()` or the path of an ELF program (on a default boot `/bin` is the read-only GRUB module) |
+| **Extras** | Dependency graph, ordering, restart delays, masking, journal, `.service` unit files, `User=` and `Capabilities=` applied before the service's first instruction. Watchdogs and `Type=notify`: a service reports in with `mikuctl notify --ready`/`--watchdog`. `*Sec` times are seconds (`ms`, `s`, `min` suffixes). Timer units and socket activation exist in the code, but nothing can drive them yet |
 
-Services registered at boot: `kbd`, `shell`, `netd`, `usbd`, `bdflush`, `kswapd`.
-
-The `shell` service prefers `/bin/msh` (ring 3) when the root filesystem carries it, and falls back to the
-in-kernel shell otherwise. The choice is logged.
+Services started at boot: `kbd`, `usbd` (not with `nousb`), `netd`, `bdflush`, `kswapd`, `mikudod`, `shell`,
+and on the graphical target `compositor` and `greeter`. The full reference is
+[docs/wiki/system.md](docs/wiki/system.md).
 
 ---
 
 ## Userspace
 
+### Rust `std` (`lib/rust-std/`)
+
+A `std` for `target_os = "miku"`: the platform layer calls `libmiku` rather than the syscalls, so one
+library knows the numbers. `fs`, `path`, `env`, `io`, `process`, `net`, `time` (through the vDSO),
+`thread`, `sync` (on the futex) and `thread_local` work; `tokio`, `smol` and `polling` run on `poll`.
+`target_family = "unix"` is declared, so crates that branch on `unix` build. Programs in `stdapps/` are
+the test suites (`stdfs`, `stdthreads`, `stdtokio`, `stdpty`, `stdwatch`, `stdsignal`, ...) and
+`stdbench`, which builds for Linux too so the two can be compared. Not there yet: IPv6, `File::lock`,
+socket timeouts, `shutdown`, `local_addr`/`peer_addr` and binding port 0.
+
+**Zed** - the editor - builds for MikuOS from its own source with a few patches and a fourth gpui backend
+that speaks Mayland. It ships as a package in the image and starts from the desktop.
+
+### libc and C (`lib/libmiku/`, `lib/c/`)
+
+**`libc_miku.so`** is MikuOS's C library, written in Rust: about 540 exported functions (about 1450
+across all ten `miku` libraries). It covers
+`stdio` (`printf`/`scanf` families, `FILE`), `string`, `stdlib`, `ctype`, `math`, `malloc` on the binned
+heap, `time`/`ctime`, `dirent`, `poll` and `select`, sockets and `getaddrinfo`, `termios` and ptys
+(`openpty`, `posix_openpt`, `login_tty`), `pwd`/`grp` with `getgrouplist`, the `*at` calls, `setjmp`/
+`longjmp`, `getauxval`, and POSIX threads - `pthread_create`, mutexes (process-shared too), condition
+variables with a clock, rwlocks, `pthread_once`, keys, `pthread_atfork`. Not there yet: `dlopen`, `posix_spawn`, `epoll`,
+`eventfd`, `signalfd`, `timerfd` and locales; `getaddrinfo` is IPv4 only and `localtime` is UTC.
+
+`lib/c/include/` holds the C headers for it - 47 of them, from `stdio.h` to `sys/socket.h` and
+`pthread.h`. They are its C face, not a second libc: a header declares only what the library defines, so
+a C program that uses something MikuOS lacks fails to compile, and every struct layout is pinned to the
+Rust `libc` overlay by `_Static_assert`s, checked whenever a header changes. `lib/c/miku-cc` wraps the host clang with the
+target's flags. SQLite, zstd, tree-sitter and FreeType are built this way, and Rust crates that compile C
+through `cc` use the same wrapper.
+
 ### Dynamic linking
 
-`ld-miku` is the dynamic loader: ELF64 parsing, `PT_LOAD` mapping, relocation processing (`RELA`,
-`JMPREL`, `GLOB_DAT`, `JUMP_SLOT`, `RELATIVE`), symbol resolution across libraries, `DT_NEEDED` dependency
-walking, TLS setup and a full auxv.
+`ld-miku` is the dynamic loader: relocations, `DT_NEEDED`, the program's own TLS (`PT_TLS`; a library
+with TLS cannot load yet), a full auxv, and the auxv handed to libmiku before any constructor runs. There
+is no `dlopen`, and the search path is fixed (`/lib`, `/usr/lib`, `/usr/local/lib`). The `miku` libraries are preloaded at `/lib` and shared between
+processes: `core_miku`, `sys_miku`, `text_miku`, `ds_miku`, `algo_miku`, `codec_miku`, `fs_miku`,
+`net_miku`, `parse_miku`, `libc_miku`. The ring-3 heap uses segregated bins with per-thread caches.
 
-Ten shared libraries are preloaded into the VFS at `/lib` and served straight from kernel image memory
-without touching the page cache:
+### Users and privilege
 
-`core_miku`, `sys_miku`, `text_miku`, `ds_miku`, `algo_miku`, `codec_miku`, `fs_miku`, `net_miku`,
-`parse_miku`, `libc_miku`
+MikuOS boots to a login: a graphical one when there is a screen to draw it on, and the console asking
+who you are when there is not - the same login, through the same broker, drawn in text.
 
-Pages are shared between processes that map the same library; only writable segments are private.
+**There is no setuid bit on this system, no setgid bit, and no file capabilities.** `exec` reads a
+file's mode bits and the loader ignores them, so privilege is granted by a privileged process to a child
+and never acquired from a file. That removes the whole class of bugs that `sudo`, `doas` and `pkexec`
+have spent thirty years having; [MikuOS_Security.md](docs/MikuOS_Security.md) names the advisories.
 
-### `/bin/msh` - the userspace shell
-
-A ring-3 shell built strictly on the syscall ABI, which is what keeps that ABI honest.
-
-**Builtins:** `pwd`, `cd`, `ls`, `cat`, `stat`, `mkdir`, `rm`, `write`, `echo`, `wc`, `head`, `grep`,
-`uptime`, `date`, `stty`, `pid`, `help`, `exit`
-
-**Shell features:** redirection `>` `>>` `<`, pipelines `|` (one forked process per stage), and a startup
-script at `/etc/msh.rc`.
+Elevation is a broker: `/bin/mikudo` runs as you, with no authority, and asks `/bin/mikudod` - started by
+mikuD - over a local socket; the kernel names the caller through `peercred`. The login screens are clients
+of the same broker: `login` and `maygreet` run as the unprivileged `greeter` account, and `mikudod` is the
+only process that reads `/etc/shadow` and spends the Argon2id.
 
 ```
-$ cat /p.txt | wc
-3 3 14
-$ ls /bin | grep msh
-msh
+login: miku
+password for miku:
+
+Welcome, miku.
+miku@os:/ $ id
+uid=1000(miku) gid=1000(miku) groups=1000(miku),10(wheel),100(users)
+miku@os:/ $ cat /etc/shadow
+  /etc/shadow: permission denied
+miku@os:/ $ mikudo id
+[mikudo] password for miku:
+uid=0(root) gid=0(root) groups=0(root)
 ```
 
-### Building userspace programs
+A session is a kernel object: an identity, a seat and the process that leads it. It holds one capability,
+`CAP_MAY_PRIV`, that follows the seat: the greeter has it while nobody is logged in, and the kernel takes it
+away the moment somebody is. While the greeter is up the compositor pins focus to it and every window
+manager chord is inert. The home directory is made from `/etc/skel` when a graphical session first starts.
 
-```bash
-cd src/lib/userspace
-cargo +nightly build --release --target x86_64-miku-app.json \
-    -Z json-target-spec -Z build-std=core \
-    -Z build-std-features=compiler-builtins-mem --bin msh
-```
+Programs: `mikudo`, `mikudod`, `login`, `maygreet`, `maysession`, `passwd`, `id`, `su`, `useradd`.
+The hash and every parser are in `lib/mikuauth`: `cargo test` runs about a hundred cases, including RFC 9106's
+Argon2id tag.
 
-The builder does this automatically and stages the binaries into `/bin` on the root image.
+### Packages (`lib/mikupkg`, `/bin/mikupkg`)
+
+A container format, a resolver, and a transaction with a journal that rolls back, never forward. The
+applier's only contact with the world is a `Root` trait, so the builder installs packages into the image
+with the same code `/bin/mikupkg` uses on the machine. Packages are signed (ECDSA P-256). There is no
+repository to fetch from yet, and a change to the installed system needs a writable root (`rootrw`).
+
+### Shells
+
+- **`msh`** - the shell, in ring 3 on a pty: quoting, pipes, redirects (`2>` too), `;`, `&&`, `||`, background
+  jobs and job control, line editing. It has no variables, globbing or control flow; a name it cannot
+  find in `/bin` goes to the kernel console (`kcmd`). See [docs/wiki/msh.md](docs/wiki/msh.md).
+- **The in-kernel shell** - the emergency console. It still holds the commands that reach kernel internals
+  with no syscall: ext tools (`extfsck`, `extinfo`, ...), `mount`, `gpt`, `mkfs.ext*`, swap, `smart`,
+  `fstrim`, `sv` for services, `nvidia` and `mayland` subcommands, `install`, and the selftests. Its output
+  goes to the terminal, not to fd 1, so `>` does not capture it. Every command is in
+  [docs/wiki/commands.md](docs/wiki/commands.md).
 
 ---
 
-## In-kernel shell
+## Tests and diagnostics
 
-Still the larger of the two shells, because these commands reach into kernel internals that have no
-syscall yet. Roughly 190 commands, including:
-
-- **Files** - `ls`, `cat`, `cd`, `cp`, `mv`, `rm`, `mkdir`, `tree`, `du`, `stat`, `ln`, `chmod`, `chattr`
-- **ext (version-agnostic)** - `extls`, `extcat`, `extwrite`, `extfsck`, `extinfo`, `extsync`, … plus the
-  `ext2*` / `ext3*` / `ext4*` families
-- **Mounting** - `mount`, `umount`, `fs.list`, `fs.select`, `partprobe`, `gpt`, `mkfs.ext2/3/4`
-- **Storage** - `blkstat`, `blkdiscard`, `blkzero`, `smart`, `fstrim`, `fiemap`, `nvmestress`
-- **Swap** - `mkswap`, `swapon`, `swapoff`, `swapinfo`
-- **Processes** - `ps`, `top`, `kill`, `nice`, `affinity`, `exec`
-- **Services** - `sv start|stop|restart|status|enable|disable|mask|journal|timer|analyze`
-- **Network** - `net`, `ping`, `dhcp`, `ntp`, `wget`, `curl`, `fetch`, `traceroute`, `socket`
-- **Linking** - `ldd`, `ldconfig`, `load`
-- **GPU** - `nvidia` subcommands
-- **System** - `info`, `heap`, `memmap`, `history`, `reboot`, `poweroff`
-
----
-
-## NVIDIA GPU driver
-
-Bring-up work in progress - not a display driver.
-
-| Chip family | Target | State |
-|:--|:--|:--|
-| TU116 / TU117 (Turing) | GTX 1650 / 1660 | Falcon bring-up, FWSEC, ACR, SEC2, GSP-RM boot args, message queues |
-| GB206 (Blackwell) | RTX 5060 / 5060 Ti | FSP, FMC, GSP bootloader path |
-
-Module layout (`kernel/drivers/gpu/nvidia/`): `pci`, `mmio`, `chip`, `vbios`, `reset`, `msi`, `fb`,
-`profile`, `generic`, a shared `gsp_common/` (RPC, sysinfo) and per-chip `gtx1650/` and `rtx5060/`.
-
-Firmware is not embedded in the kernel. It is staged into a `/lib/firmware` tree, packed into an ext2
-image, handed to the kernel as a GRUB module and mounted on demand - so a single ISO carries kernel and
-firmware without needing a second disk.
+- **Selftests in the kernel**, run headless from the boot line: `run=vfs_test;ext_test;poweroff`. Suites
+  for memory, IPC, VFS, ext, btrfs, terminals, the ELF loader, credentials, the network, the kernel log,
+  Mayland and the NVIDIA driver, and the `std` programs. The output goes to the serial port. See
+  [docs/wiki/testing.md](docs/wiki/testing.md).
+- **Host tests**, no boot: `lib/extfs`, `lib/btrfs`, `lib/net` (crypto, X.509, every parser),
+  `lib/mikuauth`, `lib/mayland` (`cargo test-host`), the kernel heap (`kernel/mm/heap/hosttest`),
+  libmiku's heap (`lib/libmiku/hosttest`), `lib/mikupkg`, `lib/fshost`, `lib/freetype` and `aosh`
+  (`cargo test-host`), `builder`.
+- **`stdbench`** - the same benchmark on MikuOS and on Linux. On QEMU/KVM with 4 vCPUs against Linux on
+  the bare machine: a process spawn and wait 0.27 ms (Linux 0.63), `Instant::now` 11 ns (20), a pipe round
+  trip between processes 2.1 µs (6.8), `read_dir` 145 ns a name (130-142), `stat` 4.7 M/s on four threads.
+- **Escape hatches on the GRUB line** - `noauth` (a root console, no login), `nosmap`/`nosmep`, `nointr`
+  (GPU waits poll), `nogpu`, `writethrough` (no write-back), `vfsmutex` (no read-side VFS lock),
+  `nopagecache`, `nvmepoll`, `netpoll`, `lockstat`, `slabdebug`, `trace`; the full list is in
+  [docs/wiki/boot.md](docs/wiki/boot.md).
 
 ---
 
@@ -377,8 +565,12 @@ firmware without needing a second disk.
 
 | Tool | Purpose |
 |:--|:--|
-| Rust nightly + `rust-src` | `build-std` for the bare-metal target |
-| `grub-mkrescue`, `xorriso`, `mtools` | ISO creation |
+| Rust nightly + `rust-src` | `build-std` for the bare-metal and the userspace targets |
+| clang | The C libraries, through `lib/c/miku-cc`; aosh needs it, so the build does too |
+| LLVM (`llvm-ar`) | Archives for the C libraries |
+| `nm` (binutils) | The builder checks that every function a C header declares is defined |
+| CUDA toolkit (optional) | `nvcc` compiles the GPU programs (`sm_120`); without it the kernel builds and says they are unavailable |
+| `grub-mkrescue`, `xorriso`, `mtools` | ISO creation; GRUB's `i386-pc` files are also used by the in-system installer |
 | `qemu-system-x86_64` | Running |
 | `e2fsprogs` (`mke2fs`, `debugfs`) | Root image and firmware staging |
 
@@ -386,22 +578,31 @@ firmware without needing a second disk.
 
 ```bash
 cd builder
-cargo run
+cargo run --release
 ```
 
-The builder builds `ld-miku`, the miku libraries, the userspace programs and the kernel (release), creates
-the ISO, provisions `disk.img` with `/lib/firmware` and `/bin`, and can launch QEMU.
+The builder builds `ld-miku`, the vDSO, the libraries, the userspace programs (`system`, `utils`, `apps`,
+`stdapps`, `aosh`), installs them as packages into the root image, builds the kernel, packs the firmware
+image and creates `miku-os/miku-os.iso`. It asks its questions with a timeout each: low-RAM mode, whether
+to build the `std` programs in `stdapps` (crate sources cargo has cleaned away are downloaded again;
+aosh is built either way), the size of `miku-os/disk.img` (which it creates or refreshes), a data image,
+and whether to launch QEMU. `MIKU_FW=` limits the firmware image to one card's files. Zed is built
+separately: `cargo run --release -- zed build -p zed` in `builder/`; `cargo run --release -- std <crate>`
+builds any one `std` crate. The whole build is described in [docs/wiki/building.md](docs/wiki/building.md).
 
-### Run by hand
+### Run
 
 ```bash
-qemu-system-x86_64 \
+qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m 4G \
   -boot d -cdrom miku-os/miku-os.iso \
-  -drive file=miku-os/disk.img,format=raw,if=none,id=disk0,cache=unsafe,aio=threads \
-  -device ide-hd,drive=disk0,bus=ide.0,unit=1 \
-  -serial stdio -display gtk -m 4G -smp 4 \
-  -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0
+  -serial stdio \
+  -netdev user,id=n0 -device virtio-net-pci,netdev=n0
 ```
+
+Add `-drive file=<image>,format=raw,if=virtio` for a disk. A disk is mounted as the root only with `root=`
+on the boot line, and written to only with `rootrw`. The GRUB menu has one entry;
+a flag such as `noauth`, `nointr` or `nogpu` goes on one boot with `e` there, and every flag is listed in
+[docs/wiki/boot.md](docs/wiki/boot.md).
 
 ### Write to a USB stick
 
@@ -409,40 +610,70 @@ qemu-system-x86_64 \
 sudo dd if=miku-os/miku-os.iso of=/dev/sdX bs=4M status=progress conv=fdatasync
 ```
 
+Boot it in legacy BIOS (CSM) mode, because under UEFI GRUB's `multiboot2` faults. Building with `MIKU_FW=`
+set to the value the kernel prints keeps only that card's firmware: with `nvidia/gb206` the ISO goes from
+143 to 114 MB.
+
 ---
 
 ## Repository layout
 
 ```
 kernel/                 kernel sources
-  arch/x86_64/          boot entry, GDT, IDT, APIC, ACPI, SMP, RTC, per-CPU, serial
-  mm/                   pmm, vmm, heap, mmap, swap, kernel stacks
-  sched/                CFS scheduler, run queues, lifecycle, workers
-  process/              Process, ELF loader, dynamic linking, signals
+  arch/x86_64/          boot entry, early console, GDT, IDT, traps, FPU, APIC, ACPI, SMP, RTC, per-CPU
+  mm/                   frames, paging, heap (slabs), vmap, mmap, swap, TLB, kernel stacks, shrinkers
+  sched/                scheduler, run queues, wait queues, timers, futex, idle, workers
+  process/              processes, threads, ELF loader, dynamic linking, signals, credentials,
+                        sessions, vDSO, crash reports and cores
   syscall/              dispatch, adapters, usercopy, errno
-  fs/                   VFS, ext2/3/4, tmpfs, devfs, procfs, mkfs, GPT
-  io/                   block layer, console, framebuffer, input
-  net/                  Ethernet through TLS
-  drivers/              block, bus (PCI), net, input (PS/2, USB), gpu (NVIDIA)
+  fs/                   VFS, page cache, ext, btrfs, tmpfs, memfs, devfs, procfs, GPT
+  io/                   block layer, console, framebuffer, input, terminals
+  net/                  Ethernet through TCP
+  drivers/              block, bus (PCI, MSI), net, input (PS/2, USB), gpu (NVIDIA, Bochs, KMS, EDID)
+  mayland/              display server: protocol, drawing, server, desktop policy, compositor, input
   mikud/                init daemon
-  shell/                in-kernel shell
-  kcore/                boot state, clock, firmware, locks, power, RNG, time
-src/lib/                userspace
-  ld_miku/              dynamic loader
-  libmiku/, mikulibs/   standard library sources and per-domain libraries
-  userspace/            ring-3 programs (msh, hello, tests)
+  setup/                the installer window
+  shell/                the in-kernel (emergency) shell
+  kcore/                boot state, clock, locks, kernel log, pstore, backtraces, power, RNG
+lib/                    libraries
+  extfs/, btrfs/, fshost/   filesystem formats and the trait they reach a disk through
+  libmiku/, mikulibs/   the system library and the per-domain .so libraries
+  ld-miku/, vdso/       dynamic loader, vDSO
+  rust-std/, rust-libc/ the std port and the libc overlay
+  c/, freetype/         C headers and the compiler wrapper; FreeType
+  mayland/              libmay: the display protocol, linked by both halves
+  net/                  mikunet: DNS, TLS, HTTP - the protocols, in ring 3
+  mikuauth/             password hashing and the account file parsers
+  mikupkg/              the package manager as a library
+  miku/, buildgen/      the program header; build-time generators
+system/                 msh, mayterm, maywm, maygreet, maysession, mikudo, mikudod, login,
+                        passwd, id, su, useradd, mikupkg
+utils/                  the everyday commands: ls, cat, cp, grep, ps, kill, mikuctl, ... (35)
+aosh/                   the QML desktop shell
+apps/                   examples and ABI tests: hello, maydemo, gpudemo, curl, wget, ping, ...
+stdapps/                std test programs and stdbench
+etc/                    the configuration in the image: accounts, mayland, aosh, certificates
 builder/                build orchestration and ISO/disk provisioning
-docs/                   translations, ABI reference, GPU notes
+docs/                   the wiki pages (docs/wiki/), translations, ABI reference, security model, GPU notes
+dev/                    working notes: design, decisions and measurements for each subsystem
 ```
 
 ---
 
 ## Author
 
-**alunwrd** - [github.com/alunwrd](https://github.com/alunwrd)
+<div align="center">
 
-Written in Rust, from scratch, by one person.
+<img src="https://github.com/alunwrd.png" width="98" height="96" alt="alunwrd" style="border-radius: 50%;">
+
+### **alunwrd**
+
+[![GitHub](https://img.shields.io/badge/GitHub-alunwrd-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/alunwrd)
+
+*Written in Rust, from scratch, by one person.*
+
+</div>
 
 ## License
 
-MIT - see [LICENSE](LICENSE).
+Apache 2.0 - see [LICENSE](LICENSE).

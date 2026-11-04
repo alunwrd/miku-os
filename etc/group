@@ -1,0 +1,24 @@
+# /etc/group: the groups on this machine
+#
+#   name:x:gid:member,member,...
+#
+# A user's primary group is named in /etc/passwd and is not repeated here.
+root:x:0:
+# May use mikudo. The only group with any authority attached, and that is a line
+# in /etc/mikudo.conf rather than anything in the kernel
+wheel:x:10:miku,alunwrd
+# May read /etc/shadow. Not used yet: mikudod is root and reads it as root
+shadow:x:42:
+# May ask mikudod to open a session: `login` at the console and `maygreet` on
+# the screen, both of which run as `greeter`. Membership is not authority over
+# anybody: opening a session still costs that person's password.
+#
+# The desktop's privileged globals come from CAP_MAY_PRIV, not from here. It
+# follows the seat: the greeter holds it until somebody logs in and the
+# session's leader holds it afterwards
+session:x:44:greeter
+users:x:100:miku,alunwrd
+miku:x:1000:
+alunwrd:x:1001:
+greeter:x:990:
+nobody:x:65534:

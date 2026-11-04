@@ -57,10 +57,9 @@ SECTIONS {
         *(.bss .bss.*)
         . = ALIGN(0x1000);
         /* Poisoned canary page below the stack. The kernel image is mapped by
-           a single 1 GiB huge page, so there is no room for a real unmapped
-           guard page - stack_guard::check() watches this pattern instead and
-           turns an overflow into a loud panic rather than silent corruption
-           of whatever .bss static happens to sit underneath */
+           a single 1 GiB huge page, so there is no real unmapped guard page:
+           stack_guard::check() watches this pattern and turns an overflow
+           into a panic */
         _stack_guard = .;
         . += 0x1000;
         _stack_bottom = .;

@@ -1,0 +1,21 @@
+# FreeType 2.14.3 for aosh's text, asked what Qt asks it
+#
+# Qt on Arch draws text with FreeType at `hintslight`, and the desktop has to
+# match that (`dev/aosh-negi.md`, "What changes in aosh's decisions"). `vendor/`
+# is the release, `src/shim.c` the calls Qt makes, `src/lib.rs` their Rust face.
+[package]
+name = "freetype"
+version = "2.14.3"
+edition = "2021"
+links = "freetype"
+license = "FTL"
+
+[workspace]
+
+# What FreeType's autohinter asks HarfBuzz, answered by its Rust port
+# (`src/hb.rs`): the version aosh shapes with
+[dependencies]
+rustybuzz = "0.20.1"
+
+[build-dependencies]
+cc = "1"

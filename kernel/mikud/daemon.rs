@@ -1,7 +1,7 @@
-// mikuD daemon - main loop, service lifecycle, reconciliation
+// mikuD daemon: main loop, service lifecycle, reconciliation
 //
-// Handles watchdog, oneshot, notify, graceful shutdown,
-// conflict resolution, burst protection, and condition checks
+// Handles watchdog, oneshot, notify, graceful shutdown, conflict resolution,
+// burst protection, and condition checks
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -80,6 +80,18 @@ pub fn set_target(target: Target) {
         journal::log(journal::Event::TargetChanged, target.as_str(), 0, old as u64);
     }
     crate::serial_println!("[mikud] target -> {}", target.as_str());
+
+    // Leaving the graphical target puts the screen back on the console.
+    // `reconcile_target` stops the compositor service, a thread that watches;
+    // the frame loop it started is a different thread, and the console it
+    // blanked stays blanked otherwise. The fallback out of a failing greeter
+    // needs this
+    if old == Target::Graphical && target < Target::Graphical
+        && crate::mayland::render::running()
+    {
+        crate::serial_println!("[mikud] leaving the graphical target - stopping the compositor");
+        crate::mayland::render::stop();
+    }
 }
 
 pub fn set_target_name(name: &str) -> bool {
@@ -228,12 +240,12 @@ fn stop_service_locked_wrapper(name: &str) -> bool {
     with_service_table(|table| stop_service_locked(table, name, 0))
 }
 
-/// Request asynchronous poweroff - daemon loop will handle it
+/// Requests asynchronous poweroff: the daemon loop handles it
 pub fn poweroff() {
     SHUTDOWN_REQUEST.store(1, Ordering::Relaxed);
 }
 
-/// Request asynchronous reboot - daemon loop will handle it
+/// Requests asynchronous reboot: the daemon loop handles it
 pub fn reboot() {
     SHUTDOWN_REQUEST.store(2, Ordering::Relaxed);
 }
@@ -304,7 +316,11 @@ pub fn start_service_locked(table: &mut ServiceTable, name: &str, now: u64, dept
 
     // Condition checks
     if !table.services[idx].check_conditions() {
-        crate::serial_println!("[mikud] '{}' conditions not met, skipping", name);
+        // Traced rather than printed: a condition is usually false for a while
+        // (the greeter's for as long as somebody is logged in), and reconcile
+        // comes round every tick, so full volume would be one serial write per
+        // tick per waiting service
+        crate::trace_println!("[mikud] '{}' conditions not met, skipping", name);
         table.services[idx].state = ServiceState::Stopped;
         return false;
     }
@@ -319,7 +335,7 @@ pub fn start_service_locked(table: &mut ServiceTable, name: &str, now: u64, dept
 
     table.services[idx].state = ServiceState::Starting;
 
-    // Resolve conflicts - stop conflicting services
+    // Stop conflicting services
     let conflicts = table.services[idx].conflicts;
     for conflict_name in conflicts.iter() {
         if let Some(cidx) = table.find_by_name(conflict_name) {
@@ -341,7 +357,7 @@ pub fn start_service_locked(table: &mut ServiceTable, name: &str, now: u64, dept
         }
     }
 
-    // Start soft dependencies (Wants) - don't fail if they fail
+    // Start soft dependencies (Wants): they may fail
     let wants = table.services[idx].wants;
     for want in wants.iter() {
         let _ = start_service_locked(table, want, now, depth + 1);
@@ -357,7 +373,7 @@ pub fn start_service_locked(table: &mut ServiceTable, name: &str, now: u64, dept
     let name_ref = table.services[idx].name;
     let priority = table.services[idx].priority;
 
-    // Determine how to spawn: kernel fn() entry or ELF binary from disk
+    // How to spawn: kernel fn() entry or ELF binary from disk
     let pid = if let Some(entry) = table.services[idx].entry {
         crate::sched::spawn_named_child_of(mikud_pid(), entry, name_ref, priority)
     } else if let Some(exec_path) = table.services[idx].exec_start_path {
@@ -365,6 +381,16 @@ pub fn start_service_locked(table: &mut ServiceTable, name: &str, now: u64, dept
             Ok(pid) => {
                 // Re-parent the process under mikuD
                 crate::sched::set_parent(pid, mikud_pid());
+                // And give it the identity and authority its unit asks for,
+                // usually less than root. A service left as root because that
+                // is what exec() produces would have every capability for no
+                // reason
+                apply_unit_identity(
+                    pid,
+                    table.services[idx].user,
+                    table.services[idx].caps,
+                    name_ref,
+                );
                 pid
             }
             Err(e) => {
@@ -379,6 +405,17 @@ pub fn start_service_locked(table: &mut ServiceTable, name: &str, now: u64, dept
         table.services[idx].state = ServiceState::Failed;
         return false;
     };
+
+    // A unit granted `CAP_MAY_PRIV` drives the screen before anybody has logged
+    // in: the greeter, and nothing else in what ships. `session::open` takes
+    // the capability off the seat's previous holder, so who holds it is
+    // recorded here
+    if table.services[idx].caps
+        .map(|m| crate::process::cred::CapSet(m).has(crate::process::cred::CAP_MAY_PRIV))
+        .unwrap_or(false)
+    {
+        crate::process::session::hold_seat(crate::process::session::SEAT0, pid);
+    }
 
     table.services[idx].pid = pid;
     table.services[idx].last_start_tick = now;
@@ -516,6 +553,9 @@ pub fn reload_service_locked(table: &mut ServiceTable, name: &str) -> bool {
 
 fn observe_dead_services(now: u64) -> Vec<&'static str> {
     let mut restart_list = Vec::new();
+    // Set inside the closure below, acted on outside it: changing the target
+    // reconciles every service, which needs the service table's lock
+    let mut fall_back = false;
 
     with_service_table(|table| {
         for svc in table.services.iter_mut() {
@@ -526,6 +566,28 @@ fn observe_dead_services(now: u64) -> Vec<&'static str> {
             // Only check running/activating/starting services
             if !matches!(svc.state, ServiceState::Running | ServiceState::Activating | ServiceState::Starting) {
                 continue;
+            }
+
+            // A stopped service is neither dead nor running:
+            // `find_zombie_child` below answers `None` for it, so without this
+            // `kill -STOP` would wedge it with no restart and no journal line.
+            //
+            // Supervision leaves a deliberately stopped service stopped, and
+            // says so once
+            if svc.pid != 0 && crate::sched::is_stopped(svc.pid) {
+                if !svc.flags.noticed_stopped {
+                    svc.flags.noticed_stopped = true;
+                    crate::serial_println!(
+                        "[mikud] '{}' pid={} has stopped - not restarting a service                          somebody suspended", svc.name, svc.pid);
+                    journal::log(journal::Event::Stopped, svc.name, svc.pid, 0);
+                }
+                continue;
+            }
+            if svc.pid != 0 && svc.flags.noticed_stopped {
+                // Continued: watched again, and the next stop is reported too
+                svc.flags.noticed_stopped = false;
+                crate::serial_println!("[mikud] '{}' pid={} is running again",
+                                       svc.name, svc.pid);
             }
 
             if let Some((child_pid, exit_code)) = crate::sched::find_zombie_child(mikud_pid(), svc.pid) {
@@ -551,12 +613,20 @@ fn observe_dead_services(now: u64) -> Vec<&'static str> {
 
                 let should_restart = svc.restart.should_restart(exit_code, svc.flags.was_signal_kill);
 
-                // Update burst tracking
+                // Update burst tracking.
+                //
+                // Only failures count: the limit stops a service crashing on
+                // startup from being restarted for ever. A clean exit restarted
+                // by policy is not that: the greeter exits with 0 every time
+                // somebody logs in
+                let crashed = exit_code != 0 || svc.flags.was_signal_kill;
                 if now - svc.burst_window_start >= RESTART_BURST_WINDOW {
                     svc.burst_count = 0;
                     svc.burst_window_start = now;
                 }
-                svc.burst_count = svc.burst_count.saturating_add(1);
+                if crashed {
+                    svc.burst_count = svc.burst_count.saturating_add(1);
+                }
                 svc.restarts = svc.restarts.saturating_add(1);
 
                 journal::log(journal::Event::Exited, svc.name, child_pid, exit_code);
@@ -570,6 +640,13 @@ fn observe_dead_services(now: u64) -> Vec<&'static str> {
                     svc.next_restart_tick = 0; // don't auto-restart
                     journal::log(journal::Event::BurstLimit, svc.name, 0, svc.restarts as u64);
                     crate::serial_println!("[mikud] '{}' hit restart burst limit", svc.name);
+                    // A service only the graphical target wants, which cannot
+                    // be kept running: this machine is not a graphical machine.
+                    // Without the fallback there is a black screen with a
+                    // working console behind it
+                    if svc.target == Target::Graphical && current_target() == Target::Graphical {
+                        fall_back = true;
+                    }
                 } else {
                     svc.state = ServiceState::Stopped;
                     svc.next_restart_tick = 0;
@@ -577,6 +654,14 @@ fn observe_dead_services(now: u64) -> Vec<&'static str> {
             }
         }
     });
+
+    if fall_back {
+        crate::serial_println!(
+            "[mikud] the graphical target cannot be kept up - falling back to multi-user");
+        journal::log(journal::Event::TargetChanged, Target::MultiUser.as_str(), 0, 0);
+        set_target(Target::MultiUser);
+        set_default_target(Target::MultiUser);
+    }
 
     restart_list
 }
@@ -738,8 +823,105 @@ pub fn mikud_main() -> ! {
             check_watchdogs(now);
             check_notify_services(now);
             super::timer::tick_timers(now);
+            reap_orphans();
         }
 
         crate::sched::sleep(BOOT_WAIT_TICKS);
+    }
+}
+
+
+/// Collects the zombies nobody else will
+///
+/// When a process dies its children are reparented to PID 1, which is this.
+/// Without this every orphan that exited would sit in PROC_TABLE for the rest
+/// of the boot.
+///
+/// A session leader is orphaned on purpose: `mikudod` double-forks so the
+/// desktop it starts does not have the machine's one authority as its parent.
+///
+/// Registered services are skipped and left to `reconcile_target`, which reads
+/// the exit code to decide whether to restart them
+fn reap_orphans() {
+    // The services' own pids, gathered before anything is marked collected: see
+    // find_zombie_child_excluding for why the order matters
+    let mut mine = [0u64; super::service::MAX_SERVICES];
+    let mut n = 0;
+    {
+        let table = SERVICES.lock();
+        for svc in table.services.iter().filter(|s| s.active && s.pid != 0) {
+            mine[n] = svc.pid;
+            n += 1;
+        }
+    }
+    // Bounded: this runs every loop, and a machine producing more than a few
+    // zombies per tick will not be fixed by reaping faster
+    for _ in 0..4 {
+        let (pid, code) = match crate::sched::find_zombie_child_excluding(mikud_pid(), &mine[..n]) {
+            Some(z) => z,
+            None => return,
+        };
+        crate::sched::reap_zombie(pid);
+        crate::serial_println!("[mikud] reaped orphan pid={} code={}", pid, code);
+    }
+}
+
+/// Puts a freshly exec'd service into the identity its unit describes.
+///
+/// Done here, from PID 1, rather than by the service dropping privilege itself:
+/// the process has run none of its own code yet (`exec` has built the image and
+/// the scheduler has not picked it up), so it is never running as root.
+///
+/// The capability set is narrowed through the bounding set as well as the
+/// permitted one, so nothing the service starts can regain what was taken.
+///
+/// Public because the console's `login` command starts the same program the
+/// greeter is, for the same reason
+pub fn apply_unit_identity(
+    pid: u64,
+    user: Option<(u16, u16)>,
+    caps: Option<u64>,
+    name: &'static str,
+) {
+    use crate::process::cred::CapSet;
+    let ptr = unsafe { crate::sched::proc_index_raw(pid) };
+    if ptr.is_null() {
+        return;
+    }
+    let mut cred = unsafe { (*ptr).cred.write() };
+
+    if let Some(mask) = caps {
+        let want = CapSet(mask).sanitized();
+        cred.permitted = cred.permitted.intersect(want);
+        cred.effective = cred.effective.intersect(want);
+        cred.bounding  = cred.bounding.intersect(want);
+    }
+
+    if let Some((uid, gid)) = user {
+        cred.uid = uid;
+        cred.euid = uid;
+        cred.suid = uid;
+        cred.gid = gid;
+        cred.egid = gid;
+        cred.sgid = gid;
+        cred.groups = [0; crate::fs::vfs::types::MAX_GROUPS];
+        cred.ngroups = 0;
+        // A service told to run as a user keeps only what its unit named. If
+        // the unit named nothing, it keeps nothing: "User=" without
+        // "Capabilities=" means an ordinary unprivileged program
+        if uid != 0 && caps.is_none() {
+            cred.drop_all_caps();
+            cred.bounding = crate::process::cred::CAP_NONE;
+        }
+    }
+
+    // Said with the guard released. A serial line runs with interrupts off and
+    // spins on the port for milliseconds, and anybody reading this process's
+    // credential (the syscall path, on every call checking one) would wait
+    // through it
+    let said = (user.is_some() || caps.is_some()).then_some((cred.uid, cred.effective.0));
+    drop(cred);
+    if let Some((uid, caps)) = said {
+        crate::serial_println!("[mikud] {} runs as uid {} with caps {:#x}", name, uid, caps);
     }
 }

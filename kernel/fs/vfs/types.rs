@@ -1,15 +1,17 @@
-pub const MAX_VNODES: usize = 256;
-pub const MAX_DENTRIES: usize = 128;
+// The vnode table has no size: it grows with what is cached and gives it back
+// (`vfs::table`, `dev/vfs-dentries-inodes.md`)
+
 pub const MAX_MOUNTS: usize = 8;
-// Per-process FD table size. With per-process tables (vfs.fd_tables
-// keyed by pid) this is the upper bound for a single process, not a
-// system-wide cap. 128 covers stdio + dynamic linker + heap-allocator
-// fds + dozens of open files comfortably
-pub const MAX_FDS: usize = 128;
-pub const MAX_OPEN_FILES: usize = 128;
-// Syscall layer handles 0/1/2 as stdin/stdout/stderr //
+// Per-process, both of them: `MAX_OPEN_FILES` is the length of the array inside
+// one `FdTable`, one table per thread group (`vfs::fd`).
+//
+// 512: a program with a file watcher and a few language servers under it needs
+// more than a shell does, and `getdents` takes a descriptor, so every directory
+// read opens one
+pub const MAX_FDS: usize = 512;
+pub const MAX_OPEN_FILES: usize = 512;
+// 0/1/2 reserved for stdin/stdout/stderr by the syscall layer.
 pub const RESERVED_STDIO_FDS: usize = 3;
-pub const MAX_DATA_PAGES: usize = 1024;
 pub const MAX_XATTRS_PER_NODE: usize = 8;
 pub const MAX_LOCKS: usize = 16;
 pub const MAX_WATCHES: usize = 8;
@@ -26,24 +28,39 @@ pub const MAX_SLAB_ITEMS: usize = 64;
 pub const MAX_SECURITY_LABELS: usize = 8;
 pub const MAX_AUDIT_LOG: usize = 32;
 pub const MAX_NOTIFY_EVENTS: usize = 16;
-pub const MAX_GROUPS: usize = 8;
-pub const NAME_LEN: usize = 64;
-pub const PAGE_SIZE: usize = 512;
+/// Supplementary groups a process may carry. wheel, users, video, audio, input,
+/// disk, shadow and a primary group already make eight
+pub const MAX_GROUPS: usize = 16;
+/// The widest single path component this VFS stores.
+///
+/// 255, what ext allows, and required for correctness: `rmdir`, `rename` and
+/// `unlink` hand the vnode's own name back to the filesystem as authoritative,
+/// so a truncated name would ask the disk to delete a name that does not exist,
+/// and two names sharing a prefix would be one.
+///
+/// The `getdents` ABI has its own limit (`abi::UDIRENT_NAME_LEN`) and truncates
+/// there, visibly.
+pub const NAME_LEN: usize = 255;
+
+/// The longest symlink target, which is a path and not a name. Targets are on
+/// the heap and only symlinks pay for them
+pub const SYMLINK_MAX: usize = 4096;
+/// A tmpfs page, which is a frame (`vfs::pages`)
+pub const PAGE_SIZE: usize = 4096;
 pub const BLOCK_SIZE: usize = 512;
 pub const MAX_SYMLINK_DEPTH: usize = 8;
 pub const MAX_PATH_DEPTH: usize = 32;
-pub const DIRECT_BLOCKS: usize = 128;
-pub const INDIRECT_ENTRIES: usize = 64;
-pub const MAX_FILE_SIZE: u64 = (DIRECT_BLOCKS as u64) * (PAGE_SIZE as u64);
 
 pub type Timestamp = u64;
 pub type VfsResult<T> = Result<T, VfsError>;
-pub type InodeId = u16;
-pub type PageId = u16;
-pub type DentryId = u16;
+/// A vnode's id in the table. Thirty-two bits: the table grows (`vfs::table`)
+pub type InodeId = u32;
+/// A page of the tmpfs cache (`vfs::pages`)
+pub type PageId = u32;
 pub type BlockDevId = u8;
 
-pub const INVALID_ID: u16 = 0xFFFF;
+pub const INVALID_ID: InodeId = InodeId::MAX;
+pub const INVALID_PAGE: PageId = PageId::MAX;
 pub const INVALID_U8: u8 = 0xFF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +105,75 @@ pub enum VfsError {
     PipeFull = 37,
     BrokenPipe = 38,
     InvalidUtf8 = 39,
+    /// The link count would pass what `i_links_count` can express
+    TooManyLinks = 40,
+    /// A structure the operation needs did not fit in memory
+    OutOfMemory = 41,
+    /// The node names a terminal and the caller is at none: what `/dev/tty`
+    /// answers a process with no controlling terminal. `ENXIO`
+    NoTerminal = 42,
+    /// A walk stopped at a name it would have read from the disk with the
+    /// VFS lock held, and left the read for `core::with_vfs_walk` to make
+    /// without it. Never reaches a program: the walk runs again
+    Deferred = 43,
+}
+
+/// What the ext driver's errors mean to the layer above.
+///
+/// A full disk, a directory with files in it, an existing name and a broken
+/// sector are different answers, and ring 3 sees only what comes out of here:
+/// `ENOSPC` told as `EIO` reports a hardware fault when the answer is to delete
+/// something.
+impl From<crate::fs::ext::FsError> for VfsError {
+    fn from(e: crate::fs::ext::FsError) -> Self {
+        use crate::fs::ext::FsError as F;
+        match e {
+            F::NotFound | F::InvalidInode => VfsError::NotFound,
+            F::NotDirectory => VfsError::NotDirectory,
+            F::IsDirectory => VfsError::IsDirectory,
+            F::NotEmpty => VfsError::NotEmpty,
+            F::AlreadyExists => VfsError::AlreadyExists,
+            F::NoSpace | F::ExtentFull | F::JournalFull => VfsError::NoSpace,
+            F::ReadOnlyFs => VfsError::ReadOnly,
+            F::PermissionDenied => VfsError::PermissionDenied,
+            F::NameTooLong => VfsError::NameTooLong,
+            F::TooManyLinks => VfsError::TooManyLinks,
+            F::FileTooLarge => VfsError::FileTooLarge,
+            F::NotSymlink => VfsError::NotSymlink,
+            F::LinkLoop => VfsError::Loop,
+            F::NotRegularFile => VfsError::InvalidArgument,
+            F::InvalidArg | F::BufferTooSmall => VfsError::InvalidArgument,
+            F::InlineTooBig => VfsError::XattrTooLarge,
+            // The filesystem is not what it claims to be. Distinct from an
+            // I/O error: the read succeeded and what came back was wrong
+            F::CorruptedFs
+            | F::ChecksumError
+            | F::BadMagic
+            | F::InvalidBlock
+            | F::InvalidExtent
+            | F::TooManyGroups => VfsError::Corrupted,
+            F::UnsupportedFeature | F::UnsupportedVersion | F::NoJournal => {
+                VfsError::NotSupported
+            }
+            F::OutOfMemory => VfsError::OutOfMemory,
+            F::IoError => VfsError::IoError,
+        }
+    }
+}
+
+/// What the block layer's errors mean. A device that is not there, one that
+/// timed out and one that refuses the operation are three different answers
+impl From<crate::io::block::driver::BlkError> for VfsError {
+    fn from(e: crate::io::block::driver::BlkError) -> Self {
+        use crate::io::block::driver::BlkError as B;
+        match e {
+            B::NoDevice | B::Offline => VfsError::NotMounted,
+            B::BufferTooSmall => VfsError::InvalidArgument,
+            B::ReadOnly => VfsError::ReadOnly,
+            B::Unsupported => VfsError::NotSupported,
+            B::DeviceFault | B::Timeout => VfsError::IoError,
+        }
+    }
 }
 
 impl VfsError {
@@ -132,6 +218,10 @@ impl VfsError {
             Self::PipeFull => "pipe full",
             Self::BrokenPipe => "broken pipe",
             Self::InvalidUtf8 => "invalid utf-8 in name",
+            Self::TooManyLinks => "too many links",
+            Self::OutOfMemory => "out of memory",
+            Self::NoTerminal => "no controlling terminal",
+            Self::Deferred => "deferred to a read without the VFS lock",
         }
     }
 }
@@ -142,6 +232,11 @@ impl core::fmt::Display for VfsError {
     }
 }
 
+/// Which filesystem a vnode belongs to.
+///
+/// Adding a filesystem means implementing `fsops::FileSystem` and a line in
+/// `fs::registry::PROBERS`. The variant here is a label. Discriminants 6 and 7
+/// once meant something else and are not reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FsType {
@@ -151,8 +246,11 @@ pub enum FsType {
     Ext2   = 3,
     Ext3   = 4,
     Ext4   = 5,
-    CowFS  = 6,
-    PipeFS = 7,
+    /// 8: discriminants 6 and 7 are not reused, as a stale stamp on a vnode
+    /// would come back as the wrong answer
+    Btrfs  = 8,
+    /// 9, by the same rule
+    MemFs  = 9,
 }
 
 impl FsType {
@@ -161,14 +259,25 @@ impl FsType {
         matches!(self, FsType::Ext2 | FsType::Ext3 | FsType::Ext4)
     }
 
+    /// Whether a mounted filesystem stands behind this, as against the vnode
+    /// table being the storage itself. Includes `MemFs`: mounted, reached
+    /// through `registry::with_mounted` as ext is, with no disk.
+    #[inline]
+    pub fn has_mounted_fs(self) -> bool {
+        !matches!(self, FsType::TmpFS | FsType::DevFS | FsType::ProcFS)
+    }
+
     pub fn magic(self) -> u32 {
         match self {
             FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => 0xEF53,
             FsType::TmpFS  => 0x01021994,
             FsType::DevFS  => 0x1373,
             FsType::ProcFS => 0x9FA0,
-            FsType::PipeFS => 0x50495045,
-            FsType::CowFS  => 0xC0FF,
+            // `_BHRfS_M`, truncated to the 32 bits of this field. The whole
+            // eight bytes are in `lib/btrfs`; this is only what statfs prints
+            FsType::Btrfs  => 0x9123_683E,
+            // `MEMF`. With no superblock, this is a name for `statfs` to print
+            FsType::MemFs  => 0x4D45_4D46,
         }
     }
 
@@ -180,8 +289,8 @@ impl FsType {
             FsType::Ext2   => "ext2",
             FsType::Ext3   => "ext3",
             FsType::Ext4   => "ext4",
-            FsType::CowFS  => "cowfs",
-            FsType::PipeFS => "pipefs",
+            FsType::Btrfs  => "btrfs",
+            FsType::MemFs  => "memfs",
         }
     }
 }
@@ -307,7 +416,7 @@ impl FileMode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermWho {
     Owner,
     Group,
@@ -361,7 +470,8 @@ pub enum SeekFrom {
 
 #[derive(Debug, Clone, Copy)]
 pub struct VNodeStat {
-    pub id: InodeId,
+    /// `VNode::ino`: stable, and the same for every name of a file
+    pub ino: u64,
     pub kind: VNodeKind,
     pub mode: FileMode,
     pub size: u64,
@@ -394,7 +504,8 @@ pub struct StatFs {
 pub struct DirEntry {
     pub name: [u8; NAME_LEN],
     pub name_len: u8,
-    pub inode_id: InodeId,
+    /// `VNode::ino`, as `stat` says it
+    pub inode_id: u64,
     pub kind: VNodeKind,
     pub offset: u32,
 }
@@ -404,21 +515,23 @@ impl DirEntry {
         Self {
             name: [0; NAME_LEN],
             name_len: 0,
-            inode_id: INVALID_ID,
+            inode_id: 0,
             kind: VNodeKind::Regular,
             offset: 0,
         }
     }
 
-    pub fn from_name(nm: &str, id: InodeId, kind: VNodeKind) -> Self {
-        let mut entry = Self::empty();
+    /// This entry made `nm`, written in place: only the name's bytes move, and
+    /// the rest of the array keeps what it held, unread past `name_len`.
+    /// Building each entry by value would zero 255 bytes for a name of six
+    pub fn set(&mut self, nm: &str, id: u64, kind: VNodeKind, offset: u32) {
         let bytes = nm.as_bytes();
         let len = bytes.len().min(NAME_LEN);
-        entry.name[..len].copy_from_slice(&bytes[..len]);
-        entry.name_len = len as u8;
-        entry.inode_id = id;
-        entry.kind = kind;
-        entry
+        self.name[..len].copy_from_slice(&bytes[..len]);
+        self.name_len = len as u8;
+        self.inode_id = id;
+        self.kind = kind;
+        self.offset = offset;
     }
 
     pub fn get_name(&self) -> &str {
@@ -436,67 +549,9 @@ pub struct SetAttr {
     pub mtime: Option<Timestamp>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Credentials {
-    pub uid: u16,
-    pub gid: u16,
-    pub euid: u16,
-    pub egid: u16,
-    pub groups: [u16; MAX_GROUPS],
-    pub ngroups: u8,
-}
-
-impl Credentials {
-    pub const fn root() -> Self {
-        Self {
-            uid: 0,
-            gid: 0,
-            euid: 0,
-            egid: 0,
-            groups: [0; MAX_GROUPS],
-            ngroups: 1,
-        }
-    }
-
-    pub const fn user(uid: u16, gid: u16) -> Self {
-        let mut groups = [0u16; MAX_GROUPS];
-        groups[0] = gid;
-        Self {
-            uid,
-            gid,
-            euid: uid,
-            egid: gid,
-            groups,
-            ngroups: 1,
-        }
-    }
-
-    pub const fn is_root(&self) -> bool {
-        self.euid == 0
-    }
-
-    pub fn in_group(&self, gid: u16) -> bool {
-        if self.egid == gid {
-            return true;
-        }
-        for i in 0..self.ngroups as usize {
-            if i < MAX_GROUPS && self.groups[i] == gid {
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn who_for(&self, file_uid: u16, file_gid: u16) -> PermWho {
-        if self.euid == file_uid {
-            PermWho::Owner
-        } else if self.in_group(file_gid) {
-            PermWho::Group
-        } else {
-            PermWho::Other
-        }
-    }
-}
+// Who a process is, for the permission checks below: the same value the
+// scheduler holds
+pub use crate::process::cred::Cred as Credentials;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessContext {
@@ -519,6 +574,56 @@ impl ProcessContext {
     }
 }
 
+/// Where a symlink points.
+///
+/// A path, not a name, on the heap: only symlinks pay, and they can hold a
+/// whole path.
+#[derive(Debug, Default)]
+pub struct SymlinkTarget(Option<alloc::boxed::Box<[u8]>>);
+
+impl SymlinkTarget {
+    pub const fn none() -> Self {
+        Self(None)
+    }
+
+    pub fn set(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            self.0 = None;
+            return;
+        }
+        let n = bytes.len().min(SYMLINK_MAX);
+        self.0 = Some(bytes[..n].into());
+    }
+
+    pub fn clear(&mut self) {
+        self.0 = None;
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        match &self.0 {
+            Some(b) => b,
+            None => &[],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The target as text. A target that is not UTF-8 is not a path this kernel
+    /// can walk, and the replacement character makes the failure a `NotFound`
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(self.bytes()).unwrap_or("\u{FFFD}")
+    }
+}
+
+/// A single path component, stored by value.
+///
+/// `len` is a `u8` and `NAME_LEN` is 255, the largest value a `u8` holds
 #[derive(Clone, Copy)]
 pub struct NameBuf {
     pub data: [u8; NAME_LEN],

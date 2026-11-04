@@ -1,10 +1,10 @@
-// Userspace ABI: byte layouts of structs returned to user-mode programs.
-// These layouts are stable contracts: do not reorder or resize fields
-// without coordinating libmiku and userspace
+// Userspace ABI: byte layouts of structs returned to user-mode programs. Stable
+// contracts: do not reorder or resize fields without coordinating libmiku and
+// userspace
 
 use crate::fs::vfs::types::VNodeStat;
 
-// stat(2)/fstat(2) - 64 bytes:
+// stat(2)/fstat(2), 64 bytes:
 //   0  u64  size
 //   8  u32  mode
 //  12  u32  nlinks
@@ -22,15 +22,35 @@ use crate::fs::vfs::types::VNodeStat;
 //  60  [4]  reserved
 pub const STAT_SIZE: u64 = 64;
 
-// readdir(2) entry - 72 bytes:
-//   0  [64] name (null-terminated, NAME_LEN-1 max usable)
-//  64  u16  inode_id
-//  66  u8   kind
-//  67  u8   name_len
-//  68  u32  reserved
-pub const UDIRENT_SIZE: u64 = 72;
+// getdents(2) entry, 272 bytes:
+//    0  [256] name (null-terminated, 255 max usable)
+//  256  u64   inode_id
+//  264  u8    kind
+//  265  u8    name_len
+//  266  [6]   reserved
+//
+// The inode is 64 bits, the same number `stat`(18) reports, and what
+// `std::os::unix::fs::DirEntryExt::ino` returns
+pub const UDIRENT_SIZE: u64 = 272;
 
-// statfs(2) - 48 bytes:
+/// Where the inode sits in an entry, and how wide it is. Named because the
+/// offsets after the name all move together when the name field or the inode
+/// changes width
+pub const UDIRENT_INO_OFF: usize = UDIRENT_NAME_LEN;
+pub const UDIRENT_KIND_OFF: usize = UDIRENT_INO_OFF + 8;
+pub const UDIRENT_NAMELEN_OFF: usize = UDIRENT_KIND_OFF + 1;
+
+/// How much of a name fits in a `getdents` entry.
+///
+/// A truncated name is a name that does not exist, so a program listing a
+/// directory and opening what it found would get `ENOENT` for it, as
+/// `std::fs::read_dir` feeding `File::open` does.
+///
+/// 256 so the terminator has somewhere to go; `name_len` is a `u8` and
+/// describes the 255 usable bytes
+pub const UDIRENT_NAME_LEN: usize = 256;
+
+// statfs(2), 48 bytes:
 //   0  u32  fs_type
 //   4  u32  block_size
 //   8  u64  total_blocks
@@ -56,7 +76,7 @@ pub fn write_stat_to_user(ptr: u64, st: &VNodeStat) {
         (p.add(24) as *mut u64).write_unaligned(st.atime);
         (p.add(32) as *mut u64).write_unaligned(st.mtime);
         (p.add(40) as *mut u64).write_unaligned(st.ctime);
-        (p.add(48) as *mut u64).write_unaligned(st.id as u64);
+        (p.add(48) as *mut u64).write_unaligned(st.ino);
         (p.add(56) as *mut u32).write_unaligned(st.blocks);
     }
 }

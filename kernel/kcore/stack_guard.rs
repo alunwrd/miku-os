@@ -1,16 +1,13 @@
 // BSP kernel-stack overflow detection
 //
-// The kernel stack lives at the end of .bss (see linker.ld) and the whole
-// kernel image is mapped by one 1 GiB huge page, so an overflow does not
-// fault - it just keeps writing downwards into whatever statics the linker
-// placed below '_stack_bottom'. That is how a ~0.5 MiB stack temporary in
-// 'init_vfs' once zeroed 'apic::LAPIC_BASE_VIRT' / 'LAPIC_TICKS_PER_HZ' and
-// left the kernel hanging on the first `sti` with no hint as to why.
+// The kernel stack is at the end of .bss (see linker.ld) and the kernel image
+// is mapped by one 1 GiB huge page, so an overflow does not fault: it keeps
+// writing downwards into the statics below '_stack_bottom'.
 //
-// 'linker.ld' therefore reserves one page directly below the stack.
-// 'init()' fills it with a magic pattern and 'check()' verifies it; the
-// boot-step reporter calls 'check()' after every init step, so an overflow
-// is reported at the step that caused it
+// 'linker.ld' reserves one page directly below the stack. 'init()' fills it
+// with a magic pattern and 'check()' verifies it; the boot-step reporter calls
+// 'check()' after every init step, so an overflow is reported at the step that
+// caused it
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -44,8 +41,8 @@ pub fn intact() -> bool {
         return true;
     }
     let words = guard_words();
-    // Walk from the top of the guard (closest to the stack) downwards - an
-    // overflow always chews through that end first
+    // Walk from the top of the guard (closest to the stack) downwards: an
+    // overflow goes through that end first
     for i in (0..(GUARD_SIZE / 8)).rev() {
         if unsafe { core::ptr::read_volatile(words.add(i)) } != GUARD_MAGIC {
             return false;

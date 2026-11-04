@@ -23,9 +23,8 @@ struct SwapMap {
     entries:    [ReverseEntry; MAX_TRACKED],
     clock_hand: usize,
     tracked:    usize,
-    // Upper bound (exclusive) on used indices. All scans clip to this.
-    // Without it every age_all / pick_victim walks 64K entries even on
-    // a small workload, and age_all runs in the timer ISR path
+    // Upper bound (exclusive) on used indices. All scans clip to this, so
+    // age_all and pick_victim do not walk 64K entries on a small workload
     high_water: usize,
 }
 
@@ -88,7 +87,7 @@ impl SwapMap {
     }
 
     pub fn age_all(&mut self) {
-        // Bound by high_water; timer ISR runs this every ~second
+        // Bound by high_water
         let hw = self.high_water;
         for e in self.entries[..hw].iter_mut() {
             if e.is_used() && !e.pinned {
@@ -104,9 +103,9 @@ impl SwapMap {
 
         if self.clock_hand >= hw { self.clock_hand = 0; }
 
-        // Single-pass clock scan with fallback memo. Preferred victim is
-        // age>=3; remember first usable any-age entry so we don't need a
-        // second sweep on cold caches
+        // Single-pass clock scan with a fallback: the preferred victim is
+        // age>=3, and the first usable any-age entry is remembered so cold
+        // caches need no second sweep
         let start = self.clock_hand;
         let mut fallback: Option<usize> = None;
         let mut steps = 0usize;
@@ -142,17 +141,17 @@ impl SwapMap {
     }
 }
 
-// Aged from the timer ISR - see IrqMutex docs for why this cannot be a
-// plain spin::Mutex
+// An IrqMutex, as `pmm::PMM` is: the two are held together on the fork and
+// teardown paths
 static SWAP_MAP: IrqMutex<SwapMap> = IrqMutex::new(SwapMap::new());
 
 pub fn track(phys: u64, cr3: u64, virt: u64, pinned: bool) {
     SWAP_MAP.lock().track(phys, cr3, virt, pinned);
 }
 
-/// Guard that holds SWAP_MAP locked across a batch of tracked frames -
-/// for e.g. a multi-MB map_range. Caller supplies pte_flags directly so
-/// we don't re-walk page tables to recover what was just written
+/// Guard holding SWAP_MAP across a batch of tracked frames, e.g. a multi-MB
+/// map_range. The caller supplies pte_flags, so page tables are not re-walked
+/// for what was just written
 pub struct SwapMapGuard<'a> {
     inner: IrqMutexGuard<'a, SwapMap>,
 }
@@ -221,7 +220,8 @@ pub fn make_swap_pte(slot: u32) -> u64 {
 }
 
 pub fn make_swap_pte_with_flags(slot: u32, pte_flags: u64) -> u64 {
-    // bits 0: not present, bit 1: swap marker, bits 2-11: saved flags, bits 12+: slot
+    // bits 0: not present, bit 1: swap marker, bits 2-11: saved flags, bits
+    // 12+: slot
     SWAP_PTE_MARKER | (pte_flags & 0xFFC) | ((slot as u64) << SWAP_PTE_SLOT_SHIFT)
 }
 
@@ -257,7 +257,8 @@ pub fn evict_one() -> Option<u64> {
         }
     };
 
-    // Encode original PTE flags into swap PTE so they can be restored on swap-in
+    // Encode original PTE flags into swap PTE so they can be restored on
+    // swap-in
     unsafe { crate::mm::vmm::mark_swapped_with_flags(cr3, virt, slot, pte_flags); }
     SWAP_MAP.lock().untrack(phys);
     crate::mm::pmm::free_frame(phys);
@@ -320,10 +321,8 @@ pub fn alloc_for_swapin() -> Option<u64> {
 
 // Reclaim (kswapd)
 //
-// Reclaim used to run straight out of the timer ISR, which meant evict_one()
-// - and therefore a blocking swap write to disk - executed in interrupt
-// context while holding SWAP_MAP and PMM. The ISR now only raises a flag and
-// the work happens on this thread, where sleeping and I/O are legal.
+// The timer ISR only raises a flag, and the work happens on this thread, where
+// sleeping and I/O are legal: evict_one() makes a blocking swap write to disk
 
 const EMERGENCY_LOW_WATER:  usize = 32;
 const EMERGENCY_HIGH_WATER: usize = 64;
@@ -331,15 +330,15 @@ const EMERGENCY_HIGH_WATER: usize = 64;
 static RECLAIM_WANTED: AtomicBool = AtomicBool::new(false);
 
 /// Called from the timer ISR. Must stay allocation-free, lock-free and
-/// I/O-free - all it does is decide whether kswapd has work
+/// I/O-free: it only decides whether kswapd has work
 pub fn request_reclaim_from_isr() {
     if crate::mm::pmm::emergency_frames_available() < EMERGENCY_LOW_WATER {
         RECLAIM_WANTED.store(true, Ordering::Relaxed);
     }
 }
 
-/// Refill the emergency frame pool by evicting cold pages to swap.
-/// Thread context only - this performs disk I/O
+/// Refills the emergency frame pool by evicting cold pages to swap. Thread
+/// context only: this performs disk I/O
 pub fn refill_emergency_pool() {
     if crate::mm::pmm::emergency_frames_available() >= EMERGENCY_LOW_WATER {
         return;
@@ -349,22 +348,37 @@ pub fn refill_emergency_pool() {
     }
 }
 
+/// How often the heap's depots give back what they did not need: Bonwick's
+/// working-set interval, about five seconds at 250 Hz
+const REAP_TICKS: u64 = 5 * 250;
+
 /// Page-reclaim kernel thread. Wakes on the flag the tick raises, ages the
 /// reverse map, and tops the emergency pool back up
 pub fn kswapd_thread() -> ! {
     crate::serial_println!("[kswapd] thread started");
     let mut last_age_tick = 0u64;
+    let mut last_reap_tick = 0u64;
     loop {
         let tick = crate::arch::x86_64::interrupts::get_tick();
-        // Age the reverse map about once a second (250 Hz tick). This was
-        // also an ISR job; it walks up to high_water entries and has no
-        // business running with interrupts off
+        // Ages the reverse map about once a second (250 Hz tick). It walks up
+        // to high_water entries, which must not run with interrupts off
         if tick.saturating_sub(last_age_tick) >= crate::arch::x86_64::apic::TIMER_HZ_DEFAULT as u64 {
             last_age_tick = tick;
             age_all();
+            crate::sched::stats::report_overdue_sleepers();
         }
         if RECLAIM_WANTED.swap(false, Ordering::Relaxed) {
             refill_emergency_pool();
+        }
+        // What is kept only to be quick goes back when frames are short: cached
+        // file pages first, each of which can be read again (`mm::shrink`). The
+        // heap's mapped area gets its freed ranges back here, where nothing is
+        // held, and its caches give back what sat unused for a whole interval
+        crate::mm::shrink::run_if_low();
+        crate::mm::vmap::purge_if_wanted();
+        if tick.saturating_sub(last_reap_tick) >= REAP_TICKS {
+            last_reap_tick = tick;
+            crate::mm::heap::reap();
         }
         crate::sched::sleep(25);
     }

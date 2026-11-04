@@ -94,7 +94,8 @@ pub fn user_compat_selector() -> SegmentSelector {
     unsafe { (*cpu_gdt_mut(0)).sels.user_compat }
 }
 
-/// Pointer to the current CPU's TSS. Interrupt handlers use this for diagnostics
+/// Pointer to the current CPU's TSS. Interrupt handlers use this for
+/// diagnostics
 pub fn tss_ptr() -> *mut TaskStateSegment {
     let idx = percpu::current_index();
     unsafe { &mut (*cpu_gdt_mut(idx)).tss as *mut TaskStateSegment }

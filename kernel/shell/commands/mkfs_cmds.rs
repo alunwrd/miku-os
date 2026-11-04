@@ -158,7 +158,7 @@ fn do_mkfs(args: &str, fs_type: FsType) {
     println!();
     cprintln!(57, 197, 187, "  mkfs.{} on drive {}...", fs_type.name(), drive_idx);
 
-    match mkfs(dev, &params) {
+    match mkfs(crate::fs::host::KernelHost::new(dev), &params) {
         Ok(report) => {
             println!();
             print_success!("  {} filesystem created successfully", report.fs_type);

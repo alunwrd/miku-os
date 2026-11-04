@@ -1,10 +1,7 @@
 // Read-only dump of firmware-controlled SMI/NMI/IRQ sources
 //
-// Goal: photograph the output once and know exactly which register the
-// BIOS left armed. Replaces the guess-and-build cycle: until now we
-// were clearing AMD FCH SMI banks blind. With this module the user
-// sees ALL the candidate sources in one screen and we can pick the
-// exact bit to clear
+// Shows which register the BIOS left armed: all the candidate sources on one
+// screen.
 //
 // Sections (in print order, ~25 lines fit on one framebuffer page):
 //   1) CPU vendor + family/model + SMM MSRs (HWCR, SMM_BASE/ADDR/MASK)
@@ -12,9 +9,9 @@
 //   3) HPET (cap, conf, per-timer cfg with routing)
 //   4) AMD FCH AcpiMmio: SMI bank 0x200..0x21F, watchdog 0xB00,
 //      first 4 nonzero offsets in PMIO 0x300..0x400
-//   5) ACPI MADT: NMI Source + LAPIC NMI entries (LIKELY culprit
-//      for unmaskable LINT1 NMI on AMD legacy boot - per Intel SDM
-//      11.5.1, mask bit is IGNORED when LVT delivery mode is NMI)
+//   5) ACPI MADT: NMI Source + LAPIC NMI entries (the likely culprit
+//      for unmaskable LINT1 NMI on AMD legacy boot: per Intel SDM
+//      11.5.1, the mask bit is ignored when LVT delivery mode is NMI)
 //   6) ACPI FADT: SMI_CMD, ACPI_EN/DIS, PM1A_CNT live read (SCI_EN
 //      bit), GPE0 enable/status live read
 //   7) PCI bus 0: USB controllers + LPC bridge + SMBus (FCH PMBASE)
@@ -349,9 +346,9 @@ fn dump_acpi() {
         let mut off = 36u64 + 8;
         let mut suspect = 0u32;
         while off + 2 < total {
-            // MADT entries are byte-packed: type/length at off+0..1 then
-            // a payload that can land on any alignment. read_unaligned
-            // is mandatory for the multi-byte fields.
+            // MADT entries are byte-packed: type/length at off+0..1, then a
+            // payload at any alignment, so multi-byte fields need
+            // read_unaligned.
             let etype = unsafe { core::ptr::read_unaligned(
                 (madt_phys + hhdm + off) as *const u8) };
             let elen  = unsafe { core::ptr::read_unaligned(

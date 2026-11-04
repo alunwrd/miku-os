@@ -1,20 +1,16 @@
 // Boot splash / GPU test-pattern
 //
 // The splash is drawn onto the live framebuffer which, on a machine whose
-// primary display is the NVIDIA card we probed, physically lives inside
-// the card's BAR1. So every pixel we paint here is going into GPU memory
-// and out through the card's scanout hardware. Without a GSP firmware blob
-// we cannot re-program the display engine, but we do not need to: the
-// pipeline firmware set up is already feeding this framebuffer to the
-// panel
+// primary display is the NVIDIA card probed, is inside the card's BAR1: every
+// pixel goes into GPU memory and out through the card's scanout hardware,
+// through the pipeline firmware set up.
 //
-// The splash has three bands:
+// Three bands:
 //   - a color-bar strip across the top (red / green / blue / yellow / cyan
-//     / magenta / white / black, plus a horizontal gradient underneath)
-//     to demonstrate pixel output on all channels,
+//     / magenta / white / black, plus a horizontal gradient underneath),
 //   - a centered "MikuOS" title plus a source label,
-//   - a footer showing GPU / framebuffer info so the user can verify the
-//     display is actually routed through the GPU we detected.
+//   - a footer showing GPU / framebuffer info, to verify the display is
+//     routed through the detected GPU.
 
 use crate::io::console;
 use crate::drivers::gpu::nvidia;
@@ -27,7 +23,7 @@ pub fn draw() {
         None => return,
     };
 
-    // 1. Background: a deep teal that matches MikuOS's palette
+    // Background: a deep teal from MikuOS's palette
     console::fill_rect(0, 0, w, h, 10, 20, 28);
 
     // 2. Color bars across the top band.
@@ -73,11 +69,9 @@ fn draw_gradient_band(w: usize, _h: usize) {
 fn draw_title(w: usize, h: usize) {
     // Headline just below the bars
     let cy = h / 2;
-    // Using the text console: set the cursor near the center and write.
-    // Because the console is fixed-pitch with CHAR_WIDTH=9 per glyph, we
-    // compute a roughly-centered x
-    // Version comes from Cargo.toml so the splash, the boot banner and the
-    // shell can never disagree - which is exactly what happened before
+    // Set the cursor near the center and write; the console is fixed-pitch,
+    // CHAR_WIDTH=9 per glyph. The version comes from Cargo.toml, as for the
+    // boot banner and the shell
     let title = concat!("MikuOS v", env!("CARGO_PKG_VERSION"));
     let title_px = title.len() * 9;
     let x = (w.saturating_sub(title_px)) / 2;
@@ -130,7 +124,8 @@ fn draw_footer(w: usize, h: usize) {
     draw_text_at(40, fy + 40, line3.as_str(), r, g, b);
 }
 
-/// Write a UTF-8 string at absolute pixel (x, y) through the Console. We temporarily move the console cursor, print, then restore
+/// Write a UTF-8 string at absolute pixel (x, y) through the Console. We
+/// temporarily move the console cursor, print, then restore
 fn draw_text_at(x: usize, y: usize, text: &str, r: u8, g: u8, b: u8) {
     use crate::io::console::WRITER;
     use x86_64::instructions::interrupts;
@@ -154,8 +149,8 @@ fn draw_text_at(x: usize, y: usize, text: &str, r: u8, g: u8, b: u8) {
 mod heapless_string {
     use core::fmt;
 
-    /// A tiny fixed-size string buffer so splash formatting doesn't touch
-    /// the heap on the hot boot path
+    /// A tiny fixed-size string buffer, so splash formatting does not touch the
+    /// heap on the boot path
     pub struct HeaplessLine {
         buf: [u8; 160],
         len: usize,

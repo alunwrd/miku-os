@@ -54,18 +54,14 @@ pub fn init_workers(count: usize) {
 
 /// How many workers to run on this machine.
 ///
-/// The count used to be hardwired to 4, so a 16- or 32-core box drained the
-/// shared work queue with the same four threads as a dual-core one and the
-/// extra CPUs simply idled. One worker per CPU tracks the machine; the lower
-/// bound keeps small machines responsive and the upper bound stops a very
-/// wide box from spending all its memory on worker stacks.
+/// One worker per CPU tracks the machine; the lower bound keeps small machines
+/// responsive and the upper bound stops a very wide box spending all its memory
+/// on worker stacks.
 pub fn default_worker_count() -> usize {
     const MIN_WORKERS: usize = 4;
     const MAX_WORKERS: usize = 32;
-    // Count CPUs from the ACPI topology, not from percpu::cpu_count():
-    // workers are started well before smp::start_aps(), so at this point
-    // exactly one CPU is online and sizing the pool by that would pin every
-    // machine to the minimum - which is precisely how the count stayed at 4
+    // Counts CPUs from the ACPI topology, not percpu::cpu_count(): workers
+    // start well before smp::start_aps(), when one CPU is online
     let cpus = crate::arch::x86_64::acpi::topology()
         .as_ref()
         .map(|t| t.cpus.iter().filter(|c| c.enabled).count())

@@ -1,4 +1,4 @@
-// mikuD journal - ring-buffer event log for service lifecycle
+// mikuD journal: ring-buffer event log for service lifecycle
 
 extern crate alloc;
 use core::sync::atomic::{AtomicUsize, Ordering};

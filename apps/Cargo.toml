@@ -1,0 +1,103 @@
+# Programs that run on MikuOS, rather than programs MikuOS is made of
+#
+# The network tools (`wget`, `curl`, `host`, `ntpdate`, `ping`, `traceroute`)
+# are programs because everything that can go wrong in them (a URL, a DNS
+# answer, a certificate chain, a chunked response) is parsing input someone else
+# chose. An unknown command at a shell prompt is looked up in `/bin`.
+#
+# The rest are `maydemo`, a display-protocol client written to be read, and ABI
+# smoke tests such as `abitest` and `polltest`: a process starts, a signal
+# arrives, a mapping appears, a program allocates.
+#
+# What the machine needs is in `system/`.
+[package]
+name    = "miku-apps"
+version = "1.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+miku   = { path = "../lib/miku" }
+# The protocols, for the network tools. `userspace` is what brings in the
+# transport; without it the crate is the pure-computation half the tests use
+# `default-features = false` leaves the L2-L4 stack out: these programs sit on
+# top of a socket and never see a frame. netd is the one that asks for it
+mikunet = { path = "../lib/net", default-features = false, features = ["userspace"] }
+libmay = { path = "../lib/mayland" }
+
+[profile.release]
+opt-level = 1
+lto = false
+
+[[bin]]
+name = "hello"
+path = "src/hello.rs"
+
+[[bin]]
+name = "maydemo"
+path = "src/maydemo.rs"
+
+[[bin]]
+name = "gpudemo"
+path = "src/gpudemo.rs"
+
+[[bin]]
+name = "test_full"
+path = "src/test_full.rs"
+
+[[bin]]
+name = "mmaptest"
+path = "src/mmaptest.rs"
+
+[[bin]]
+name = "envtest"
+path = "src/envtest.rs"
+
+[[bin]]
+name = "sigtest"
+path = "src/sigtest.rs"
+
+[[bin]]
+name = "spin"
+path = "src/spin.rs"
+
+[[bin]]
+name = "threadtest"
+path = "src/threadtest.rs"
+
+[[bin]]
+name = "polltest"
+path = "src/polltest.rs"
+
+[[bin]]
+name = "abitest"
+path = "src/abitest.rs"
+
+[[bin]]
+name = "wget"
+path = "src/wget.rs"
+
+[[bin]]
+name = "curl"
+path = "src/curl.rs"
+
+[[bin]]
+name = "host"
+path = "src/host.rs"
+
+[[bin]]
+name = "ntpdate"
+path = "src/ntpdate.rs"
+
+[[bin]]
+name = "ping"
+path = "src/ping.rs"
+
+[[bin]]
+name = "traceroute"
+path = "src/traceroute.rs"
+
+[[bin]]
+name = "crashtest"
+path = "src/crashtest.rs"

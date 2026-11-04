@@ -1,0 +1,59 @@
+crates/languages: the downloadable language servers' platform name.
+
+rust-analyzer, ty and ruff pick their release asset by a per-system const,
+with no fallback. MikuOS names its own triple (unknown-miku), not FreeBSD's
+or Linux's, whose binaries it cannot run.
+
+diff --git a/crates/languages/src/python.rs b/crates/languages/src/python.rs
+index 00d3748..672d224 100644
+--- a/crates/languages/src/python.rs
++++ b/crates/languages/src/python.rs
+@@ -337,6 +337,14 @@ impl TyLspAdapter {
+     const ARCH_SERVER_NAME: &str = "unknown-freebsd";
+ }
+ 
++// No project publishes a server built for MikuOS; this is the name one would
++// carry, the target's own triple. A server on PATH is found before any download
++#[cfg(target_os = "miku")]
++impl TyLspAdapter {
++    const GITHUB_ASSET_KIND: AssetKind = AssetKind::TarGz;
++    const ARCH_SERVER_NAME: &str = "unknown-miku";
++}
++
+ #[cfg(target_os = "windows")]
+ impl TyLspAdapter {
+     const GITHUB_ASSET_KIND: AssetKind = AssetKind::Zip;
+@@ -2447,6 +2455,14 @@ impl RuffLspAdapter {
+     const ARCH_SERVER_NAME: &str = "unknown-freebsd";
+ }
+ 
++// No project publishes a server built for MikuOS; this is the name one would
++// carry, the target's own triple. A server on PATH is found before any download
++#[cfg(target_os = "miku")]
++impl RuffLspAdapter {
++    const GITHUB_ASSET_KIND: AssetKind = AssetKind::TarGz;
++    const ARCH_SERVER_NAME: &str = "unknown-miku";
++}
++
+ #[cfg(target_os = "windows")]
+ impl RuffLspAdapter {
+     const GITHUB_ASSET_KIND: AssetKind = AssetKind::Zip;
+diff --git a/crates/languages/src/rust.rs b/crates/languages/src/rust.rs
+index d0f468a..0841fe9 100644
+--- a/crates/languages/src/rust.rs
++++ b/crates/languages/src/rust.rs
+@@ -63,6 +63,14 @@ impl RustLspAdapter {
+     const ARCH_SERVER_NAME: &str = "unknown-freebsd";
+ }
+ 
++// No project publishes a server built for MikuOS; this is the name one would
++// carry, the target's own triple. A server on PATH is found before any download
++#[cfg(target_os = "miku")]
++impl RustLspAdapter {
++    const GITHUB_ASSET_KIND: AssetKind = AssetKind::Gz;
++    const ARCH_SERVER_NAME: &str = "unknown-miku";
++}
++
+ #[cfg(target_os = "windows")]
+ impl RustLspAdapter {
+     const GITHUB_ASSET_KIND: AssetKind = AssetKind::Zip;

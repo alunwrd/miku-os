@@ -1,15 +1,13 @@
 // VBIOS extraction from the PCI expansion ROM
 //
-// A VBIOS image is a chain of "ROM images" tagged with a PCIR structure.
-// For NVIDIA cards on UEFI systems the PCI expansion ROM is usually the
-// full legacy VBIOS followed by an UEFI image. For our purposes we walk
-// the chain, find the legacy x86 image (code_type=0), and return its
-// bytes. That image drives devinit and contains the DCB (Display Config
-// Block) we need later for mode-setting
+// A VBIOS image is a chain of "ROM images" tagged with a PCIR structure. On
+// UEFI systems the PCI expansion ROM is usually the full legacy VBIOS followed
+// by a UEFI image. This walks the chain, finds the legacy x86 image
+// (code_type=0), and returns its bytes. That image drives devinit and contains
+// the DCB (Display Config Block) mode-setting needs.
 //
 // Format summary (PCI Firmware Specification, chapter 5):
-//   Each image begins with 0x55AA, then at offset 0x18 holds a little-
-//   endian pointer to the PCIR structure. The PCIR header is:
+//   Each image begins with 0x55AA, then at offset 0x18 holds a little-endian pointer to the PCIR structure. The PCIR header is:
 //     0x00: 'PCIR'
 //     0x04: vendor id   (u16)
 //     0x06: device id   (u16)
@@ -17,10 +15,10 @@
 //     0x14: code type   (u8)  0 = x86 BIOS, 3 = EFI
 //     0x15: last image  (u8)  bit 7 set = last image in the chain
 //
-// The image size in 512-byte units lives at offset 0x02 of the image
-// itself
+// The image size in 512-byte units lives at offset 0x02 of the image itself
 
 extern crate alloc;
+use crate::drivers::gpu::nvidia::le;
 use alloc::vec::Vec;
 use core::ptr;
 
@@ -97,10 +95,10 @@ const PBUS_PRAMIN_WINDOW: u32 = 0x0000_1700; // window base in 64 KiB units
 const PRAMIN_APERTURE:    u32 = 0x0070_0000; // BAR0 window into the selected VRAM region
 
 /// Read the VBIOS from the PRAMIN shadow (the post-devinit BIOS image kept in
-/// VRAM). On Turing the PCI expansion ROM only carries the legacy + EFI
-/// images; the data image (PCIR code type 0xe0) that holds the falcon ucodes
-/// (FWSEC etc.) lives only in this shadow. nouveau prefers PRAMIN over PROM
-/// for exactly this reason (shadow.c method order: ramin before prom).
+/// VRAM). On Turing the PCI expansion ROM carries only the legacy + EFI images;
+/// the data image (PCIR code type 0xe0) holding the falcon ucodes (FWSEC etc.)
+/// lives only in this shadow. nouveau prefers PRAMIN over PROM for this reason
+/// (shadow.c method order: ramin before prom).
 ///
 /// Mirrors nouveau shadowramin.c 'pramin_init'/'pramin_read' for the GV100+
 /// path (TU11x is card_type TU, >= GV100):
@@ -145,7 +143,7 @@ pub fn read_rom_pramin(bar0: &MmioRegion) -> Option<Vec<u8>> {
     let mut buf = alloc::vec![0u8; size];
     for i in (0..size).step_by(4) {
         let w = bar0.read32(PRAMIN_APERTURE + i as u32);
-        buf[i..i + 4].copy_from_slice(&w.to_le_bytes());
+        le::put_u32(&mut buf, i, w);
     }
 
     bar0.write32(PBUS_PRAMIN_WINDOW, saved);
@@ -186,7 +184,8 @@ pub fn parse_images(rom: &[u8]) -> Vec<VbiosImage> {
         let code_type = rom[pcir + 0x14];
         let last = rom[pcir + 0x15] & 0x80 != 0;
 
-        // Image size: some vendors put it at PCIR+0x10 (size in 512-byte units), but the legacy spot is offset 0x02 of the image itself
+        // Image size: some vendors put it at PCIR+0x10 (size in 512-byte
+        // units), but the legacy spot is offset 0x02 of the image itself
         let size_units = rom[offset + 2] as usize;
         let size = size_units * 512;
         if size == 0 || offset + size > rom.len() {
@@ -227,14 +226,13 @@ pub struct RomImage {
     pub last: bool,
 }
 
-/// Walk the ROM image chain exactly like nouveau 'nvbios_imagen':
-///    image size  = PCIR[+0x10] * 512, overridden by NPDE[+0x08]*512 for
-///                   images whose PCIR code type != 0x70
+/// Walk the ROM image chain like nouveau 'nvbios_imagen':
+///     image size  = PCIR[+0x10] * 512, overridden by NPDE[+0x08]*512 for images whose PCIR code type != 0x70
 ///     image type  = PCIR[+0x14]
 ///     last        = PCIR[+0x15] & 0x80, overridden by NPDE[+0x0a] likewise
-/// NPDE sits at (pcir_data + pcir_hdr_len + 0x0f) & ~0x0f. Keeping the exact
-/// sizes matters: the BIT pointer translation base is image[0].size, and a
-/// size taken from the wrong field shifts every dereferenced pointer.
+/// NPDE sits at (pcir_data + pcir_hdr_len + 0x0f) & ~0x0f. The BIT pointer
+/// translation base is image[0].size, so a size from the wrong field shifts
+/// every dereferenced pointer.
 pub fn walk_images(rom: &[u8]) -> Vec<RomImage> {
     let mut out = Vec::new();
     let mut base = 0usize;
@@ -286,12 +284,12 @@ pub fn image_map(rom: &[u8]) -> Vec<(usize, usize, u8, bool)> {
         .collect()
 }
 
-/// A read-through view over the raw expansion ROM that reproduces nouveau's
+/// A read-through view over the raw expansion ROM reproducing nouveau's
 /// 'nvbios_addr;' pointer translation. NVIDIA BIT pointers live in a virtual
-/// space where [0, image0_size) maps to the legacy image and everything at
-/// or beyond image0_size maps into the data image (PCIR type 0xe0) located
-/// at 'imaged_addr' in the raw ROM. Without this remap, any pointer past the
-/// legacy image (e.g. the PMU table) dereferences into padding/garbage.
+/// space where [0, image0_size) maps to the legacy image and everything from
+/// image0_size on maps into the data image (PCIR type 0xe0) at 'imaged_addr' in
+/// the raw ROM. Without this remap, a pointer past the legacy image (e.g. the
+/// PMU table) dereferences into padding.
 #[derive(Clone, Copy)]
 pub struct VbiosView<'a> {
     pub rom: &'a [u8],
@@ -321,10 +319,14 @@ impl<'a> VbiosView<'a> {
         }
     }
 
+    // rd8/rd16/rd32/slice are one family over the same image; each table needs
+    // its own widths
+    #[allow(dead_code)]
     #[inline]
     pub fn rd8(&self, addr: usize) -> Option<u8> {
         self.rom.get(self.phys(addr)).copied()
     }
+    #[allow(dead_code)]
     #[inline]
     pub fn rd16(&self, addr: usize) -> Option<u16> {
         raw_rd16(self.rom, self.phys(addr))
@@ -336,7 +338,8 @@ impl<'a> VbiosView<'a> {
 
     /// Borrow 'len' contiguous bytes starting at virtual 'addr'. Valid only
     /// when the whole range lives inside one image (true for the FWSEC
-    /// descriptor + ucode, which sit together in the data image)
+    /// descriptor + ucode, together in the data image)
+    #[allow(dead_code)]
     pub fn slice(&self, addr: usize, len: usize) -> Option<&'a [u8]> {
         let start = self.phys(addr);
         let end = start.checked_add(len)?;

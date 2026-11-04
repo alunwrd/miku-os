@@ -1,4 +1,4 @@
-// mikuD - MikuOS init daemon (PID 1)
+// mikuD: MikuOS init daemon (PID 1)
 //
 // Supports: targets, dependencies (Requires/Wants/Conflicts), lifecycle hooks,
 // watchdog, notify, conditions, masking, graceful shutdown, boot analysis
@@ -24,7 +24,7 @@ pub use daemon::{
     default_target, set_default_target,
     target_is, target_at_least, promote_target,
     enable_boot_promotion, disable_boot_promotion, boot_promoted,
-    boot_phase, boot_state, mikud_main,
+    boot_phase, boot_state, mikud_main, apply_unit_identity,
     is_shutting_down, isolate_target, poweroff, reboot,
 };
 pub use socket::{
@@ -43,7 +43,7 @@ pub use api::{
     reload_service,
     enable_service, disable_service,
     mask_service, unmask_service, is_masked,
-    watchdog_ping, notify_ready,
+    watchdog_ping, notify_ready, notify_from,
     services_ready, ready_targets, service_count, active_service_count,
     waiting_restart_count, service_names, target_for_service,
     service_state, service_pid, service_description,

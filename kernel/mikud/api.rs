@@ -1,4 +1,4 @@
-// mikuD public API - register, start, stop, restart, query, mask, reload
+// mikuD public API: register, start, stop, restart, query, mask, reload
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -95,7 +95,7 @@ fn do_register(svc: Service) {
     let restart = svc.restart;
     let ok = SERVICES.lock().add(svc);
     if ok {
-        crate::serial_println!("[mikud] registered '{}' target={} restart={}",
+        crate::trace_println!("[mikud] registered '{}' target={} restart={}",
             name, target.as_str(), restart.as_str());
     } else {
         crate::serial_println!("[mikud] failed to register '{}'", name);
@@ -226,30 +226,66 @@ pub fn is_masked(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-// watchdog
+// Watchdog and readiness
+//
+// What a service says about itself: "I am ready" (`Type=notify` leaves Starting
+// on it) and "I am still alive" (`WatchdogSec=` restarts it when this stops
+// arriving). A service says it with `sv notify` over kcmd (`mikuctl notify`),
+// and `notify_from` decides which service is speaking
+
+/// Apply what a service said about itself to its entry
+fn apply_notify(svc: &mut Service, ready: bool, watchdog: bool, now: u64) {
+    if ready {
+        svc.flags.notify_ready = true;
+    }
+    if watchdog {
+        svc.watchdog_last_ping = now;
+    }
+}
 
 pub fn watchdog_ping(name: &str) -> bool {
     let now = crate::arch::x86_64::interrupts::get_tick();
-    with_service_table(|table| {
-        let idx = match table.find_by_name(name) {
-            Some(i) => i,
-            None => return false,
-        };
-        table.services[idx].watchdog_last_ping = now;
-        true
+    with_service_table(|table| match table.find_by_name(name) {
+        Some(idx) => { apply_notify(&mut table.services[idx], false, true, now); true }
+        None => false,
     })
 }
 
 /// Called by a service to report readiness
 pub fn notify_ready(name: &str) -> bool {
-    with_service_table(|table| {
-        let idx = match table.find_by_name(name) {
-            Some(i) => i,
-            None => return false,
-        };
-        table.services[idx].flags.notify_ready = true;
-        true
+    with_service_table(|table| match table.find_by_name(name) {
+        Some(idx) => { apply_notify(&mut table.services[idx], true, false, 0); true }
+        None => false,
     })
+}
+
+/// How far up from the caller `notify_from` looks for a service's main process.
+/// A service running a script that runs a helper is three; this only bounds a
+/// walk through the process table
+const NOTIFY_MAX_DEPTH: usize = 32;
+
+/// `pid` speaks for the service it belongs to: the service whose main process
+/// is `pid`'s process, or an ancestor of it below mikuD. A process can only say
+/// "ready" or "alive" about its own service, the same scope as systemd's
+/// `NotifyAccess=all`. Returns the service's name, or `None` when `pid` is part
+/// of no service
+pub fn notify_from(pid: u64, ready: bool, watchdog: bool) -> Option<&'static str> {
+    let now = crate::arch::x86_64::interrupts::get_tick();
+    let stop = mikud_pid();
+    let mut cur = crate::sched::tgid_of(pid);
+    for _ in 0..NOTIFY_MAX_DEPTH {
+        if cur == 0 || cur == stop { return None; }
+        let found = with_service_table(|table| {
+            let idx = table.find_by_pid(cur)?;
+            apply_notify(&mut table.services[idx], ready, watchdog, now);
+            Some(table.services[idx].name)
+        });
+        if found.is_some() { return found; }
+        let parent = crate::sched::ppid_of(cur)?;
+        if parent == cur { return None; }
+        cur = crate::sched::tgid_of(parent);
+    }
+    None
 }
 
 // queries
@@ -444,9 +480,10 @@ pub fn boot_analyze() -> Vec<BootTiming> {
         } else {
             svc.last_start_tick
         };
-        // For services that started during boot, calculate their activation time
+        // For services that started during boot, calculate their activation
+        // time
         let duration = if svc.restarts == 0 && svc.state == ServiceState::Running {
-            // First start, still running - measure from registration to running
+            // First start, still running: measure from registration to running
             0 // instant start for kernel services
         } else {
             end.saturating_sub(svc.last_start_tick)

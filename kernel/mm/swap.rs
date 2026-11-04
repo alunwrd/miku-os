@@ -24,6 +24,13 @@ struct SwapState {
     pub total_pages:   u32,
     pub used_pages:    u32,
     bitmap:            [u64; SWAP_BITMAP_WORDS],
+    /// How many page-table entries name each slot, by slot - 1.
+    ///
+    /// One, until `fork` copies a swapped-out entry into the child: then both
+    /// name the slot, and it must outlive whichever reads it back first.
+    /// Linux's `swap_map` count. The bitmap stays the allocator; a slot is
+    /// freed when its count reaches zero
+    refs:              [u16; SWAP_MAX_PAGES],
 }
 
 impl SwapState {
@@ -35,6 +42,7 @@ impl SwapState {
             total_pages:   0,
             used_pages:    0,
             bitmap:        [0u64; SWAP_BITMAP_WORDS],
+            refs:          [0u16; SWAP_MAX_PAGES],
         }
     }
 
@@ -46,6 +54,7 @@ impl SwapState {
                 let slot = word_idx * 64 + bit;
                 if slot < self.total_pages as usize {
                     self.bitmap[word_idx] |= 1 << bit;
+                    self.refs[slot] = 1;
                     self.used_pages += 1;
                     return Some(slot as u32 + 1);
                 }
@@ -54,13 +63,25 @@ impl SwapState {
         None
     }
 
-    fn free_slot(&mut self, slot: u32) {
-        if slot == 0 || slot > self.total_pages { return; }
-        let idx = (slot as usize - 1) / 64;
-        let bit = (slot as usize - 1) % 64;
-        if self.bitmap[idx] & (1 << bit) != 0 {
-            self.bitmap[idx] &= !(1 << bit);
+    /// One entry fewer names `slot`; the last one frees it
+    fn put_slot(&mut self, slot: u32) {
+        if !self.is_used(slot) { return; }
+        let i = slot as usize - 1;
+        self.refs[i] = self.refs[i].saturating_sub(1);
+        if self.refs[i] == 0 {
+            self.bitmap[i / 64] &= !(1 << (i % 64));
             self.used_pages = self.used_pages.saturating_sub(1);
+        }
+    }
+
+    /// One entry more names `slot`. False for a slot that is not in use, or
+    /// one whose count would overflow
+    fn dup_slot(&mut self, slot: u32) -> bool {
+        if !self.is_used(slot) { return false; }
+        let i = slot as usize - 1;
+        match self.refs[i].checked_add(1) {
+            Some(n) => { self.refs[i] = n; true }
+            None => false,
         }
     }
 
@@ -104,7 +125,7 @@ fn write_page(dev: BlockDevId, lba_base: u32, src: *const u8) -> Result<(), BlkE
 }
 
 fn phys_to_virt(phys: u64) -> u64 {
-    let hhdm = crate::net::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+    let hhdm = crate::arch::x86_64::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
     phys + hhdm
 }
 
@@ -121,8 +142,11 @@ pub fn swap_out_internal(phys_addr: u64) -> Result<u32, SwapError> {
     };
 
     let lba_base = lba_for_slot(slot);
-    write_page(dev, lba_base, phys_to_virt(phys_addr) as *const u8)
-        .map_err(SwapError::Io)?;
+    // A failed write gives the slot back: nothing will ever name it
+    if let Err(e) = write_page(dev, lba_base, phys_to_virt(phys_addr) as *const u8) {
+        SWAP.lock().put_slot(slot);
+        return Err(SwapError::Io(e));
+    }
 
     crate::serial_println!("[swap] swap_out: phys={:#x} -> slot={}", phys_addr, slot);
     Ok(slot)
@@ -140,7 +164,10 @@ pub fn swap_in_internal(slot: u32, phys_addr: u64) -> Result<(), SwapError> {
     read_page(dev, lba_base, phys_to_virt(phys_addr) as *mut u8)
         .map_err(SwapError::Io)?;
 
-    SWAP.lock().free_slot(slot);
+    // This entry's reference, dropped only after the read: while it is held the
+    // slot cannot be handed out again, so another entry naming it (the other
+    // side of a `fork`) still reads the page written there
+    SWAP.lock().put_slot(slot);
     crate::serial_println!("[swap] swap_in: slot={} -> phys={:#x}", slot, phys_addr);
     Ok(())
 }
@@ -153,9 +180,18 @@ pub fn swap_in(slot: u32, phys_addr: u64) -> Result<(), SwapError> {
     swap_in_internal(slot, phys_addr)
 }
 
+/// An entry naming `slot` is gone without reading it back (an unmap, an exit)
 pub fn free_swap_slot(slot: u32) {
     if slot == 0 { return; }
-	SWAP.lock().free_slot(slot);
+    SWAP.lock().put_slot(slot);
+}
+
+/// A second entry now names `slot`: `fork` copying a swapped-out page into
+/// the child. False if the slot is not in use or its count is full, and the
+/// caller must not copy the entry then
+pub fn dup_swap_slot(slot: u32) -> bool {
+    if slot == 0 { return false; }
+    SWAP.lock().dup_slot(slot)
 }
 
 pub fn try_reclaim_page() -> Option<u64> {
@@ -231,6 +267,7 @@ pub fn swapon(
         s.total_pages   = total_pages.saturating_sub(1).min(SWAP_MAX_PAGES as u32);
         s.used_pages    = 0;
         s.bitmap        = [0u64; SWAP_BITMAP_WORDS];
+        s.refs.fill(0);
     }
 
     crate::serial_println!(
@@ -260,6 +297,9 @@ pub fn swapoff() -> Result<(), SwapError> {
     s.used_pages    = 0;
     s.partition_lba = 0;
     s.bitmap        = [0u64; SWAP_BITMAP_WORDS];
+    // In place: a 128 KiB array literal is a 128 KiB temporary on the
+    // kernel stack before it is copied in
+    s.refs.fill(0);
     crate::serial_println!("[swap] swapoff ok");
     Ok(())
 }

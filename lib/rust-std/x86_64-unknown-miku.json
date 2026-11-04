@@ -1,0 +1,45 @@
+{
+  "llvm-target": "x86_64-unknown-none",
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+  "arch": "x86_64",
+  "os": "miku",
+  "env": "",
+  "vendor": "unknown",
+  "target-pointer-width": 64,
+  "target-c-int-width": 32,
+  "target-endian": "little",
+  "executables": true,
+  "linker-flavor": "ld.lld",
+  "linker": "rust-lld",
+  "dynamic-linking": true,
+  "has-thread-local": true,
+  "crt-static-respected": false,
+  "pre-link-args": {
+    "ld.lld": [
+      "--dynamic-linker=/lib/ld-miku.so",
+      "--no-as-needed",
+      "-rpath",
+      "/lib",
+      "-lcore_miku",
+      "-lsys_miku",
+      "-ltext_miku",
+      "-lds_miku",
+      "-lalgo_miku",
+      "-lcodec_miku",
+      "-lfs_miku",
+      "-lnet_miku",
+      "-lparse_miku",
+      "-llibc_miku"
+    ]
+  },
+  "relocation-model": "pic",
+  "position-independent-executables": true,
+  "disable-redzone": true,
+  "features": "",
+  "panic-strategy": "abort",
+  "tls-model": "local-exec",
+  "target-family": [
+    "unix"
+  ],
+  "no-default-libraries": true
+}

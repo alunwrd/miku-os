@@ -8,6 +8,10 @@ pub mod system;
 pub mod nvidia_cmds;
 pub mod mkfs_cmds;
 pub mod disk_cmds;
+pub mod install_cmds;
+pub mod mayland_cmds;
+pub mod display_cmds;
+pub mod elf_cmds;
 
 extern crate alloc;
 
@@ -23,9 +27,26 @@ macro_rules! ext_dispatch {
     };
 }
 
+/// Runs a program the person at the console asked for.
+///
+/// `exec_as`, not `exec`: a program the user started should be the user. The
+/// credential comes from the shell thread, which `login` set, so `cat` and
+/// `/bin/cat` answer the same way and `mikudo` in front of either means the
+/// same.
+///
+/// Machine commands stay ring 0: somebody who can type at this console can
+/// power-cycle it and boot something else. What is enforced is everything the
+/// VFS mediates, which is where the secrets are
 fn cmd_exec(path: &str, args: &[&str]) {
-    match crate::process::exec::exec(path, args, crate::process::exec::DEFAULT_ENV) {
+    let cred = crate::sched::current_cred();
+    let env = user_env(cred.uid);
+    let env: alloc::vec::Vec<&str> = env.iter().map(|s| s.as_str()).collect();
+    match crate::process::exec::exec_as(path, args, &env, cred) {
         Ok(pid) => {
+            // The keyboard goes to the program the user is waiting on, and
+            // comes back when it exits. `exec` does not do this: a daemon
+            // started by mikuD must never take the console
+            crate::io::input::user_stdin::set_foreground(pid);
             crate::sched::waitpid(pid);
             crate::io::input::user_stdin::clear_foreground();
         }
@@ -35,9 +56,36 @@ fn cmd_exec(path: &str, args: &[&str]) {
     }
 }
 
-pub fn execute(input: &str) {
+/// The environment of a program started from this shell: the one a login
+/// session gets from `mikudod` (`session_env`), for whoever this shell is.
+/// `SHELL` is set because the passwd field names a session program here, not a
+/// shell
+fn user_env(uid: u16) -> alloc::vec::Vec<alloc::string::String> {
+    use alloc::format;
+    let (name, home) = crate::syscall::adapters::process::passwd_name_home(uid)
+        .unwrap_or_else(|| (alloc::string::String::new(), "/".into()));
+    let mut env = alloc::vec![
+        format!("PATH=/bin"),
+        format!("HOME={home}"),
+        format!("SHELL=/bin/msh"),
+        format!("TERM=miku"),
+        format!("OS=MikuOS"),
+    ];
+    if !name.is_empty() {
+        env.push(format!("USER={name}"));
+        env.push(format!("LOGNAME={name}"));
+    }
+    env
+}
+
+/// Runs one command line. False means nothing here answers to that name
+///
+/// `kcmd` turns that into `-ENOENT`, so a ring-3 shell that asked because it
+/// could not find a program can print its own "not found" and exit 127, and
+/// `cmd || echo failed` works
+pub fn execute(input: &str) -> bool {
     let t = input.trim();
-    if t.is_empty() { return; }
+    if t.is_empty() { return true; }
 
     let mut parts = t.split_whitespace();
     let cmd  = parts.next().unwrap_or("");
@@ -46,67 +94,40 @@ pub fn execute(input: &str) {
     let a3   = parts.next().unwrap_or("");
     let rest = if t.len() > cmd.len() { t[cmd.len()..].trim_start() } else { "" };
 
+    // Two different questions. Powering off is `CAP_SYS_BOOT`, which a session
+    // holds: somebody at this seat can reach the button on the case. Everything
+    // else on the list is `CAP_SYS_ADMIN` (mounting a disk, partitioning one,
+    // starting services), and that is what mikudo is for
+    if let Some(cap) = gated_by(cmd, rest) {
+        if !crate::sched::current_cred().has(cap) {
+            crate::print_error!("  {}: this is a machine command and you are not root", cmd);
+            crate::println!("  it changes the machine, so it wants CAP_SYS_ADMIN, which a");
+            crate::println!("  desktop session deliberately does not carry. Ask for it:");
+            crate::println!("     mikudo {} ...", cmd);
+            // Refused, but answered: the name exists and this is what it said
+            return true;
+        }
+    }
+
+    // The everyday commands are not here. `ls`, `cat`, `cp`, `mv`, `rm`,
+    // `mkdir`, `rmdir`, `ln`, `readlink`, `touch`, `stat`, `chmod`, `chown`,
+    // `du`, `df`, `tree`, `head`, `tail`, `wc`, `grep`, `sort`, `uniq`, `tee`,
+    // `echo`, `ps`, `kill`, `sleep`, `date`, `uptime`, `uname`, `free`,
+    // `clear`, `which` and `env` are programs in /bin. An unknown name falls
+    // through to `run_external` at the bottom of this match. See utils/ and
+    // dev/terminal-architecture.md.
+    //
+    // `cd` and `pwd` stay, because they are the shell's own state: a `cd` in a
+    // child would change nothing anybody sees.
     match cmd {
-        "ls"  => fs::cmd_ls(if a1.is_empty() { "." } else { a1 }),
         "cd"  => fs::cmd_cd(a1),
         "pwd" => fs::cmd_pwd(),
 
-        "mkdir" => {
-            if a1.is_empty() { println!("Usage: mkdir <name>"); }
-            else { fs::cmd_mkdir(a1); }
-        }
-        "touch" => {
-            if a1.is_empty() { println!("Usage: touch <name>"); }
-            else { fs::cmd_touch(a1); }
-        }
-        "cat" => {
-            if a1.is_empty() { println!("Usage: cat <file>"); }
-            else { fs::cmd_cat(a1); }
-        }
         "write" => {
             if a1.is_empty() || rest.len() <= a1.len() { println!("Usage: write <file> <text>"); }
             else { fs::cmd_write(a1, rest[a1.len()..].trim_start()); }
         }
         "dd" => fs::cmd_dd(rest),
-        "stat" => {
-            if a1.is_empty() { println!("Usage: stat <path>"); }
-            else { fs::cmd_stat(a1); }
-        }
-        "rm" => {
-            if a1.is_empty() { println!("Usage: rm [-rf] <path>"); }
-            else if a1 == "-rf" || a1 == "-r" || a1 == "-f" {
-                if a2.is_empty() { println!("Usage: rm -rf <path>"); }
-                else { fs::cmd_rm_rf(a2); }
-            } else {
-                fs::cmd_rm(a1);
-            }
-        }
-        "rmdir" => {
-            if a1.is_empty() { println!("Usage: rmdir <dir>"); }
-            else { fs::cmd_rmdir(a1); }
-        }
-        "mv" => {
-            if a1.is_empty() || a2.is_empty() { println!("Usage: mv <old> <new>"); }
-            else { fs::cmd_mv(a1, a2); }
-        }
-        "ln" => {
-            if a1 == "-s" {
-                if a2.is_empty() || a3.is_empty() { println!("Usage: ln -s <target> <linkname>"); }
-                else { fs::cmd_symlink(a2, a3); }
-            } else {
-                if a1.is_empty() || a2.is_empty() { println!("Usage: ln <existing> <newname>"); }
-                else { fs::cmd_link(a1, a2); }
-            }
-        }
-        "readlink" => {
-            if a1.is_empty() { println!("Usage: readlink <path>"); }
-            else { fs::cmd_readlink(a1); }
-        }
-        "chmod" => {
-            if a1.is_empty() || a2.is_empty() { println!("Usage: chmod <mode> <path>"); }
-            else { fs::cmd_chmod(a1, a2); }
-        }
-        "df"     => fs::cmd_df(),
         "mount"  => { if a1.is_empty() { fs::cmd_mount_list(); } else { fs::cmd_mount(a1, a2); } }
         "umount" => { if a1.is_empty() { println!("Usage: umount <path>"); } else { fs::cmd_umount(a1); } }
 
@@ -116,6 +137,8 @@ pub fn execute(input: &str) {
 
         "fs.list"   => ext2_cmds::cmd_fs_list(),
         "fs.select" => ext2_cmds::cmd_fs_select(rest),
+        "fs.rw"     => ext2_cmds::cmd_fs_remount(rest, true),
+        "fs.ro"     => ext2_cmds::cmd_fs_remount(rest, false),
         "fs.umount" => ext2_cmds::cmd_fs_umount(rest),
 
         "extls" => fs::cmd_extls(a1),
@@ -194,7 +217,16 @@ pub fn execute(input: &str) {
         }
         "extrmdir" => {
             if a1.is_empty() { println!("Usage: extrmdir <path>"); }
-            else { fs::cmd_rmdir(a1); }
+            else {
+                // To the ext implementation, like every other `ext*` command
+                let abs = fs::make_abs_path_pub(a1);
+                let abs_str = unsafe { core::str::from_utf8_unchecked(&abs.0[..abs.1]) };
+                ext_dispatch!(
+                    ext2_cmds::cmd_ext2_rmdir(abs_str),
+                    ext3_cmds::cmd_ext3_rmdir(abs_str),
+                    ext4_cmds::cmd_ext4_rmdir(abs_str)
+                );
+            }
         }
         "extmv" => {
             if a1.is_empty() || a2.is_empty() { println!("Usage: extmv <path> <newname>"); }
@@ -247,11 +279,7 @@ pub fn execute(input: &str) {
             ext3_cmds::cmd_ext3_tree(a1),
             ext4_cmds::cmd_ext4_tree(a1)
         ); }
-        "extfsck" => { ext_dispatch!(
-            ext2_cmds::cmd_ext2_fsck(),
-            ext2_cmds::cmd_ext2_fsck(),
-            ext4_cmds::cmd_ext4_fsck()
-        ); }
+        "extfsck" => ext_cmds_common::impl_fsck(a1 == "-y" || a1 == "--repair"),
         "extcache"      => ext2_cmds::cmd_ext2_cache(),
         "extcacheflush" => ext2_cmds::cmd_ext2_cache_flush(),
         "extsync" | "sync" => ext4_cmds::cmd_ext4_sync(),
@@ -320,7 +348,7 @@ pub fn execute(input: &str) {
         }
         "ext2du"        => ext2_cmds::cmd_ext2_du(a1),
         "ext2tree"      => ext2_cmds::cmd_ext2_tree(a1),
-        "ext2fsck"      => ext2_cmds::cmd_ext2_fsck(),
+        "ext2fsck"      => ext2_cmds::cmd_ext2_fsck(a1 == "-y" || a1 == "--repair"),
         "ext2cache"     => ext2_cmds::cmd_ext2_cache(),
         "ext2cacheflush"=> ext2_cmds::cmd_ext2_cache_flush(),
 
@@ -368,7 +396,7 @@ pub fn execute(input: &str) {
         }
         "ext4tree"   => ext4_cmds::cmd_ext4_tree(a1),
         "ext4du"     => ext4_cmds::cmd_ext4_du(a1),
-        "ext4fsck"   => ext4_cmds::cmd_ext4_fsck(),
+        "ext4fsck"   => ext4_cmds::cmd_ext4_fsck(a1 == "-y" || a1 == "--repair"),
 
         "fiemap"     => ext4_cmds::cmd_fiemap(a1),
         "getxattr"   => { if a1.is_empty() || a2.is_empty() { println!("Usage: getxattr <path> <name>"); } else { xattr_cmds::cmd_getxattr(a1, a2); } }
@@ -402,6 +430,8 @@ pub fn execute(input: &str) {
             if a1.is_empty() || a2.is_empty() { println!("Usage: mkfs.dry <drive 0-3> <ext2|ext3|ext4>"); }
             else { mkfs_cmds::cmd_mkfs_dry(a1, a2); }
         }
+
+        "install"  => install_cmds::cmd_install(rest),
 
         "gpt"      => disk_cmds::cmd_gpt_show(a1),
         "gpt.init" => disk_cmds::cmd_gpt_init(a1),
@@ -441,6 +471,7 @@ pub fn execute(input: &str) {
         "swapon.auto"=> disk_cmds::cmd_swapon_auto(),
         "mkswap.raw" => disk_cmds::cmd_mkswap_raw(rest),
 
+
         "exec" => {
             if a1.is_empty() {
                 println!("Usage: exec <path> [args...]");
@@ -453,171 +484,134 @@ pub fn execute(input: &str) {
             }
         }
 
-        "echo"     => system::cmd_echo(rest),
         "history"  => system::cmd_history(),
         "info"     => system::cmd_info(),
+        "display"  => display_cmds::cmd_display(rest),
         "memmap"   => system::cmd_memmap(),
+        "pstore"   => system::cmd_pstore(rest),
+        "dmesg"    => system::cmd_dmesg(rest),
         "help"     => system::cmd_help(),
-        "clear"    => system::cmd_clear(),
         "heap"     => system::cmd_heap(),
+        // `mm test`, or `run=mm_test` on the GRUB line: the kernel heap and
+        // the frame allocator on the machine (`dev/kernel-core.md`)
+        "mm"       => match rest.trim() {
+            "test" => crate::mm::selftest::cmd_selftest(),
+            _ => crate::println!("Usage: mm test"),
+        },
         "poweroff" | "shutdown" | "halt" => system::cmd_poweroff(),
         "reboot"   | "restart"           => system::cmd_reboot(),
-        "ps"       => system::cmd_ps(),
         "ldconfig" => system::cmd_ldconfig(rest),
         "ldd"      => system::cmd_ldd(a1),
         "nvidia" | "gpu" => nvidia_cmds::cmd_nvidia(rest),
+        "mayland" | "may" => mayland_cmds::cmd_mayland(rest),
         "usb" | "lsusb"  => system::cmd_usb(),
         "top"      => system::cmd_top(),
         "swaptest" => system::cmd_swaptest(),
         "nice"     => system::cmd_nice(a1, a2),
         "affinity" => system::cmd_affinity(a1, a2),
-        "kill"     => {
-            if a1.is_empty() { println!("Usage: kill <pid>"); }
-            else if let Ok(pid) = a1.parse::<u64>() {
-                crate::sched::kill(pid);
-                crate::cprintln!(100, 220, 150, "  killed pid={}", pid);
-            } else {
-                crate::print_error!("  invalid pid");
-            }
-        }
 
         "sv" => cmd_sv(a1, a2, a3),
 
+        // `logout`: ends the console's session (see `cmd_logout`)
+        "logout" => cmd_logout(),
+        "who" => cmd_who(),
+
+        // `login`: hands the console to a person.
+        //
+        // The in-kernel shell is ring 0: it does not go through the syscall
+        // layer, so no credential check applies. This is a way off it, into a
+        // session with an identity, a capability set, and a `mikudo` to ask.
+        //
+        // `login` holds nothing: it asks mikudod, over the socket the graphical
+        // greeter uses. It is started as `greeter`, the account both login
+        // prompts run as, with no capability, so a bug in it is an ordinary bug
+        "login" => cmd_login(),
+
         "net"  => { crate::net::poll(); crate::net::cmd_net(rest); }
+        "ipc"  => crate::syscall::cmd_ipc(rest),
+        "elf"  => elf_cmds::cmd_elf(rest),
+        // `ext test`, or `run=ext_test` on the GRUB line. Only what the host
+        // test suite cannot reach: two filesystems at once, the real block
+        // layer, and the kernel's own mkfs writing to a device
+        "ext"  => match rest.trim() {
+            "test" => crate::fs::ext::selftest::cmd_selftest(),
+            _ => crate::println!("Usage: ext test"),
+        },
+        // `btrfs test`, or `run=btrfs_test` on the GRUB line. The probe
+        // registry, the real block layer, the mount table and a path through
+        // `MikuVFS`, which `lib/btrfs`'s host tests cannot reach
+        "btrfs" => match rest.trim() {
+            "test" => crate::fs::btrfs::selftest::cmd_selftest(),
+            _ => crate::println!("Usage: btrfs test"),
+        },
+        // `vfs test`, or `run=vfs_test` on the GRUB line. The vnode tree driven
+        // through its own API against a real filesystem: the layer
+        // `lib/extfs`'s host tests sit under
+        "vfs"  => match rest.trim() {
+            "test" => crate::fs::vfs::selftest::cmd_selftest(),
+            _ => crate::println!("Usage: vfs test"),
+        },
+        // `cred test`, or `run=cred_test` on the GRUB line. Identity, the
+        // capability set, and that exec never raises anybody
+        "cred" => match rest.trim() {
+            "test" => crate::process::selftest_cred::cmd_selftest(),
+            "" | "show" => cmd_cred_show(),
+            _ => crate::println!("Usage: cred [show|test]"),
+        },
+        "tty" => match rest.trim() {
+            "test" => crate::io::tty::selftest::cmd_selftest(),
+            "" | "list" => cmd_tty_list(),
+            _ => crate::println!("Usage: tty [list|test]"),
+        },
         "dhcp" => crate::net::cmd_dhcp(),
-        "ping" => {
-            if a1.is_empty() { println!("Usage: ping <ip|host> [count]"); }
-            else {
-                let count = a2.parse::<usize>().unwrap_or(usize::MAX);
-                match parse_ip(a1) {
-                    Some(ip) => crate::net::cmd_ping(a1, &ip, count),
-                    None => {
-                        crate::cprintln!(57, 197, 187, "ping: resolving {}...", a1);
-                        let dns = crate::net::get_dns();
-                        match crate::net::dns::resolve(a1, &dns) {
-                            Some(ip) => crate::net::cmd_ping(a1, &ip, count),
-                            None => crate::print_error!("ping: cannot resolve '{}'", a1),
-                        }
-                    }
-                }
-            }
-        }
-        "fetch" => {
-            if a1.is_empty() { println!("Usage: fetch <url|host> [port]"); }
-            else { cmd_fetch(a1, a2); }
-        }
-        "wget"  => {
-            if a1.is_empty() { println!("Usage: wget <url> [-O <file>]"); }
-            else {
-                x86_64::instructions::interrupts::enable();
-                crate::net::http::cmd_wget(rest);
-            }
-        }
-        "curl"  => {
-            if a1.is_empty() { println!("Usage: curl <url> [-X GET|POST] [-d <data>] [-o <file>] [-I]"); }
-            else {
-                x86_64::instructions::interrupts::enable();
-                crate::net::http::cmd_curl(rest);
-            }
-        }
-        "ntp"   => {
-            x86_64::instructions::interrupts::enable();
-            crate::net::ntp::cmd_ntp(a1);
-        }
-        "traceroute" | "tr" => {
-            if a1.is_empty() { println!("Usage: traceroute <host|ip>"); }
-            else {
-                x86_64::instructions::interrupts::enable();
-                crate::net::traceroute::cmd_traceroute(a1);
-            }
-        }
+        // ping, traceroute, wget, curl, fetch, ntp and host are programs,
+        // reached through the `/bin` fall-through below
 
-        _ => println!("Unknown: '{}'", cmd),
+        _ => return run_external(cmd, rest),
     }
+    true
 }
 
-fn cmd_fetch(host_or_url: &str, port_str: &str) {
-    if host_or_url.starts_with("http://") || host_or_url.starts_with("https://") {
-        x86_64::instructions::interrupts::enable();
-        if let Some(resp) = crate::net::http::get(host_or_url) {
-            let sc = if resp.status < 400 { (100u8, 220u8, 150u8) } else { (255u8, 80u8, 80u8) };
-            crate::cprintln!(sc.0, sc.1, sc.2, "HTTP {} {}", resp.status, resp.reason);
-            if resp.body.is_empty() {
-                crate::print_warn!("fetch: empty body");
-            } else {
-                crate::cprintln!(120, 200, 200, "fetch: {} bytes", resp.body.len());
-                print_response(&resp.body);
-            }
-        }
-        return;
-    }
-    let (host, port, use_tls) = {
-        let p: u16 = port_str.parse().unwrap_or(80);
-        (host_or_url, p, p == 443)
-    };
-    let dns = crate::net::get_dns();
-    let ip  = match parse_ip(host) {
-        Some(ip) => ip,
-        None => {
-            crate::cprintln!(57, 197, 187, "fetch: resolving {}...", host);
-            match crate::net::dns::resolve(host, &dns) {
-                Some(ip) => ip,
-                None => { crate::print_error!("fetch: cannot resolve '{}'", host); return; }
-            }
-        }
-    };
-    crate::cprintln!(57, 197, 187,
-        "fetch: connecting to {}.{}.{}.{}:{} ({})...",
-        ip[0], ip[1], ip[2], ip[3], port,
-        if use_tls { "TLS" } else { "plain" }
-    );
-    x86_64::instructions::interrupts::enable();
-    let req_str  = alloc::format!(
-        "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: MikuOS/0.2-rc\r\nConnection: close\r\n\r\n",
-        host
-    );
-    let req_bytes = req_str.as_bytes();
-    if use_tls {
-        crate::cprintln!(120, 200, 200, "fetch: TLS handshake...");
-        let mut stream = match crate::net::tls::TlsStream::connect(host, ip, port) {
-            Some(s) => s,
-            None    => { crate::print_error!("fetch: TLS failed"); return; }
-        };
-        crate::print_success!("fetch: TLS ok ({})", stream.cipher_name());
-        if !stream.send(req_bytes) { crate::print_error!("fetch: send failed"); stream.close(); return; }
-        crate::cprintln!(120, 200, 200, "fetch: waiting...");
-        let data = stream.recv_all(8_000_000);
-        print_response(data);
-        stream.close();
+/// Anything the kernel shell does not know is looked for in `/bin`
+///
+/// So a command can leave ring 0 without the name changing.
+///
+/// A name with a `/` in it is a path as written; anything else is a program
+/// name, and programs live in `/bin`
+fn run_external(cmd: &str, rest: &str) -> bool {
+    use alloc::string::String;
+
+    let owned: String = if cmd.contains('/') {
+        String::from(cmd)
     } else {
-        let mut sock = match crate::net::tcp::TcpSocket::connect(ip, port) {
-            Some(s) => s,
-            None    => { crate::print_error!("fetch: connection failed"); return; }
-        };
-        crate::print_success!("fetch: connected");
-        if !sock.send(req_bytes) { crate::print_error!("fetch: send failed"); sock.close(); return; }
-        crate::cprintln!(120, 200, 200, "fetch: waiting...");
-        let data = sock.recv_all(8_000_000);
-        print_response(data);
-        sock.close();
-    }
-}
+        let mut p = String::from("/bin/");
+        p.push_str(cmd);
+        p
+    };
 
-fn print_response(data: &[u8]) {
-    if data.is_empty() { crate::print_warn!("fetch: no data received"); return; }
-    let show = data.len().min(4096);
-    let mut text = alloc::string::String::with_capacity(show);
-    for &b in &data[..show] {
-        if b == b'\n' || b == b'\r' || b == b'\t' || (b >= 32 && b <= 126) {
-            text.push(b as char);
-        } else {
-            text.push('.');
+    // Ask first, so the answer can name the reason. The root filesystem is
+    // normally the GRUB module and always there; when it is not, "unknown
+    // command" would suggest a typo
+    if crate::fs::vfs::core::with_vfs(|v| v.resolve_path(0, &owned).is_err()) {
+        // Said by the console, not by a ring-3 shell asking on somebody's
+        // behalf: that caller has a better message, and a status to return
+        if crate::syscall::adapters::admin::in_kcmd() {
+            return false;
         }
+        crate::print_error!("  unknown command: '{}'", cmd);
+        if !cmd.contains('/') {
+            crate::println!("  (programs live in /bin - if it is empty, no root filesystem is mounted)");
+        }
+        return false;
     }
-    crate::println!("{}", text);
-    if data.len() > show {
-        crate::cprintln!(120, 140, 140, "... ({} bytes total, showing first 4096)", data.len());
-    }
+
+    let mut argv: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    argv.push(cmd);
+    argv.extend(rest.split_whitespace());
+    // Interrupts on: a program in ring 3 needs the timer to be scheduled at all
+    x86_64::instructions::interrupts::enable();
+    cmd_exec(&owned, &argv);
+    true
 }
 
 fn parse_ip(s: &str) -> Option<[u8; 4]> {
@@ -1026,7 +1020,7 @@ fn cmd_sv(subcmd: &str, name: &str, extra: &str) {
                 }
                 crate::println!("  Restart={}", svc.restart);
                 if svc.watchdog_ticks > 0 {
-                    crate::println!("  WatchdogSec={}", svc.watchdog_ticks);
+                    crate::println!("  WatchdogSec={}", crate::mikud::unit::ticks_as_duration(svc.watchdog_ticks));
                 }
                 if svc.critical {
                     crate::println!("  Critical=true");
@@ -1038,6 +1032,33 @@ fn cmd_sv(subcmd: &str, name: &str, extra: &str) {
                 crate::println!("  WantedBy={}", svc.target);
             } else {
                 crate::print_error!("  service '{}' not found", name);
+            }
+        }
+        // A service talking about itself: `READY=1` (a `Type=notify` service
+        // has finished starting) and `WATCHDOG=1` (it is still alive), as in
+        // sd_notify. About the caller's own service and no other, so it is not
+        // privileged (`gated_by`)
+        "notify" => {
+            let mut ready = false;
+            let mut watchdog = false;
+            for word in [name, extra] {
+                match word {
+                    "" => {}
+                    "READY=1" => ready = true,
+                    "WATCHDOG=1" => watchdog = true,
+                    other => {
+                        crate::print_error!("  sv notify: {}: not READY=1 or WATCHDOG=1", other);
+                        return;
+                    }
+                }
+            }
+            if !ready && !watchdog {
+                crate::println!("Usage: sv notify [READY=1] [WATCHDOG=1]");
+                return;
+            }
+            match crate::mikud::notify_from(crate::sched::current_pid(), ready, watchdog) {
+                Some(svc) => crate::println!("  {}: noted", svc),
+                None => crate::print_error!("  sv notify: this process is not part of any service"),
             }
         }
         _ => {
@@ -1062,6 +1083,274 @@ fn cmd_sv(subcmd: &str, name: &str, extra: &str) {
             crate::println!("  scan          - scan /etc/mikud/ for units");
             crate::println!("  timer         - manage timer units");
             crate::println!("  socket        - manage socket units");
+            crate::println!("  notify READY=1|WATCHDOG=1 - a service reports on itself");
         }
+    }
+}
+
+
+/// `cred`: who this shell is, and what it may do
+///
+/// After `mikudo` or a service has changed something, this says what the kernel
+/// believes rather than what /etc/passwd claims
+fn cmd_cred_show() {
+    let cred = crate::sched::current_cred();
+    crate::println!("uid={} euid={} suid={}", cred.uid, cred.euid, cred.suid);
+    crate::println!("gid={} egid={} sgid={}", cred.gid, cred.egid, cred.sgid);
+    if cred.ngroups > 0 {
+        crate::print!("groups=");
+        for i in 0..cred.ngroups as usize {
+            if i > 0 { crate::print!(","); }
+            crate::print!("{}", cred.groups[i]);
+        }
+        crate::println!("");
+    }
+    crate::println!("umask={:04o}", cred.umask);
+    crate::println!("caps  effective={:#06x} permitted={:#06x} bounding={:#06x}",
+        cred.effective.0, cred.permitted.0, cred.bounding.0);
+    if cred.effective == crate::process::cred::CAP_ALL {
+        crate::println!("      (every capability - this is what 'root' means here)");
+    } else {
+        crate::print!("      ");
+        for i in 0..=crate::process::cred::CAP_LAST {
+            if cred.effective.has(i) {
+                crate::print!("{} ", crate::process::cred::CapSet::name(i));
+            }
+        }
+        crate::println!("");
+    }
+}
+
+
+/// Which capability a command wants, or `None` if anybody may run it
+///
+/// `admin_only` answers whether a command is the machine's; this answers which
+/// authority it takes.
+///
+/// Reading is not administering: `nvidia-smi` does not want root on Linux and
+/// neither does `lsusb`, because looking at what the hardware says about itself
+/// is not a privileged act; writing a partition table is. The split is by what
+/// the command does, so the first argument matters: `nvidia list` and
+/// `nvidia gsp-rm-boot` differ.
+///
+/// The conservative half of the line is where Linux draws it. Register dumps,
+/// scans, pokes and boot sequences are privileged even though they only read: a
+/// register read is not always free of consequence. Raw filesystem structures
+/// (`ext*`, `gpt`, `blk` writes) stay privileged as `/dev/sda` is not
+/// world-readable
+fn gated_by(cmd: &str, rest: &str) -> Option<u8> {
+    use crate::process::cred::{CAP_SYS_ADMIN, CAP_SYS_BOOT};
+    match cmd {
+        "reboot" | "restart" | "poweroff" | "shutdown" | "halt" => Some(CAP_SYS_BOOT),
+        // Not read-only, and not privileged either: it changes only the state
+        // of the service the caller is itself part of (`mikud::notify_from`),
+        // which any service has to be able to do as whatever user it runs as
+        "sv" if rest.split_whitespace().next() == Some("notify") => None,
+        _ if read_only(cmd, rest) => None,
+        _ if admin_only(cmd) => Some(CAP_SYS_ADMIN),
+        _ => None,
+    }
+}
+
+/// Does this command only look at things?
+///
+/// The subsystem commands take a verb, and the verb decides. Anything not named
+/// here is assumed to change something
+fn read_only(cmd: &str, rest: &str) -> bool {
+    let verb = rest.split_whitespace().next().unwrap_or("");
+    match cmd {
+        // What `nvidia-smi` shows without root: which cards are here, what they
+        // are doing, how warm they are, what is plugged into them.
+        //
+        // `nvidia perf` shows; `nvidia perf boost` changes the clocks
+        "nvidia" | "gpu" if verb == "perf" => !rest.split_whitespace().any(|w| w == "boost"),
+        // The listing, `imp` and `underflow` look; `poll` acts on a hot-plug.
+        // The setters (mode, on, off, vrr) are in `display`
+        "nvidia" | "gpu" if verb == "disp" || verb == "outputs" =>
+            rest.split_whitespace().nth(1) != Some("poll"),
+        "nvidia" | "gpu" => matches!(verb,
+            "" | "info" | "status" | "list" | "ls" | "gpus"
+            | "temp" | "thermal" | "temperature"
+            | "vram" | "fbmap" | "va" | "vaspace" | "disp" | "outputs"
+            | "util" | "pcie" | "bus"
+            | "firmware" | "fw" | "rm-tree" | "objects" | "rmtree"
+            | "gb206" | "blackwell" | "5060"
+            | "next" | "todo" | "roadmap" | "help" | "?"),
+
+        // `systemctl status` is not privileged either
+        "sv" => matches!(verb,
+            "" | "list" | "ls" | "status" | "tree" | "rdeps" | "analyze"
+            | "failed" | "cat" | "show" | "help"),
+
+        // `mount` with nothing to mount is `mount`, which prints the table
+        "mount" => verb.is_empty(),
+
+        // Which devices exist and how big they are: `lsblk`, not `fdisk`
+        "blkstat" | "swapinfo" | "usb" | "lsusb" => true,
+
+        // What the screens are: `xrandr` with no arguments. Changing one is not
+        // here
+        "display" => matches!(verb, "" | "list" | "ls" | "help" | "?"),
+
+        // The compositor's own state, for a program that wants to know whether
+        // there is a desktop. Starting and stopping it is not here
+        "mayland" | "may" => matches!(verb, "" | "status" | "info" | "list" | "help"),
+
+        _ => false,
+    }
+}
+
+/// The commands that are the machine's rather than a user's.
+///
+/// Most reach a disk directly: the `ext*` family walks inodes on a mounted
+/// filesystem with no reference to who is asking, and `dd` reads a block
+/// device, so the permission bits do not apply and `ext2cat` would print
+/// /etc/shadow. The rest are machine operations (partitioning, swap, firmware,
+/// service control).
+///
+/// Teaching each of them the credential model is the long-term answer; refusing
+/// them fails loudly rather than leaking
+fn admin_only(cmd: &str) -> bool {
+    // Anything that walks a filesystem's raw structures, plus dd
+    if cmd.starts_with("ext") || cmd.starts_with("mkfs.") || cmd.starts_with("fs.")
+        || cmd.starts_with("gpt") || cmd.starts_with("blk") || cmd.starts_with("swap")
+        || cmd.starts_with("mkswap")
+    {
+        return true;
+    }
+    matches!(cmd,
+        // raw block and filesystem access
+        "dd" | "mount" | "umount" | "fstrim" | "partprobe" | "smart" | "nvmestress"
+        | "fiemap" | "chattr" | "lsattr" | "getxattr" | "setxattr" | "listxattr"
+        | "install" | "scan"
+        // the machine itself
+        | "reboot" | "poweroff" | "nvidia" | "display" | "usb" | "memmap" | "pstore" | "load"
+        // The kernel's log: addresses, and what every other user's programs did
+        | "dmesg"
+        // Service control: starting and stopping the machine's services,
+        // `mikudod` among them
+        | "start" | "stop" | "restart" | "reload" | "enable" | "disable"
+        | "mask" | "unmask" | "isolate" | "target" | "force-stop" | "sv"
+    )
+}
+
+/// Ends the console's session.
+///
+/// The console is physical access only on a text boot; on a graphical one it is
+/// a window (`/bin/mayterm`), and the person typing is inside their own login.
+/// So this ends the session and stops there: `logout` must never yield root.
+/// Authority comes back through `login`, a program asking a broker, and on a
+/// graphical boot through `shell::adopt_terminal_owner`, which reads whose
+/// terminal this is
+fn cmd_logout() {
+    let was = crate::sched::current_cred();
+    if was.uid == 0 {
+        crate::println!("  logout: nobody is logged in - the console is already root");
+        return;
+    }
+    // A console session is the machine's own login, and closing it is what
+    // puts the credential back and hands the seat on
+    let closed = {
+        let mut buf = [Default::default(); crate::process::session::MAX_SESSIONS];
+        let n = crate::process::session::list_console(&mut buf);
+        let mut done = false;
+        for s in &buf[..n] {
+            if crate::process::session::close(s.id) { done = true; }
+        }
+        done
+    };
+    if closed {
+        crate::serial_println!("[session] uid {} logged out; the console is root again", was.uid);
+        crate::print_success!("  logged out - the console is root again. 'login' to start a session");
+        return;
+    }
+
+    // No console session to close: the graphical case. The terminal belongs to
+    // a graphical session, which the desktop's log-out ends.
+    //
+    // Same person, no capability: `Cred::user` is an ordinary account, the only
+    // direction this command may move
+    crate::sched::update_current_cred(|c| *c = crate::process::cred::Cred::user(was.uid, was.gid));
+    crate::serial_println!(
+        "[session] uid {} asked to log out of a console with no session - \
+         authority dropped, not raised", was.uid);
+    crate::print_success!(
+        "  this terminal has no console session to end - it belongs to your \
+         desktop session. Authority dropped; use 'login' to start one");
+}
+
+/// Starts the console's login prompt as the account it belongs to
+///
+/// `greeter` is a member of `session`, the group mikudod checks before opening
+/// a session. It has no password, no capabilities and nothing to read.
+///
+/// The identity is applied here, after `exec` has built the image and before
+/// the scheduler has run an instruction of it, by the function mikuD uses for a
+/// unit's `User=`
+pub fn run_login() {
+    cmd_login()
+}
+
+fn cmd_login() {
+    const PATH: &str = "/bin/login";
+    const AS_WHOM: &str = "greeter";
+
+    let who = crate::syscall::adapters::process::passwd_ids(AS_WHOM);
+    if who.is_none() {
+        crate::print_error!("login: this machine has no '{}' account", AS_WHOM);
+        crate::println!("  (it is in the shipped /etc/passwd; a disk without one has no login)");
+        return;
+    }
+
+    match crate::process::exec::exec(PATH, &[PATH], crate::process::exec::DEFAULT_ENV) {
+        Ok(pid) => {
+            // No capabilities, whoever it inherited them from. `Some(0)` is
+            // "these and no others", unlike `None`
+            crate::mikud::apply_unit_identity(pid, who, Some(0), "login");
+            // login reads the keyboard, so it needs the console, and it is
+            // waited for so the prompt underneath is not drawn over the
+            // password prompt
+            crate::io::input::user_stdin::set_foreground(pid);
+            crate::sched::waitpid(pid);
+            crate::io::input::user_stdin::clear_foreground();
+        }
+        Err(e) => crate::print_error!("login: {}", e.as_str()),
+    }
+}
+
+/// `who`: the sessions open on this machine
+///
+/// Reads the table directly rather than through syscall 92: this is ring-0 code
+fn cmd_who() {
+    let mut buf = [Default::default(); crate::process::session::MAX_SESSIONS];
+    let n = crate::process::session::list(&mut buf);
+    if n == 0 {
+        crate::println!("  nobody is logged in");
+        return;
+    }
+    let mut namebuf = [0u8; 33];
+    for s in &buf[..n] {
+        let name = crate::syscall::adapters::process::passwd_name(s.uid, &mut namebuf)
+            .unwrap_or("?");
+        if s.leader == 0 {
+            crate::println!("  {:<12} {:<10} seat{}  session {}",
+                            name, s.kind.as_str(), s.seat, s.id);
+        } else {
+            crate::println!("  {:<12} {:<10} seat{}  session {}  leader pid {}",
+                            name, s.kind.as_str(), s.seat, s.id, s.leader);
+        }
+    }
+}
+
+/// `tty`: what terminals this machine has
+fn cmd_tty_list() {
+    for id in crate::io::tty::list() {
+        let who = match crate::io::tty::master_owner(id) {
+            Some(pid) => alloc::format!("pid {}", pid),
+            None if id == crate::io::tty::SYSTEM => alloc::string::String::from("the console"),
+            None => alloc::string::String::from("hung up"),
+        };
+        let shape = crate::io::tty::with_grid(id, |g| g.size()).unwrap_or((0, 0));
+        crate::println!("  tty{}  {:>3}x{:<3}  {}", id.index(), shape.0, shape.1, who);
     }
 }

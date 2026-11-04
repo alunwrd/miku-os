@@ -5,16 +5,16 @@ use crate::fs::ext::{FsError, MikuFS};
 use crate::{cprint, cprintln, print_error, print_success, println, serial_println};
 use crate::fs::vfs::path::split_parent_name;
 
-// The mount table itself now lives in fs::ext::mount. These re-exports keep
-// the existing `ext2_cmds::` call sites inside the shell working
+// Mount table lives in fs::ext::mount; re-exported here so shell call sites
+// can keep using `ext2_cmds::`
 pub use crate::fs::ext::mount::{
     active_fs_type, active_slot_index, dev_for_idx, ext_fs_version_tag, force_unmount,
     invalidate_drive_mounts, is_ext2_ready, mount_dev, mount_root_disk,
-    mounted_slots_snapshot, register_mount_vnode, slot_for_vnode, try_mount,
-    unmount_slot, with_ext2_pub, MAX_MOUNTS,
+    mounted_slots_snapshot, register_mount_vnode, remount_ro, remount_rw, slot_for_vnode,
+    try_mount, try_mount_ro, unmount_slot, with_ext2_pub, MAX_MOUNTS,
 };
 use crate::fs::ext::mount::{
-    invalidate_vfs_ext_mounts, probe_drive, with_ext2, ExtProbe, INVALID_VNODE, STATE,
+    invalidate_vfs_ext_mounts, scan_volumes, FsProbe, INVALID_VNODE, STATE,
 };
 
 pub fn cmd_fs_list() {
@@ -31,9 +31,10 @@ pub fn cmd_fs_list() {
             let total_b = state.slots[slot].superblock.blocks_count();
             let bs      = state.slots[slot].block_size;
             let marker  = if slot == state.active_slot { " <- active" } else { "" };
+            let mode    = if state.slots[slot].reader.read_only { "ro" } else { "rw" };
             println!(
-                "  [{}] {} drive={} lba={} free={}/{} ({} MB){}",
-                slot, version, drive, lba,
+                "  [{}] {} {} drive={} lba={} free={}/{} ({} MB){}",
+                slot, version, mode, drive, lba,
                 free_b, total_b,
                 free_b as u64 * bs as u64 / (1024 * 1024),
                 marker
@@ -51,7 +52,7 @@ pub fn cmd_fs_list() {
 pub fn cmd_fs_select(args: &str) {
     let slot: usize = match args.trim().parse() {
         Ok(n) if n < MAX_MOUNTS => n,
-        _ => { print_error!("  usage: fs.select <0|1>"); return; }
+        _ => { print_error!("  usage: fs.select <0-{}>", MAX_MOUNTS - 1); return; }
     };
     let mut state = STATE.lock();
     if !state.ready[slot] {
@@ -67,6 +68,29 @@ pub fn cmd_fs_select(args: &str) {
     }
 }
 
+/// fs.rw [slot] / fs.ro [slot]: flips a mount between read-only and read-write.
+/// Mounts come up read-only, so this is where the user says "yes, write to this
+/// disk"
+pub fn cmd_fs_remount(args: &str, want_rw: bool) {
+    let arg = args.trim();
+    let slot: usize = if arg.is_empty() {
+        active_slot_index()
+    } else {
+        match arg.parse() {
+            Ok(n) if n < MAX_MOUNTS => n,
+            _ => {
+                print_error!("  usage: fs.{} [0-{}]", if want_rw { "rw" } else { "ro" }, MAX_MOUNTS - 1);
+                return;
+            }
+        }
+    };
+    let result = if want_rw { remount_rw(slot) } else { remount_ro(slot) };
+    match result {
+        Ok(())   => print_success!("  slot {} is now {}", slot, if want_rw { "read-write" } else { "read-only" }),
+        Err(msg) => print_error!("  fs.{}: slot {}: {}", if want_rw { "rw" } else { "ro" }, slot, msg),
+    }
+}
+
 pub fn cmd_fs_umount(args: &str) {
     let mut state = STATE.lock();
     let slot: usize = if args.trim().is_empty() {
@@ -74,24 +98,25 @@ pub fn cmd_fs_umount(args: &str) {
     } else {
         match args.trim().parse() {
             Ok(n) if n < MAX_MOUNTS => n,
-            _ => { print_error!("  usage: fs.umount [0|1]"); return; }
+            _ => { print_error!("  usage: fs.umount [0-{}]", MAX_MOUNTS - 1); return; }
         }
     };
     if !state.ready[slot] {
         crate::print_warn!("  slot {} is already empty", slot);
         return;
     }
-    let _ = state.slots[slot].sync();
-    state.slots[slot].mark_clean_unmount();
-    let _ = state.slots[slot].flush_all_dirty_metadata();
+    // Read-only slot never got dirty, nothing to flush
+    if !state.slots[slot].reader.read_only {
+        let _ = state.slots[slot].finish_unmount();
+    }
     state.ready[slot] = false;
     state.slots[slot].block_cache = None;
     state.slots[slot].journal_inode_cached = None;
     state.mount_vnode[slot] = INVALID_VNODE;
     print_success!("  slot {} unmounted", slot);
+    // Hands the active role to another mounted slot, if there is one
     if state.active_slot == slot {
-        let other = 1 - slot;
-        if state.ready[other] {
+        if let Some(other) = (0..MAX_MOUNTS).find(|&i| i != slot && state.ready[i]) {
             state.active_slot = other;
             println!("  active slot switched to {}", other);
         }
@@ -119,41 +144,50 @@ fn parse_ext2_octal(s: &str) -> Option<u16> {
     Some(result)
 }
 
-fn parse_u16(s: &str) -> Option<u16> {
-    let mut result: u16 = 0;
+/// An id as typed. `u32`, the width an id has on disk: ext4 keeps the high half
+/// in `l_i_uid_high`
+fn parse_u32(s: &str) -> Option<u32> {
+    if s.is_empty() { return None; }
+    let mut result: u32 = 0;
     for &b in s.as_bytes() {
         if b < b'0' || b > b'9' { return None; }
-        result = result.checked_mul(10)?.checked_add((b - b'0') as u16)?;
+        result = result.checked_mul(10)?.checked_add((b - b'0') as u32)?;
     }
     Some(result)
 }
 
-/// Resolve a mount "drive index" to a block-layer device id. Indices 0-3 are
-/// the legacy ATA slots; 4-7 address PCI block devices (virtio-blk) that the
-/// boot-time probe registered.
+/// Mounts an ext filesystem. Indices 0-3 are the legacy ATA slots; 4-7 address
+/// PCI block devices (virtio-blk) the boot-time probe registered.
 pub fn cmd_ext2_mount(args: &str) {
-    let mut parts = args.split_whitespace();
+    // rw must be spelled out explicitly: a read-write mount stamps the
+    // superblock, replays the journal, and starts writing atimes
+    let want_rw = args.split_whitespace().any(|t| t == "rw");
+    let mut parts = args.split_whitespace().filter(|t| *t != "rw");
     let drive_str = parts.next().unwrap_or("");
     let part_str  = parts.next().unwrap_or("");
+    let mount = |drive: usize, lba: u32| -> bool {
+        if want_rw { try_mount(drive, lba) } else { try_mount_ro(drive, lba) }
+    };
 
     if drive_str.is_empty() {
         serial_println!("[miku_extfs] scanning all drives...");
 
-        let mut candidates: alloc::vec::Vec<ExtProbe> = alloc::vec::Vec::new();
+        // The shared scan walks GPT partitions too, not just LBA 0: an
+        // installed root always lives in a partition
+        let mut candidates: alloc::vec::Vec<FsProbe> = alloc::vec::Vec::new();
         let mut already_mounted: Option<usize> = None;
 
-        for i in 0..crate::fs::vfs::types::MAX_BLOCK_DEVICES {
-            if STATE.lock().is_already_mounted(i, 0) {
-                already_mounted = Some(i);
+        for probe in scan_volumes() {
+            if STATE.lock().is_already_mounted(probe.drive, probe.start_lba) {
+                already_mounted = Some(probe.drive);
                 continue;
             }
-            if let Some(probe) = probe_drive(i, 0) {
-                serial_println!(
-                    "[miku_extfs] drive {} - {} candidate (block={})",
-                    probe.drive, probe.fs_version, probe.block_size
-                );
-                candidates.push(probe);
-            }
+            serial_println!(
+                "[miku_extfs] drive {}:{} - {} candidate (block={}, label '{}')",
+                probe.drive, probe.start_lba, probe.version, probe.block_size,
+                probe.label_str()
+            );
+            candidates.push(probe);
         }
 
         match candidates.len() {
@@ -165,20 +199,20 @@ pub fn cmd_ext2_mount(args: &str) {
                 }
             }
             1 => {
-                let d = candidates[0].drive;
-                if !try_mount(d, 0) {
-                    print_error!("  failed to mount ext on drive {}", d);
+                let (d, lba) = (candidates[0].drive, candidates[0].start_lba);
+                if !mount(d, lba) {
+                    print_error!("  failed to mount ext on drive {}:{}", d, lba);
                 }
             }
             _ => {
                 print_error!("  multiple ext filesystems found:");
                 for c in &candidates {
                     println!(
-                        "    drive {}: {} ({} byte blocks)",
-                        c.drive, c.fs_version, c.block_size
+                        "    drive {}:{}  {} ({} byte blocks) labelled '{}'",
+                        c.drive, c.start_lba, c.version, c.block_size, c.label_str()
                     );
                 }
-                println!("  specify explicitly: ext4mount <drive>");
+                println!("  specify explicitly: ext4mount <drive> <lba>");
             }
         }
         return;
@@ -186,7 +220,7 @@ pub fn cmd_ext2_mount(args: &str) {
 
     let drive_idx = match drive_str.parse::<usize>() {
         Ok(n) if n <= 7 => n,
-        _ => { print_error!("  usage: ext2mount [drive 0-7] [partition]"); return; }
+        _ => { print_error!("  usage: ext2mount [drive 0-7] [partition] [rw]"); return; }
     };
 
     let start_lba: u32 = if !part_str.is_empty() {
@@ -197,7 +231,13 @@ pub fn cmd_ext2_mount(args: &str) {
         let dev = dev_for_idx(drive_idx);
         match crate::fs::gpt::gpt_read(dev) {
             Ok(tbl) => {
-                let entry = &tbl.entries[part_num - 1];
+                // part_num is 1-based user input, not an array index
+                let Some(entry) = tbl.entries.get(part_num - 1) else {
+                    print_error!(
+                        "  drive {} has {} partition slots, not {}",
+                        drive_idx, tbl.entries.len(), part_num);
+                    return;
+                };
                 if !entry.is_used() {
                     print_error!("  partition {} does not exist", part_num);
                     return;
@@ -210,122 +250,40 @@ pub fn cmd_ext2_mount(args: &str) {
         0u32
     };
 
-    if !try_mount(drive_idx, start_lba) {
+    if !mount(drive_idx, start_lba) {
         print_error!("  no extfs found on drive {} (start_lba={})", drive_idx, start_lba);
     }
 }
 
-/// Mount the persistent root disk (disk.img = ATA drive 1, primary slave) at
-/// the ext layer if it is not already mounted. Quiet, boot-safe wrapper around
-/// try_mount used by the firmware loader to bring /lib/firmware online. Returns
-/// true if an ext filesystem is mounted on drive 1 afterwards
+// ls/cat/stat/info share one implementation across ext2/3/4; output reflects
+// what the superblock actually reports, not which command name was typed
 pub fn cmd_ext2_ls(path: &str) {
-    let path = if path.is_empty() { "/" } else { path };
-    let result = with_ext2(|fs| -> Result<([DirEntry; 256], usize), FsError> {
-        let ino = fs.resolve_path(path)?;
-        let inode = fs.read_inode(ino)?;
-        if !inode.is_directory() { return Err(FsError::NotDirectory); }
-        let mut entries = [const { DirEntry::empty() }; 256];
-        let count = fs.read_dir(&inode, &mut entries)?;
-        Ok((entries, count))
-    });
-    match result {
-        Some(Ok((entries, count))) => {
-            println!("  ext2:{} ({} entries)", path, count);
-            for i in 0..count {
-                let e = &entries[i];
-                let name = e.name_str();
-                match e.file_type {
-                    FT_DIR     => cprintln!(0, 220, 220, "  d {}/", name),
-                    FT_SYMLINK => cprintln!(128, 222, 217, "  l {}@", name),
-                    _          => println!("  - {} (ino={})", name, e.inode),
-                }
-            }
-        }
-        Some(Err(e)) => print_error!("  ext2ls: {:?}", e),
-        None => print_error!("  no ext2/3/4 filesystem mounted (run ext2mount first)"),
-    }
+    super::ext_cmds_common::impl_ls(path, "ext2");
 }
 
 pub fn cmd_ext2_cat(path: &str) {
-    if path.is_empty() { println!("Usage: ext2cat <path>"); return; }
-    let result = with_ext2(|fs| -> Result<([u8; 512], usize, u64), FsError> {
-        let ino = fs.resolve_path(path)?;
-        let inode = fs.read_inode(ino)?;
-        if inode.is_directory() { return Err(FsError::IsDirectory); }
-        if !inode.is_regular() && !inode.is_symlink() { return Err(FsError::NotRegularFile); }
-        let size = inode.size();
-        let read_size = (size as usize).min(512);
-        let mut buf = [0u8; 512];
-        let n = fs.read_file(&inode, 0, &mut buf[..read_size])?;
-        Ok((buf, n, size))
-    });
-    match result {
-        Some(Ok((buf, n, size))) => {
-            if size > 512 { println!("  (showing first 512 of {} bytes)", size); }
-            let s = core::str::from_utf8(&buf[..n]).unwrap_or("(binary data)");
-            println!("{}", s);
-        }
-        Some(Err(e)) => print_error!("  ext2cat: {:?}", e),
-        None => print_error!("  no ext2/3/4 filesystem mounted (run ext2mount first)"),
-    }
+    super::ext_cmds_common::impl_cat(path, "ext2");
 }
 
 pub fn cmd_ext2_stat(path: &str) {
-    if path.is_empty() { println!("Usage: ext2stat <path>"); return; }
-    let result = with_ext2(|fs| -> Result<(u32, Inode), FsError> {
-        let ino = fs.resolve_path(path)?;
-        let inode = fs.read_inode(ino)?;
-        Ok((ino, inode))
-    });
-    match result {
-        Some(Ok((ino, inode))) => {
-            println!("  Inode: {}", ino);
-            println!("  Type:  {:?}", inode.file_type());
-            println!("  Mode:  0o{:o}", inode.permissions());
-            println!("  Size:  {} bytes", inode.size());
-            println!("  Links: {}", inode.links_count());
-            println!("  Blocks: {}", inode.blocks());
-            println!("  UID:   {}", inode.uid_full());
-            println!("  GID:   {}", inode.gid_full());
-            if inode.uses_extents() { println!("  Extents: yes"); }
-            if inode.has_inline_data() { println!("  Inline: yes"); }
-            if inode.is_fast_symlink() {
-                let target = inode.fast_symlink_target();
-                if let Ok(t) = core::str::from_utf8(target) { println!("  Target: {}", t); }
-            }
-        }
-        Some(Err(e)) => print_error!("  ext2stat: {:?}", e),
-        None => print_error!("  no ext2/3/4 filesystem mounted (run ext2mount first)"),
-    }
+    super::ext_cmds_common::impl_stat(path, "ext2");
 }
 
 pub fn cmd_ext2_info() {
-    let result = with_ext2(|fs| fs.fs_info());
-    match result {
-        Some(info) => {
-            println!("  Version: {}", info.version);
-            println!("  Block size: {} bytes", info.block_size);
-            println!("  Blocks: {} / {} used", info.total_blocks - info.free_blocks, info.total_blocks);
-            println!("  Inodes: {} / {} used", info.total_inodes - info.free_inodes, info.total_inodes);
-            println!("  Groups: {}", info.groups);
-            println!("  Inode size: {} bytes", info.inode_size);
-            println!("  Journal: {}", if info.has_journal { "yes" } else { "no" });
-            println!("  Extents: {}", if info.has_extents { "yes" } else { "no" });
-        }
-        None => print_error!("  no ext2/3/4 filesystem mounted (run ext2mount first)"),
-    }
+    super::ext_cmds_common::impl_info("ext2");
 }
 
 pub fn cmd_ext2_write(path: &str, text: &str) {
     if path.is_empty() || text.is_empty() { println!("Usage: ext2write <path> <text>"); return; }
     let disk_sw = crate::kcore::time::Stopwatch::start();
-    let result = with_ext2(|fs| -> Result<u32, FsError> {
+    let result = with_ext2_pub(|fs| -> Result<u32, FsError> {
         let (parent_ino, filename) = resolve_parent_and_name(fs, path)?;
         let data = text.as_bytes();
         fs.ext3_write_file_create_or_overwrite(parent_ino, filename, 0o644, data)
     });
     let disk_ms = disk_sw.elapsed_ms();
+    // Written by inode, past the VFS: no cached page of it may outlive this
+    crate::fs::vfs::core::changed_below_vfs();
     let render_sw = crate::kcore::time::Stopwatch::start();
     match result {
         Some(Ok(ino)) => print_success!("  written to inode {}  [disk {}ms]", ino, disk_ms),
@@ -338,10 +296,12 @@ pub fn cmd_ext2_write(path: &str, text: &str) {
 
 pub fn cmd_ext2_mkdir(path: &str) {
     if path.is_empty() { println!("Usage: ext2mkdir <path>"); return; }
-    let result = with_ext2(|fs| -> Result<u32, FsError> {
+    let result = with_ext2_pub(|fs| -> Result<u32, FsError> {
         let (parent_ino, dirname) = resolve_parent_and_name(fs, path)?;
         fs.ext3_create_dir(parent_ino, dirname, 0o755)
     });
+    // Changed past the VFS, by inode number
+    crate::fs::vfs::core::changed_below_vfs();
     match result {
         Some(Ok(ino)) => print_success!("  created dir inode {}", ino),
         Some(Err(e))  => print_error!("  ext2mkdir: {:?}", e),
@@ -351,10 +311,12 @@ pub fn cmd_ext2_mkdir(path: &str) {
 
 pub fn cmd_ext2_rm(path: &str) {
     if path.is_empty() { println!("Usage: ext2rm <path>"); return; }
-    let result = with_ext2(|fs| -> Result<(), FsError> {
+    let result = with_ext2_pub(|fs| -> Result<(), FsError> {
         let (parent_ino, name) = resolve_parent_and_name(fs, path)?;
         fs.ext3_delete_file(parent_ino, name)
     });
+    // Changed past the VFS, by inode number
+    crate::fs::vfs::core::changed_below_vfs();
     match result {
         Some(Ok(())) => print_success!("  deleted"),
         Some(Err(e)) => print_error!("  ext2rm: {:?}", e),
@@ -364,10 +326,12 @@ pub fn cmd_ext2_rm(path: &str) {
 
 pub fn cmd_ext2_rmdir(path: &str) {
     if path.is_empty() { println!("Usage: ext2rmdir <path>"); return; }
-    let result = with_ext2(|fs| -> Result<(), FsError> {
+    let result = with_ext2_pub(|fs| -> Result<(), FsError> {
         let (parent_ino, name) = resolve_parent_and_name(fs, path)?;
         fs.ext3_delete_dir(parent_ino, name)
     });
+    // Changed past the VFS, by inode number
+    crate::fs::vfs::core::changed_below_vfs();
     match result {
         Some(Ok(())) => print_success!("  removed dir"),
         Some(Err(e)) => print_error!("  ext2rmdir: {:?}", e),
@@ -377,10 +341,12 @@ pub fn cmd_ext2_rmdir(path: &str) {
 
 pub fn cmd_ext2_rm_rf(path: &str) {
     if path.is_empty() { println!("Usage: ext2rm -rf <path>"); return; }
-    let result = with_ext2(|fs| -> Result<u32, FsError> {
+    let result = with_ext2_pub(|fs| -> Result<u32, FsError> {
         let (parent_ino, name) = resolve_parent_and_name(fs, path)?;
         fs.ext2_delete_recursive(parent_ino, name)
     });
+    // Changed past the VFS, by inode number
+    crate::fs::vfs::core::changed_below_vfs();
     match result {
         Some(Ok(n))  => print_success!("  removed {} entries", n),
         Some(Err(e)) => print_error!("  ext2rm -rf: {:?}", e),
@@ -390,10 +356,12 @@ pub fn cmd_ext2_rm_rf(path: &str) {
 
 pub fn cmd_ext2_symlink(target: &str, linkname: &str) {
     if target.is_empty() || linkname.is_empty() { println!("Usage: ext2ln -s <target> <linkname>"); return; }
-    let result = with_ext2(|fs| -> Result<u32, FsError> {
+    let result = with_ext2_pub(|fs| -> Result<u32, FsError> {
         let (parent_ino, name) = resolve_parent_and_name(fs, linkname)?;
         fs.ext2_create_symlink(parent_ino, name, target)
     });
+    // Changed past the VFS, by inode number
+    crate::fs::vfs::core::changed_below_vfs();
     match result {
         Some(Ok(ino)) => print_success!("  symlink inode {} -> {}", ino, target),
         Some(Err(e))  => print_error!("  ext2ln: {:?}", e),
@@ -403,7 +371,7 @@ pub fn cmd_ext2_symlink(target: &str, linkname: &str) {
 
 pub fn cmd_ext2_rename(old_path: &str, new_name: &str) {
     if old_path.is_empty() || new_name.is_empty() { println!("Usage: ext2mv <path> <newname>"); return; }
-    let result = with_ext2(|fs| -> Result<(), FsError> {
+    let result = with_ext2_pub(|fs| -> Result<(), FsError> {
         let (parent_ino, old_name) = resolve_parent_and_name(fs, old_path)?;
         let actual_new_name = match new_name.rfind('/') {
             Some(pos) => &new_name[pos + 1..],
@@ -412,6 +380,8 @@ pub fn cmd_ext2_rename(old_path: &str, new_name: &str) {
         if actual_new_name.is_empty() { return Err(FsError::InvalidInode); }
         fs.ext2_rename(parent_ino, old_name, actual_new_name)
     });
+    // Changed past the VFS, by inode number
+    crate::fs::vfs::core::changed_below_vfs();
     match result {
         Some(Ok(())) => print_success!("  renamed"),
         Some(Err(e)) => print_error!("  ext2mv: {:?}", e),
@@ -423,7 +393,7 @@ pub fn cmd_ext2_chmod(mode_str: &str, path: &str) {
     if mode_str.is_empty() || path.is_empty() { println!("Usage: ext2chmod <mode> <path>"); return; }
     let mode = parse_ext2_octal(mode_str);
     if mode.is_none() { print_error!("  invalid mode '{}'", mode_str); return; }
-    let result = with_ext2(|fs| -> Result<(), FsError> {
+    let result = with_ext2_pub(|fs| -> Result<(), FsError> {
         let ino = fs.resolve_path(path)?;
         fs.ext2_chmod(ino, mode.unwrap())
     });
@@ -436,11 +406,11 @@ pub fn cmd_ext2_chmod(mode_str: &str, path: &str) {
 
 pub fn cmd_ext2_chown(uid_str: &str, gid_str: &str, path: &str) {
     if uid_str.is_empty() || path.is_empty() { println!("Usage: ext2chown <uid> <gid> <path>"); return; }
-    let uid = match parse_u16(uid_str) { Some(v) => v, None => { print_error!("  invalid uid"); return; } };
+    let uid = match parse_u32(uid_str) { Some(v) => v, None => { print_error!("  invalid uid"); return; } };
     let gid = if gid_str.is_empty() { uid } else {
-        match parse_u16(gid_str) { Some(v) => v, None => { print_error!("  invalid gid"); return; } }
+        match parse_u32(gid_str) { Some(v) => v, None => { print_error!("  invalid gid"); return; } }
     };
-    let result = with_ext2(|fs| -> Result<(), FsError> {
+    let result = with_ext2_pub(|fs| -> Result<(), FsError> {
         let ino = fs.resolve_path(path)?;
         fs.ext2_chown(ino, uid, gid)
     });
@@ -453,7 +423,7 @@ pub fn cmd_ext2_chown(uid_str: &str, gid_str: &str, path: &str) {
 
 pub fn cmd_ext2_cp(src: &str, dst: &str) {
     if src.is_empty() || dst.is_empty() { println!("Usage: ext2cp <src> <dst>"); return; }
-    let result = with_ext2(|fs| -> Result<u32, FsError> {
+    let result = with_ext2_pub(|fs| -> Result<u32, FsError> {
         let src_ino = fs.resolve_path(src)?;
         let (dst_parent_ino, dst_name) = resolve_parent_and_name(fs, dst)?;
         fs.ext4_copy_file(src_ino, dst_parent_ino, dst_name)
@@ -466,74 +436,20 @@ pub fn cmd_ext2_cp(src: &str, dst: &str) {
 }
 
 pub fn cmd_ext2_du(path: &str) {
-    let path = if path.is_empty() { "/" } else { path };
-    let result = with_ext2(|fs| -> Result<(u32, u64), FsError> {
-        let ino = fs.resolve_path(path)?;
-        fs.ext2_dir_size(ino)
-    });
-    match result {
-        Some(Ok((files, bytes))) => {
-            println!("  {} files, {} bytes total", files, bytes);
-            if bytes >= 1024 { println!("  ({} KB)", bytes / 1024); }
-        }
-        Some(Err(e)) => print_error!("  ext2du: {:?}", e),
-        None         => print_error!("  no ext2/3/4 filesystem mounted"),
-    }
+    super::ext_cmds_common::impl_du(path, "ext2");
 }
 
 pub fn cmd_ext2_tree(path: &str) {
-    let path = if path.is_empty() { "/" } else { path };
-    let mut tree = TreeResult::new();
-    let result = with_ext2(|fs| -> Result<(), FsError> {
-        let ino = fs.resolve_path(path)?;
-        fs.ext2_tree(ino, "", &mut tree)
-    });
-    match result {
-        Some(Ok(())) => {
-            cprintln!(0, 220, 220, "  {}", path);
-            for i in 0..tree.count {
-                let e = &tree.entries[i];
-                let depth = e.depth as usize;
-                for _ in 0..depth { cprint!(120, 140, 140, "    "); }
-                if e.is_last { cprint!(120, 140, 140, "/ "); } else { cprint!(120, 140, 140, "--- "); }
-                if e.is_dir { cprintln!(0, 220, 220, "{}/", e.name_str()); }
-                else if e.is_symlink { cprintln!(128, 222, 217, "{}@", e.name_str()); }
-                else { cprintln!(230, 240, 240, "{} ({}b)", e.name_str(), e.size); }
-            }
-            println!("  {} entries", tree.count);
-        }
-        Some(Err(e)) => print_error!("  ext2tree: {:?}", e),
-        None         => print_error!("  no ext2/3/4 filesystem mounted"),
-    }
+    super::ext_cmds_common::impl_tree(path, "ext2");
 }
 
-pub fn cmd_ext2_fsck() {
-    let result = with_ext2(|fs| fs.ext2_fsck());
-    match result {
-        Some(r) => {
-            if !r.checked { print_error!("  fsck failed to run"); return; }
-            cprintln!(57, 197, 187, "  ext2 filesystem check");
-            println!("  Block size:   {} bytes", r.block_size);
-            println!("  Total blocks: {}", r.total_blocks);
-            println!("  Free blocks:  {}", r.free_blocks);
-            println!("  Total inodes: {}", r.total_inodes);
-            println!("  Free inodes:  {}", r.free_inodes);
-            println!("  Used inodes:  {}", r.used_inodes);
-            if r.bad_magic     { print_error!("  error: bad superblock magic"); }
-            if !r.root_ok      { print_error!("  error: cannot read root inode"); }
-            if r.root_not_dir  { print_error!("  error: root inode is not a directory"); }
-            if r.bad_groups > 0 { print_error!("  error: {} bad group descriptors", r.bad_groups); }
-            if r.orphan_inodes > 0 { cprintln!(220, 220, 100, "  warning: {} orphan inodes", r.orphan_inodes); }
-            if r.errors == 0 { print_success!("  filesystem ok"); }
-            else { print_error!("  {} errors found", r.errors); }
-        }
-        None => print_error!("  no ext2/3/4 filesystem mounted"),
-    }
+pub fn cmd_ext2_fsck(repair: bool) {
+    super::ext_cmds_common::impl_fsck(repair);
 }
 
 pub fn cmd_ext2_append(path: &str, text: &str) {
     if path.is_empty() || text.is_empty() { println!("Usage: ext2append <path> <text>"); return; }
-    let result = with_ext2(|fs| -> Result<usize, FsError> {
+    let result = with_ext2_pub(|fs| -> Result<usize, FsError> {
         let ino = fs.resolve_path(path)?;
         fs.ext2_append_file(ino, text.as_bytes())
     });
@@ -546,7 +462,7 @@ pub fn cmd_ext2_append(path: &str, text: &str) {
 
 pub fn cmd_ext2_hardlink(existing: &str, linkname: &str) {
     if existing.is_empty() || linkname.is_empty() { println!("Usage: ext2link <existing> <linkname>"); return; }
-    let result = with_ext2(|fs| -> Result<(), FsError> {
+    let result = with_ext2_pub(|fs| -> Result<(), FsError> {
         let target_ino = fs.resolve_path(existing)?;
         let (parent_ino, name) = resolve_parent_and_name(fs, linkname)?;
         fs.ext2_hardlink(parent_ino, name, target_ino)
@@ -559,7 +475,7 @@ pub fn cmd_ext2_hardlink(existing: &str, linkname: &str) {
 }
 
 pub fn cmd_ext2_cache() {
-    let result = with_ext2(|fs| match &fs.block_cache {
+    let result = with_ext2_pub(|fs| match &fs.block_cache {
         Some(c) => {
             cprintln!(57, 197, 187, "  Block Cache");
             println!("  Entries:   {}/{}", c.cached_entries(), c.capacity());
@@ -575,7 +491,7 @@ pub fn cmd_ext2_cache() {
 }
 
 pub fn cmd_ext2_cache_flush() {
-    let result = with_ext2(|fs| {
+    let result = with_ext2_pub(|fs| {
         if let Some(ref mut c) = fs.block_cache {
             c.clear();
             print_success!("  cache flushed");

@@ -37,7 +37,8 @@ pub struct AtaDrive {
     role:      AtaRole,
     /// Bus-master DMA capability cache: 0 = unknown, 1 = usable, 2 = PIO only
     dma_state: u8,
-    /// TRIM capability cache, same encoding (needs DMA + IDENTIFY word 169 bit 0)
+    /// TRIM capability cache, same encoding (needs DMA + IDENTIFY word 169 bit
+    /// 0)
     trim_state: u8,
 }
 
@@ -130,7 +131,7 @@ impl AtaDrive {
 
     unsafe fn prepare_pio(&mut self, lba: u32, count: u8, cmd: u8) -> Result<(), AtaError> {
         let bp = self.base_port;
-        
+
         if Port::<u8>::new(bp + 7).read() == 0xFF {
             return Err(AtaError::NoDevice);
         }
@@ -261,10 +262,10 @@ impl AtaDrive {
         }
     }
 
-    //                              LBA48 
+    //                              LBA48
     // Program the task-file registers for a 48-bit LBA PIO transfer. The high
-    // bytes are written first, then the low bytes, into the same registers
-    // (the controller keeps a 2-deep FIFO per register)
+    // bytes are written first, then the low bytes, into the same registers (the
+    // controller keeps a 2-deep FIFO per register)
     unsafe fn prepare_pio48(&mut self, lba: u64, count: u16, cmd: u8) -> Result<(), AtaError> {
         let bp = self.base_port;
 
@@ -275,7 +276,8 @@ impl AtaDrive {
         Port::<u8>::new(self.control_port()).write(0x02);
         self.wait_not_busy()?;
 
-        // Device register: LBA mode, master/slave; LBA bits live in the LBA regs
+        // Device register: LBA mode, master/slave; LBA bits live in the LBA
+        // regs
         let dev = if self.role == AtaRole::Slave { 1u8 << 4 } else { 0 };
         Port::<u8>::new(bp + 6).write(0x40 | dev);
         self.delay_400ns();
@@ -395,14 +397,14 @@ impl AtaDrive {
 //
 // PCI IDE controllers expose a Bus Master register block via BAR4: 8 bytes per
 // channel (command, status, PRDT pointer). One PRD entry covering a 64 KiB
-// bounce buffer moves up to 128 sectors per command, replacing the per-word
-// port I/O of PIO; under KVM that is thousands of VM exits saved per request.
-// Completion is detected via the IRQ14/15 flags ('interrupts::ATA_*_IRQ')
-// backed up by polling the BM status register, so it works with or without
-// interrupts enabled
+// bounce buffer moves up to 128 sectors per command, avoiding the per-word port
+// I/O of PIO and thousands of VM exits per request under KVM. Completion is
+// detected via the IRQ14/15 flags ('interrupts::ATA_*_IRQ') backed up by
+// polling the BM status register, so it works with or without interrupts
+// enabled
 
 extern crate alloc;
-use alloc::boxed::Box;
+use crate::mm::dma::DmaBox;
 use spin::Mutex;
 
 const CMD_READ_DMA:      u8 = 0xC8;
@@ -428,9 +430,12 @@ struct ChannelDma {
     prdt:   [u8; 8],
 }
 
+// SAFETY: bytes only
+unsafe impl crate::mm::dma::Zeroed for ChannelDma {}
+
 struct BmChannel {
     bm_base: u16,
-    mem:     Box<ChannelDma>,
+    mem:     DmaBox<ChannelDma>,
 }
 
 static BM_PRIMARY:   Mutex<Option<BmChannel>> = Mutex::new(None);
@@ -454,53 +459,40 @@ fn irq_flag(base_port: u16) -> &'static core::sync::atomic::AtomicBool {
 pub fn dma_init() {
     use crate::drivers::bus::pci::{pci_read32, pci_read8};
 
-    let mut bm_base: Option<u16> = None;
-    'scan: for bus in 0..=255u8 {
-        for dev in 0..32u8 {
-            for func in 0..8u8 {
-                let id = pci_read32(bus, dev, func, 0x00);
-                if (id & 0xFFFF) as u16 == 0xFFFF {
-                    if func == 0 { break; }
-                    continue;
-                }
-                let class_rev = pci_read32(bus, dev, func, 0x08);
-                let class    = (class_rev >> 24) as u8;
-                let subclass = (class_rev >> 16) as u8;
-                if class == 0x01 && subclass == 0x01 {
-                    let bar4 = pci_read32(bus, dev, func, 0x10 + 4 * 4);
-                    if bar4 & 1 != 0 {
-                        // Enable I/O + memory + bus mastering
-                        let cmd_off = 0x04u8;
-                        let cmd = pci_read32(bus, dev, func, cmd_off);
-                        unsafe {
-                            Port::<u32>::new(crate::drivers::bus::pci::PCI_ADDR)
-                                .write(crate::drivers::bus::pci::pci_addr(bus, dev, func, cmd_off));
-                            Port::<u32>::new(crate::drivers::bus::pci::PCI_DATA)
-                                .write(cmd | 0x0007);
-                        }
-                        bm_base = Some((bar4 & !3) as u16);
-                        crate::serial_println!(
-                            "[ata] IDE controller {:02x}:{:02x}.{} bus-master base=0x{:04X}",
-                            bus, dev, func, bm_base.unwrap()
-                        );
-                        break 'scan;
-                    }
-                }
-                if func == 0 && (pci_read8(bus, dev, func, 0x0E) & 0x80) == 0 {
-                    break;
-                }
-            }
+    // Class 01 subclass 01 is an IDE controller; BAR4 is its bus-master
+    // register block and lives in I/O space
+    let bm_base = crate::drivers::bus::pci::find(|d| {
+        d.class == 0x01 && d.subclass == 0x01 && d.bars[4] & 1 != 0
+    })
+    .map(|d| {
+        // I/O + memory + bus mastering
+        let cmd = pci_read32(d.bus, d.dev, d.func, 0x04);
+        unsafe {
+            Port::<u32>::new(crate::drivers::bus::pci::PCI_ADDR)
+                .write(crate::drivers::bus::pci::pci_addr(d.bus, d.dev, d.func, 0x04));
+            Port::<u32>::new(crate::drivers::bus::pci::PCI_DATA).write(cmd | 0x0007);
         }
-    }
+        let base = (d.bars[4] & !3) as u16;
+        crate::serial_println!(
+            "[ata] IDE controller {:02x}:{:02x}.{} bus-master base=0x{:04X}",
+            d.bus, d.dev, d.func, base
+        );
+        base
+    });
 
     let Some(base) = bm_base else {
-        crate::serial_println!("[ata] no bus-master IDE controller - PIO only");
+        crate::serial_println!("[ata] no bus-master IDE controller, PIO only");
         return;
     };
 
-    let mk = || Box::new(ChannelDma { bounce: [0u8; BOUNCE_BYTES], prdt: [0u8; 8] });
-    *BM_PRIMARY.lock()   = Some(BmChannel { bm_base: base,     mem: mk() });
-    *BM_SECONDARY.lock() = Some(BmChannel { bm_base: base + 8, mem: mk() });
+    // Bus mastering IDE addresses 32 bits: a PRD entry is a 32-bit address
+    let mk = || DmaBox::<ChannelDma>::new_below(crate::mm::dma::DMA32).ok();
+    let (Some(primary), Some(secondary)) = (mk(), mk()) else {
+        crate::serial_println!("[ata] no memory below 4 GiB for DMA, PIO only");
+        return;
+    };
+    *BM_PRIMARY.lock()   = Some(BmChannel { bm_base: base,     mem: primary });
+    *BM_SECONDARY.lock() = Some(BmChannel { bm_base: base + 8, mem: secondary });
     crate::serial_println!("[ata] DMA channels ready (primary/secondary, 64 KiB bounce each)");
 }
 
@@ -544,7 +536,8 @@ impl AtaDrive {
         Ok(())
     }
 
-    /// One bus-master DMA transfer of up to 'DMA_MAX_SECTORS' sectors through the channel bounce buffer
+    /// One bus-master DMA transfer of up to 'DMA_MAX_SECTORS' sectors through
+    /// the channel bounce buffer
     fn dma_transfer(&mut self, lba: u64, sectors: u32, write: bool, buf_in: &[u8], buf_out: &mut [u8])
         -> Result<(), AtaError>
     {
@@ -560,8 +553,8 @@ impl AtaDrive {
         }
 
         // PRDT must live below 4 GiB for the 32-bit bus-master engine
-        let bounce_phys = crate::net::virt_to_phys(ch.mem.bounce.as_ptr() as u64);
-        let prdt_phys   = crate::net::virt_to_phys(ch.mem.prdt.as_ptr() as u64);
+        let bounce_phys = ch.mem.phys_of(ch.mem.bounce.as_ptr());
+        let prdt_phys   = ch.mem.phys_of(ch.mem.prdt.as_ptr());
         if bounce_phys + bytes as u64 > u32::MAX as u64 || prdt_phys > u32::MAX as u64 {
             return Err(AtaError::DeviceFault);
         }
@@ -592,7 +585,8 @@ impl AtaDrive {
             let dir = if write { 0 } else { BM_CMD_READ };
             Port::<u8>::new(bm).write(BM_CMD_START | dir);
 
-            // Wait for completion: IRQ flag (vector 0x2E/0x2F), BM IRQ status  bit, or the engine going idle - whichever lands first
+            // Wait for completion: IRQ flag (vector 0x2E/0x2F), BM IRQ status
+            // bit, or the engine going idle, whichever lands first
             let mut status_port = Port::<u8>::new(bm + 2);
             let mut spins = 0u64;
             let ok = loop {
@@ -633,7 +627,8 @@ impl AtaDrive {
 
     /// Program the task file for DATA SET MANAGEMENT / TRIM: FEATURES bit 0
     /// selects TRIM, COUNT is the number of 512-byte range blocks (always 1
-    /// here). 48-bit registers take high byte first, like 'prepare_dma_taskfile'
+    /// here). 48-bit registers take high byte first, like
+    /// 'prepare_dma_taskfile'
     unsafe fn prepare_dsm_taskfile(&mut self) -> Result<(), AtaError> {
         let bp = self.base_port;
         if Port::<u8>::new(bp + 7).read() == 0xFF {
@@ -675,8 +670,8 @@ impl AtaDrive {
 
         ch.mem.bounce[..512].copy_from_slice(block);
 
-        let bounce_phys = crate::net::virt_to_phys(ch.mem.bounce.as_ptr() as u64);
-        let prdt_phys   = crate::net::virt_to_phys(ch.mem.prdt.as_ptr() as u64);
+        let bounce_phys = ch.mem.phys_of(ch.mem.bounce.as_ptr());
+        let prdt_phys   = ch.mem.phys_of(ch.mem.prdt.as_ptr());
         if bounce_phys + 512 > u32::MAX as u64 || prdt_phys > u32::MAX as u64 {
             return Err(AtaError::DeviceFault);
         }
@@ -783,8 +778,8 @@ impl From<AtaError> for BlkError {
 
 impl AtaDrive {
     /// SMART RETURN STATUS (0xB0 / feature 0xDA): the device answers through
-    /// the LBA mid/high registers - 0x4F/0xC2 = healthy, 0xF4/0x2C = failing.
-    /// None when the drive ignores SMART entirely
+    /// the LBA mid/high registers, 0x4F/0xC2 = healthy, 0xF4/0x2C = failing.
+    /// None when the drive ignores SMART
     fn smart_status(&mut self) -> Option<bool> {
         if self.base_port == 0 {
             return None;
@@ -823,11 +818,10 @@ impl AtaDrive {
     }
 }
 
-/// Block-layer wrapper: the block layer now dispatches I/O through '&self'
-/// driver methods (no device-wide lock), so the mutable ATA driver lives
-/// behind an internal mutex. The legacy ATA port registers are still shared
-/// per channel, so this also keeps two drives on one channel serialized.
-/// 'AtaDrive' itself is untouched - swap/mkfs keep using it directly
+/// Block-layer wrapper: I/O goes through '&self' driver methods, so the mutable
+/// ATA driver lives behind an internal mutex. The legacy ATA port registers are
+/// shared per channel, so this also serializes two drives on one channel.
+/// swap/mkfs use 'AtaDrive' directly
 pub struct AtaBlockDev(spin::Mutex<AtaDrive>);
 
 impl AtaBlockDev {

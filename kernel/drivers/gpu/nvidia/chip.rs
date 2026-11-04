@@ -1,26 +1,25 @@
-//////////////////////////////////////////////////////////////////////////////////////////////
-//               NVIDIA chip identification via PMC_BOOT_0 (offset 0x000000)                //
-//                                                                                          //
-// PMC_BOOT_0 layout:                                                                       //
-//   [31:28] architecture family (NV4/NV10/.../Turing=0x16, Ampere=0x17)                    //
-//   [27:20] implementation (specific chip within the family)                               //
-//   [19:16] major revision                                                                 //
-//   [15:8]  minor revision                                                                 //
-//   [7:0]   stepping                                                                       //
-//                                                                                          //
-// Architecture codes (high nibble of the arch byte):                                       //
-//   Turing      = 0x16   Ampere   = 0x17   Hopper = 0x18   Ada Lovelace = 0x19             //
-//   Blackwell   = 0x1A (consumer) / 0x1B (datacenter, GB100)                               //
-//                                                                                          //
-// Implementations seen in the wild (impl nibble):                                          //
-//   Turing: TU102=0x2 TU104=0x4 TU106=0x6 TU117=0x7 TU116=0x8                              //
-//   Ampere: GA100=0x0 GA102=0x2 GA103=0x3 GA104=0x4 GA106=0x6 GA107=0x7                    //
-//   Ada:    AD102=0x2 AD103=0x3 AD104=0x4 AD106=0x6 AD107=0x7                              //
-//                                                                                          //
-// GTX 1650 is TU117 (primary variant) or TU116 (some GDDR6 refreshes)                      //
-//////////////////////////////////////////////////////////////////////////////////////////////
+// NVIDIA chip identification via PMC_BOOT_0 (offset 0x000000)
+//
+// PMC_BOOT_0 layout, from NV_PMC_BOOT_0_* in OpenRM's nv_ref.h:108-136:
+//   [28:24] architecture (ARCHITECTURE_0)
+//   [23:20] implementation (the chip within the architecture)
+//   [8]     ARCHITECTURE_1, an extension of the architecture field, not decoded here
+//   [7:4]   major revision
+//   [3:0]   minor revision
+//
+// Architecture codes:
+//   Turing      = 0x16   Ampere   = 0x17   Hopper = 0x18   Ada Lovelace = 0x19
+//   Blackwell   = 0x1A (datacenter, GB100) / 0x1B (consumer, GB200)
+//
+// Implementations seen in the wild (impl nibble):
+//   Turing: TU102=0x2 TU104=0x4 TU106=0x6 TU117=0x7 TU116=0x8
+//   Ampere: GA100=0x0 GA102=0x2 GA103=0x3 GA104=0x4 GA106=0x6 GA107=0x7
+//   Ada:    AD102=0x2 AD103=0x3 AD104=0x4 AD106=0x6 AD107=0x7
+//
+// GTX 1650 is TU117 (primary variant) or TU116 (some GDDR6 refreshes)
 
-pub const PMC_BOOT_0: u32 = 0x0000_0000;
+// The register this module decodes. One definition, in the host register map
+pub use super::regs::PMC_BOOT_0;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Architecture {
@@ -58,21 +57,6 @@ impl Architecture {
         }
     }
 
-    /// True for every architecture that ships a GSP (GPU System Processor)
-    /// and therefore requires the signed-firmware offload path for anything
-    /// past host-side bring-up. Turing is the first GSP generation; every
-    /// later family keeps it
-    pub fn has_gsp(&self) -> bool {
-        matches!(
-            self,
-            Architecture::Turing
-                | Architecture::Ampere
-                | Architecture::Hopper
-                | Architecture::AdaLovelace
-                | Architecture::Blackwell
-        )
-    }
-
     /// True if the driver recognizes this family well enough to attempt a
     /// host-side bring-up (BAR map, chip-ID, MSI, VBIOS, PMC, thermal,
     /// Falcon liveness). Unknown families are still probed but flagged
@@ -83,12 +67,15 @@ impl Architecture {
 
 #[derive(Copy, Clone, Debug)]
 pub struct ChipId {
+    /// The register this was decoded from: BOOT_0 or BOOT_42, whichever
+    /// constructor made it
     pub raw: u32,
     pub arch: Architecture,
+    /// The architecture as a number, which is what tells GB10x from GB20x
+    arch_code: u8,
     pub implementation: u8,
     pub major_rev: u8,
     pub minor_rev: u8,
-    pub stepping: u8,
 }
 
 impl ChipId {
@@ -96,17 +83,33 @@ impl ChipId {
         let arch_code = ((raw >> 24) & 0x1F) as u8;
         let arch = Architecture::from_code(arch_code);
         let implementation = ((raw >> 20) & 0xF) as u8;
-        let major_rev = ((raw >> 16) & 0xF) as u8;
-        let minor_rev = ((raw >> 8) & 0xFF) as u8;
-        let stepping  = (raw & 0xFF) as u8;
-        Self { raw, arch, implementation, major_rev, minor_rev, stepping }
+        let major_rev = ((raw >> 4) & 0xF) as u8;
+        let minor_rev = (raw & 0xF) as u8;
+        Self { raw, arch, arch_code, implementation, major_rev, minor_rev }
     }
 
-    /// Raw architecture byte from PMC_BOOT_0 (bits [28:24]). Needed to tell
-    /// the two Blackwell lines apart: 0x1A is datacenter (GB10x), 0x1B is
-    /// consumer (GB20x, RTX 50 series); both decode to Architecture::Blackwell
+    /// Decode PMC_BOOT_42 (0xa00): ARCHITECTURE 29:24, IMPLEMENTATION 23:20,
+    /// MAJOR_REVISION 19:16, MINOR_REVISION 15:12 (`nv_ref.h:149-155`).
+    ///
+    /// OpenRM chooses a chip's HAL from this one (`gpu_mgr.c:1264`). BOOT_0
+    /// gives the same architecture and implementation on every chip here
+    pub fn from_boot42(raw: u32) -> Self {
+        let arch_code = ((raw >> 24) & 0x3F) as u8;
+        Self {
+            raw,
+            arch: Architecture::from_code(arch_code),
+            arch_code,
+            implementation: ((raw >> 20) & 0xF) as u8,
+            major_rev: ((raw >> 16) & 0xF) as u8,
+            minor_rev: ((raw >> 12) & 0xF) as u8,
+        }
+    }
+
+    /// The architecture number. Needed to tell the two Blackwell lines apart:
+    /// 0x1A is datacenter (GB10x), 0x1B is consumer (GB20x, RTX 50 series);
+    /// both decode to Architecture::Blackwell
     pub fn arch_byte(&self) -> u8 {
-        ((self.raw >> 24) & 0x1F) as u8
+        self.arch_code
     }
 
     /// Short codename such as "TU117" or "GB206". Covers Turing through

@@ -3,33 +3,38 @@
 // Each CPU has its own 'Cpu' struct. Access is via GS base: the first field
 // ('cpu_index') sits at 'gs:[0]' so any CPU can identify itself cheaply
 //
-// // Memory model
-//
-// All fields are atomic or protected by a per-CPU spinlock. A CPU is always
-// allowed to touch its own data with interrupts disabled (no lock needed),  but remote wakeups/pushes MUST take the target's run queue lock
+// Memory model: all fields are atomic or protected by a per-CPU spinlock.
+// A CPU may always touch its own data with interrupts disabled (no lock
+// needed), but remote wakeups/pushes MUST take the target's run queue lock
 
 use core::cell::UnsafeCell;
-use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use crate::process::Process;
+use crate::sched::slot_heap::SlotHeap;
 
 pub const MAX_CPUS: usize = 64;
 
 // run queue primitive //
 
-#[repr(C)]
+/// The tasks ready to run on one CPU, least vruntime first: a heap whose
+/// slot in each task is `Process::rq_slot` (`sched::runqueue`)
 pub struct RunQueueInner {
-    pub head: *mut Process,
-    pub tail: *mut Process,
-    pub len:  usize,
+    pub heap: SlotHeap,
 }
 
-unsafe impl Send for RunQueueInner {}
+impl RunQueueInner {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.heap.len()
+    }
+}
 
 pub struct RunQueue {
     lock:  AtomicBool,
     inner: UnsafeCell<RunQueueInner>,
+    /// The heap's length, stored under the lock each time it is let go: what
+    /// an idle CPU polls and a wake compares CPUs by, without the lock
+    queued: AtomicUsize,
 }
 
 unsafe impl Sync for RunQueue {}
@@ -38,7 +43,8 @@ impl RunQueue {
     pub const fn new() -> Self {
         Self {
             lock:  AtomicBool::new(false),
-            inner: UnsafeCell::new(RunQueueInner { head: null_mut(), tail: null_mut(), len: 0 }),
+            inner: UnsafeCell::new(RunQueueInner { heap: SlotHeap::new(|p| &p.rq_slot) }),
+            queued: AtomicUsize::new(0),
         }
     }
 
@@ -56,16 +62,14 @@ impl RunQueue {
 
     #[inline]
     fn release(&self) {
+        self.queued.store(unsafe { (*self.inner.get()).len() }, Ordering::Relaxed);
         self.lock.store(false, Ordering::Release);
     }
 
-    /// The timer ISR walks this queue (schedule_from_isr), so the lock must
-    /// never be held with interrupts on: the tick would land on the same CPU
-    /// and spin forever on a lock only the interrupted code can release.
-    /// Most callers already wrap themselves in without_interrupts; disabling
-    /// here as well makes that a property of the lock instead of a rule every
-    /// future caller has to remember (nesting is free - IF is simply restored
-    /// to what it was)
+    /// The timer ISR walks this queue (schedule_from_isr), so the lock is never
+    /// held with interrupts on: the tick would land on the same CPU and spin on
+    /// a lock only the interrupted code can release. Disabling here makes that
+    /// a property of the lock (nesting is free: IF is restored to what it was)
     pub fn with<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut RunQueueInner) -> R,
@@ -97,7 +101,14 @@ impl RunQueue {
     }
 
     pub fn len(&self) -> usize {
-        self.with(|inner| inner.len)
+        self.with(|inner| inner.len())
+    }
+
+    /// The length as the last holder left it, without the lock: a hint, or
+    /// exact after a full fence that follows the store (`sched::idle`)
+    #[inline]
+    pub fn queued(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
     }
 }
 
@@ -132,6 +143,29 @@ pub struct Cpu {
     pub pf_stack:       AtomicU64,
     /// Virtual address of syscall-entry stack top
     pub sysc_stack:     AtomicU64,
+
+    /// The terminal the running task's output goes to, as a raw `TtyId`. Zero,
+    /// the common case, means the console.
+    ///
+    /// Here since `print!` reads it, at every print site in the kernel, some
+    /// inside interrupt handlers. Swapped by the context switch beside
+    /// `current_pid`
+    pub current_tty:    AtomicU32,
+
+    /// The address space in CR3 here, or 0 before the first switch writes one.
+    /// Stored (SeqCst) just before every `mov cr3`, which makes
+    /// `mm::tlb::cr3_loaded_elsewhere` exact: a processor reading anything else
+    /// here walks the page tables only after it has been told
+    pub loaded_cr3:     AtomicU64,
+
+    /// Idle and watching its run queue rather than halted: a wake for this
+    /// CPU needs no IPI (`sched::idle`)
+    pub polling:        AtomicBool,
+    /// How long idle watches before it halts, adapted to how soon this CPU
+    /// has been woken (`sched::idle`)
+    pub poll_ns:        AtomicU64,
+    /// When this CPU last switched from idle to a task, on `now_ns`'s clock
+    pub idle_left_ns:   AtomicU64,
 }
 
 impl Cpu {
@@ -153,6 +187,11 @@ impl Cpu {
             df_stack:       AtomicU64::new(0),
             pf_stack:       AtomicU64::new(0),
             sysc_stack:     AtomicU64::new(0),
+            current_tty:    AtomicU32::new(0),
+            loaded_cr3:     AtomicU64::new(0),
+            polling:        AtomicBool::new(false),
+            poll_ns:        AtomicU64::new(0),
+            idle_left_ns:   AtomicU64::new(0),
         }
     }
 }
@@ -247,19 +286,26 @@ pub fn iter_online() -> impl Iterator<Item = &'static Cpu> {
     })
 }
 
-/// Pick the CPU with shortest run queue for load balancing.
+/// The CPU a woken task should go to: the fewest queued, and of those one that
+/// is idle.
+///
+/// Queue length alone treats a CPU busy with one long task as free as an idle
+/// one, and ring 0 is not preempted, so a task woken onto a CPU in the middle
+/// of the compositor's frame waits for the frame to end.
 /// Respects 'mask' (bit N = CPU N eligible). Returns '0' as fallback
 pub fn pick_lightest(mask: u64) -> usize {
     let total = cpu_count().min(MAX_CPUS);
     let mut best_idx = 0usize;
-    let mut best_len = usize::MAX;
+    let mut best_load = usize::MAX;
     for i in 0..total {
         if mask & (1u64 << i) == 0 { continue; }
         let c = get(i);
         if c.online.load(Ordering::Relaxed) == 0 { continue; }
-        let len = c.run_queue.with(|q| q.len);
-        if len < best_len {
-            best_len = len;
+        let len = c.run_queue.queued();
+        let busy = c.current_pid.load(Ordering::Relaxed) != c.idle_pid.load(Ordering::Relaxed);
+        let load = len * 2 + busy as usize;
+        if load < best_load {
+            best_load = load;
             best_idx = i;
         }
     }

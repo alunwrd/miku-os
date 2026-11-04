@@ -1,0 +1,96 @@
+# The programs MikuOS is made of
+#
+# Not applications: what the machine is once the kernel has booted. The shell,
+# the window manager, the terminal, the login and session programs, the package
+# manager. A machine without them boots to a kernel prompt.
+#
+# Built for `x86_64-miku-app` with `-Z build-std=core`; the target spec and the
+# linker script live in `lib/miku/`, shared with `apps/`.
+[package]
+name    = "miku-system"
+version = "0.2.10"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+# The interface to the shared libraries, and the display protocol, as crates:
+# there is one encoder on the machine
+miku   = { path = "../lib/miku" }
+# `userspace` gives libmay the filesystem it needs to find the config's files:
+# the grammar has none and must not grow one, but the list of files a config is
+# made of is a directory listing
+libmay = { path = "../lib/mayland", features = ["userspace"] }
+# The password hash, the account files and the mikudo grammar. Shared between
+# the client and the daemon so there is one parser on the machine; host-tested
+mikuauth = { path = "../lib/mikuauth", features = ["userspace"] }
+# The package manager, as a library. `default-features = false` leaves the host
+# backend out (`std::fs` has no meaning here) and `userspace` brings the syscall
+# `Root` and the network, as the network tools do with `mikunet`
+mikupkg = { path = "../lib/mikupkg", default-features = false, features = ["userspace"] }
+
+[profile.release]
+opt-level = 1
+lto = false
+
+[[bin]]
+name = "maywm"
+path = "src/maywm/main.rs"
+
+[[bin]]
+name = "mayterm"
+path = "src/mayterm/main.rs"
+
+# The shell, as a program
+[[bin]]
+name = "msh"
+path = "src/msh/main.rs"
+
+# What is on this machine, and what would be. Read-only in this build: the
+# verbs that change it go through mikudo, and this program holds no authority
+[[bin]]
+name = "mikupkg"
+path = "src/mikupkg/main.rs"
+
+# The half that runs as root. It parses the plan blob, a package's own signed
+# evidence and the keyring, and nothing else: no network, no configuration
+# language, no container framing
+[[bin]]
+name = "mikupkg-apply"
+path = "src/mikupkg-apply.rs"
+
+[[bin]]
+name = "mikudo"
+path = "src/mikudo.rs"
+
+[[bin]]
+name = "mikudod"
+path = "src/mikudod.rs"
+
+[[bin]]
+name = "login"
+path = "src/login.rs"
+
+[[bin]]
+name = "maygreet"
+path = "src/maygreet.rs"
+
+[[bin]]
+name = "maysession"
+path = "src/maysession.rs"
+
+[[bin]]
+name = "passwd"
+path = "src/passwd.rs"
+
+[[bin]]
+name = "id"
+path = "src/id.rs"
+
+[[bin]]
+name = "su"
+path = "src/su.rs"
+
+[[bin]]
+name = "useradd"
+path = "src/useradd.rs"

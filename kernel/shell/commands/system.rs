@@ -1,14 +1,9 @@
 use crate::shell::SHELL;
 use crate::fs::vfs::with_vfs_ro;
-use crate::mm::allocator;
+use crate::mm::heap;
 use crate::io::console;
 use crate::{cprint, cprintln, print, print_info, print_success, println};
 
-pub fn cmd_echo(text: &str) {
-    if !text.is_empty() {
-        println!("{}", text);
-    }
-}
 
 pub fn cmd_info() {
     let (vn, mn) = with_vfs_ro(|v| (v.total_vnodes(), v.total_mounts()));
@@ -17,19 +12,32 @@ pub fn cmd_info() {
     let hours = total_secs / 3600;
     let mins  = (total_secs % 3600) / 60;
     let secs  = total_secs % 60;
-    let heap_used  = allocator::used();
-    let heap_total = allocator::HEAP_SIZE;
+    let heap_used  = heap::used();
+    let heap_total = heap::total();
 
     let (pmm_used, pmm_total) = crate::mm::pmm::stats();
 
     let usable_ram_kb = pmm_total * 4;
-    let used_ram_kb   = pmm_used * 4 + heap_used / 1024;
+    // The heap's slabs are frames, counted in `pmm_used` already
+    let used_ram_kb   = pmm_used * 4;
     let free_ram_kb   = usable_ram_kb.saturating_sub(used_ram_kb);
 
     cprintln!(57, 197, 187,  "  MikuOS v{}", env!("CARGO_PKG_VERSION"));
-    cprintln!(230, 240, 240, "  VNodes: {}/{}", vn, crate::fs::vfs::MAX_VNODES);
+    cprintln!(230, 240, 240, "  VNodes: {} cached", vn);
     cprintln!(230, 240, 240, "  Mounts: {}", mn);
     cprintln!(230, 240, 240, "  Heap:   {} / {} KB", heap_used / 1024, heap_total / 1024);
+    // The three caches holding the most, as `/proc/slabinfo` has them all
+    let mut top: [(&str, usize); 3] = [("", 0); 3];
+    heap::each_cache(|c| {
+        let kb = c.slabs * c.pages_per_slab * 4;
+        if let Some(i) = top.iter().position(|t| kb > t.1) {
+            top.copy_within(i..2, i + 1);
+            top[i] = (c.name, kb);
+        }
+    });
+    cprintln!(230, 240, 240, "  Slabs:  {} KB; {} {} KB, {} {} KB, {} {} KB; mapped {} KB",
+              heap::slab_bytes() / 1024, top[0].0, top[0].1, top[1].0, top[1].1, top[2].0, top[2].1,
+              crate::mm::vmap::mapped_pages() * 4);
     cprintln!(230, 240, 240, "  RAM:    {} / {} MB", used_ram_kb / 1024, usable_ram_kb / 1024);
     cprintln!(230, 240, 240, "  Usable: {} MB  Free: {} MB", usable_ram_kb / 1024, free_ram_kb / 1024);
 
@@ -43,6 +51,94 @@ pub fn cmd_info() {
     }
 
     cprintln!(120, 140, 140, "  Uptime: {}h {}m {}s", hours, mins, secs);
+}
+
+/// Prints the log the previous boot left in the persistent RAM region.
+///
+/// What a driver writes with pstore_println! lands in a small block of physical
+/// memory kept out of the frame allocator and flushed to DRAM as written. A
+/// warm reset does not retrain DRAM, so the block is intact when the kernel
+/// comes back, which shows what a bring-up concluded after it took the console
+/// down.
+///
+/// 'pstore clear' drops the recovered copy; the region is reset at every boot,
+/// so a dump shows one previous run.
+///
+/// A run under `klogpstore` leaves thousands of lines, so the dump filters:
+/// `err` keeps the warnings and errors (by the level letter the mirrored line
+/// carries), `-g word` the lines containing it, `-n N` the last N of what is
+/// left
+pub fn cmd_pstore(arg: &str) {
+    use crate::kcore::pstore;
+
+    // Quotes honoured, so `-g "boot events"` is one word (`kcore::words`)
+    let list = crate::kcore::words::words(arg);
+    let mut words = list.iter().map(alloc::string::String::as_str);
+    let (mut errors_only, mut grep, mut last) = (false, None::<&str>, None::<usize>);
+    while let Some(w) = words.next() {
+        match w {
+            "clear" => {
+                pstore::clear_previous();
+                cprintln!(120, 140, 140, "  cleared");
+                return;
+            }
+            // From here on the kernel log goes into the region too, emptied
+            // first so a test has all of it: the first command of a run whose
+            // screen is about to go dark
+            "mirror" => {
+                if !pstore::available() {
+                    cprintln!(220, 120, 120, "  persistent log is off (no usable RAM region was found)");
+                    return;
+                }
+                pstore::restart();
+                crate::kcore::klog::mirror_to_pstore(true);
+                cprintln!(100, 220, 150,
+                    "  the kernel log goes into pstore from here; after a warm reset, 'pstore' shows it");
+                return;
+            }
+            "err" => errors_only = true,
+            "-g" => grep = words.next(),
+            "-n" => last = words.next().and_then(|n| n.parse().ok()),
+            _ => {
+                cprintln!(255, 200, 80, "  usage: pstore [err] [-g word] [-n lines] | pstore clear | pstore mirror");
+                return;
+            }
+        }
+    }
+
+    if !pstore::available() {
+        cprintln!(220, 120, 120, "  persistent log is off (no usable RAM region was found)");
+        return;
+    }
+    cprintln!(57, 197, 187, "  Persistent log region at {:#x}", pstore::base_phys());
+
+    match pstore::previous() {
+        Some(text) if !text.is_empty() => {
+            // The level letter of a mirrored line: `[  12.345678] 2 W module ...`
+            fn level(l: &str) -> Option<&str> {
+                l.split_once("] ").and_then(|(_, r)| r.split_whitespace().nth(1))
+            }
+            let kept: alloc::vec::Vec<&str> = text
+                .lines()
+                .filter(|l| !errors_only || matches!(level(l), Some("E") | Some("W")))
+                .filter(|l| grep.map_or(true, |g| l.contains(g)))
+                .collect();
+            let from = last.map_or(0, |n| kept.len().saturating_sub(n));
+            cprintln!(120, 140, 140, "  --- previous boot: {} of {} line(s) ---",
+                kept.len() - from, text.lines().count());
+            for line in &kept[from..] {
+                println!("  {}", line);
+            }
+            cprintln!(120, 140, 140, "  --- end ---");
+        }
+        _ => {
+            cprintln!(
+                200, 200, 120,
+                "  nothing from the previous boot: either it wrote no lines, or the \
+                 firmware cleared memory on reset (a power cycle always does)"
+            );
+        }
+    }
 }
 
 pub fn cmd_memmap() {
@@ -87,9 +183,9 @@ pub fn cmd_memmap() {
 }
 
 pub fn cmd_heap() {
-    let used = allocator::used();
-    let free = allocator::free();
-    let total = allocator::HEAP_SIZE;
+    let used = heap::used();
+    let free = heap::free();
+    let total = heap::total();
     cprintln!(57, 197, 187, "  Heap Allocator");
     println!("  Total:  {} bytes ({} KB)", total, total / 1024);
     println!("  Used:   {} bytes ({} KB)", used, used / 1024);
@@ -130,6 +226,8 @@ pub fn cmd_reboot() {
 }
 
 fn sync_filesystems() {
+    // The page cache's dirty pages first (`fs/vfs/core/writeback.rs`)
+    crate::fs::vfs::core::writeback::writeback_all();
     if crate::shell::commands::ext2_cmds::is_ext2_ready() {
         crate::shell::commands::ext2_cmds::with_ext2_pub(|fs| {
             if fs.has_dirty_data() {
@@ -141,11 +239,15 @@ fn sync_filesystems() {
 }
 
 pub fn cmd_help() {
-    cprintln!(57, 197, 187, "  VFS Commands:");
-    cprintln!(128, 222, 217, "  ls cd pwd mkdir touch cat write rm rmdir mv stat");
-    cprintln!(128, 222, 217, "  ln -s <target> <n>   readlink   chmod <mode> <path>");
-    cprintln!(128, 222, 217, "  df info mount umount echo clear help history heap");
-    cprintln!(128, 222, 217, "  rm -rf <path>");
+    cprintln!(57, 197, 187, "  This console's own (they need ring 0, or are its state):");
+    cprintln!(128, 222, 217, "  cd pwd write dd mount umount info heap history help");
+    cprintln!(128, 222, 217, "  display [mode|on|off|vrr|color ...]  the screens: outputs, modes, sleep,");
+    cprintln!(128, 222, 217, "                          refresh and colour ('display help')");
+    cprintln!(128, 222, 217, "  dmesg [err|debug] [-n N] [-f] [-g text]  the kernel log, from memory");
+    cprintln!(57, 197, 187, "  Programs in /bin (this prompt or a terminal's shell):");
+    cprintln!(128, 222, 217, "  ls cat cp mv rm mkdir rmdir ln readlink touch stat chmod chown");
+    cprintln!(128, 222, 217, "  du df tree head tail wc grep sort uniq tee echo");
+    cprintln!(128, 222, 217, "  ps kill sleep date uptime uname free clear which env id su");
 
     cprintln!(57, 197, 187, "  Disk / Partitions:");
     cprintln!(128, 222, 217, "  gpt <drive>             show GPT table");
@@ -161,10 +263,12 @@ pub fn cmd_help() {
     cprintln!(128, 222, 217, "  swapon.auto              scan & activate swap");
     cprintln!(128, 222, 217, "  fs.list              show all mounted filesystems");
     cprintln!(128, 222, 217, "  fs.select <0|1>      switch active mount slot");
+    cprintln!(128, 222, 217, "  fs.rw [slot]         remount read-write (mounts come up ro)");
+    cprintln!(128, 222, 217, "  fs.ro [slot]         remount read-only");
     cprintln!(128, 222, 217, "  fs.umount [0|1]      unmount slot (default: active)");
 
     cprintln!(57, 197, 187, "  Ext2 Commands:");
-    cprintln!(128, 222, 217, "  ext2mount                mount an ext2/ext3/ext4 disk");
+    cprintln!(128, 222, 217, "  ext2mount [drv] [part] [rw]  mount ext2/3/4 (read-only unless 'rw')");
     cprintln!(128, 222, 217, "  ext2info                 filesystem info");
     cprintln!(128, 222, 217, "  ext2ls [path]            list directory");
     cprintln!(128, 222, 217, "  ext2cat <path>           show file");
@@ -182,7 +286,7 @@ pub fn cmd_help() {
     cprintln!(128, 222, 217, "  ext2chown <u> <g> <path> change owner");
     cprintln!(128, 222, 217, "  ext2du [path]            disk usage");
     cprintln!(128, 222, 217, "  ext2tree [path]          directory tree");
-    cprintln!(128, 222, 217, "  ext2fsck                 check filesystem");
+    cprintln!(128, 222, 217, "  extfsck [-y]             check the filesystem, -y to repair");
     cprintln!(128, 222, 217, "  ext2cache                cache statistics");
     cprintln!(128, 222, 217, "  ext2cacheflush           flush block cache");
 
@@ -197,18 +301,24 @@ pub fn cmd_help() {
     cprintln!(128, 222, 217, "  ext3recover              replay journal");
     cprintln!(128, 222, 217, "  ext3clean                mark journal clean");
 
-    cprintln!(57, 197, 187, "  Network:");
+    cprintln!(57, 197, 187, "  Network (kernel):");
     cprintln!(128, 222, 217, "  dhcp                     get ip via dhcp");
-    cprintln!(128, 222, 217, "  ping <ip> [count]        ping host (ctrl+c to stop)");
-    cprintln!(128, 222, 217, "  fetch <host> [port]      tcp connect + GET request");
     cprintln!(128, 222, 217, "  net status                adapter info");
     cprintln!(128, 222, 217, "  net pci                   list pci nics");
     cprintln!(128, 222, 217, "  net poll                  receive packets");
     cprintln!(128, 222, 217, "  net arp                   show arp table");
     cprintln!(128, 222, 217, "  net dns [<ip>]            show/set dns server");
     cprintln!(128, 222, 217, "  net ip <ip> <gw> <mask>  set ip manually");
-    cprintln!(128, 222, 217, "  traceroute <host>        trace route to host");
     cprintln!(128, 222, 217, "  net send <ip> <port> <m> send udp packet");
+    cprintln!(128, 222, 217, "  net test                  run the selftest");
+
+    cprintln!(57, 197, 187, "  Network (programs in /bin):");
+    cprintln!(128, 222, 217, "  ping <host> [count]      ping host (ctrl+c to stop)");
+    cprintln!(128, 222, 217, "  traceroute <host>        trace route to host");
+    cprintln!(128, 222, 217, "  host <name> [server]     look a name up");
+    cprintln!(128, 222, 217, "  wget <url> [-O <file>]   fetch a url");
+    cprintln!(128, 222, 217, "  curl <url> [-X|-d|-o|-I] make one request, show it");
+    cprintln!(128, 222, 217, "  ntpdate [server] [-q]    set the clock from a time server");
 
     cprintln!(57, 197, 187, "  mikuD (init daemon):");
     cprintln!(128, 222, 217, "  sv list|status|start|stop|restart|reload <name>");
@@ -234,11 +344,10 @@ pub fn cmd_help() {
     cprintln!(128, 222, 217, "  reboot                   restart system (graceful)");
     cprintln!(128, 222, 217, "  poweroff                 shutdown system (graceful)");
     println!("  exec <path>     - load and run ELF binary");
+    println!("  login           - start a session: prove who you are, then be them");
+    println!("  cred [show|test] - this shell's identity and capabilities");
 }
 
-pub fn cmd_clear() {
-    console::clear_screen();
-}
 
 pub fn cmd_history() {
     let sh = SHELL.lock();
@@ -256,49 +365,20 @@ pub fn cmd_history() {
     }
 }
 
-pub fn cmd_ps() {
-    let stats    = crate::sched::get_stats();
-    let total_sw = crate::sched::total_switches();
-    let now      = crate::arch::x86_64::interrupts::get_tick();
-    let uptime_s = now / 1000;
 
-    cprintln!(57, 197, 187,
-        "  {:>4}  {:<12}  {:>2}  {:>3}  {:>5}  {:>6}  {:>6}  {:>5}  {:>6}",
-        "PID", "NAME", "ST", "PRI", "CPU%", "UP(s)", "STK-U", "STK-A", "CTX-IN"
-    );
-
-    for s in &stats {
-        let ci = s.cpu_pct_x10 / 10;
-        let cf = s.cpu_pct_x10 % 10;
-        let up = s.uptime_ticks / 1000;
-
-        let (r, g, b) = match s.state {
-            "R" => (100, 220, 150),
-            "S" => (128, 222, 217),
-            "Z" => (220, 220, 100),
-            "X" => (180,  80,  80),
-            _   => (180, 140, 220),
-        };
-
-        let sp = if s.stack_alloc_kb > 0 { s.stack_used_kb * 100 / s.stack_alloc_kb } else { 0 };
-        let (sr, sg, sb) = if sp >= 80 { (220, 80, 80) } else if sp >= 50 { (220, 200, 80) } else { (100, 200, 150) };
-
-        cprint!(200, 200, 200, "  {:>4}  {:<12}  ", s.pid, s.name);
-        cprint!(r, g, b, "{:>2}", s.state);
-        cprint!(200, 200, 200, "  {:>3}  {:>2}.{}%  {:>6}  ", s.priority, ci, cf, up);
-        cprint!(sr, sg, sb, "{:>4}K ", s.stack_used_kb);
-        cprint!(160, 160, 160, "{:>4}K  ", s.stack_alloc_kb);
-        cprint!(200, 200, 200, "{:>6}", s.switch_in);
-        if s.cpu_mask != u64::MAX { cprint!(180, 140, 220, "  cpu={:#x}", s.cpu_mask); }
-        crate::println!();
+/// The kernel's log, from memory (`dev/klog.md`): every module, the same
+/// filters as `nvidia log`
+pub fn cmd_dmesg(args: &str) {
+    use crate::kcore::klog::view;
+    match view::parse(args, &mut |_| false) {
+        Ok(o) => {
+            if o.action == view::Action::Help {
+                cprintln!(57, 197, 187, "  dmesg [options] - the kernel's log, kept in memory since boot");
+            }
+            view::run(&o, "dmesg");
+        }
+        Err(e) => crate::print_error!("  dmesg: {}", e),
     }
-
-    let (pu, pt) = crate::mm::pmm::stats();
-    let hk = crate::mm::allocator::used() / 1024;
-    cprintln!(100, 100, 100,
-        "  threads={} sw={} uptime={}s  ram={}/{}MB  heap={}KB",
-        stats.len(), total_sw, uptime_s, pu * 4 / 1024, pt * 4 / 1024, hk
-    );
 }
 
 pub fn cmd_top() {
@@ -317,7 +397,7 @@ pub fn cmd_top() {
         let now      = crate::arch::x86_64::interrupts::get_tick();
         let uptime_s = now / 1000;
         let (pu, pt) = crate::mm::pmm::stats();
-        let hk       = crate::mm::allocator::used() / 1024;
+        let hk       = crate::mm::heap::used() / 1024;
 
         cprintln!(57, 197, 187,
             "  uptime={}s  ram={}/{}MB  heap={}KB  threads={}  sw={}",
@@ -519,3 +599,4 @@ pub fn cmd_usb() {
         println!("  {}", line);
     }
 }
+

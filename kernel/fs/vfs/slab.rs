@@ -1,14 +1,7 @@
 use crate::fs::vfs::types::VfsError;
 
-/// Fixed-capacity index allocator.
-///
-/// The previous version declared itself generic over `N` but stored a
-/// `[u16; 64]` free list and a single `u64` of occupancy bits, capping
-/// `MAX_ITEMS` at `min(N, 64)`. Nothing said so at the call site, so the
-/// page cache - a `Slab<1024>` sitting next to 1024 `CachedPage` entries,
-/// half a megabyte of .bss - could only ever hand out 64 pages. The cache
-/// ran at a sixteenth of its declared size while paying full price in
-/// memory, and no error was ever reported.
+/// Fixed-capacity index allocator. Free list and occupancy bitmap are both
+/// sized to `N`; callers rely on `MAX_ITEMS == N` to size their own storage.
 pub struct Slab<const N: usize> {
     free_stack: [u16; N],
     free_top: u32,

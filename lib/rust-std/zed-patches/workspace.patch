@@ -1,0 +1,26 @@
+crates/workspace: the multi-workspace state is written on quit.
+
+`MultiWorkspace::flush_serialization` wrapped its write in a foreground task.
+`App::shutdown` waits for the quit handlers by blocking the main thread, so
+the task never ran. Every quit logged "timed out waiting on app_will_quit"
+after 200 ms and exited without the write. Not MikuOS's: gpui's scheduler
+blocks the same way everywhere. Found by timing each quit handler.
+
+--- a/crates/workspace/src/multi_workspace.rs
++++ b/crates/workspace/src/multi_workspace.rs
+@@ -1474,10 +1474,14 @@
+ 
+     /// Used by the quit handler to ensure pending DB writes
+     /// complete before the process exits.
++    ///
++    /// On a background thread: the quit handler's futures are waited on by
++    /// blocking the main thread (`App::shutdown`), so a foreground task here
++    /// never ran, and every quit timed out waiting on it with the write lost.
+     pub fn flush_serialization(&mut self, cx: &mut Context<Self>) -> Task<()> {
+         self._serialize_task.take();
+         let serialization = self.serialize_now(cx);
+-        cx.spawn(async move |_, _| serialization.await)
++        cx.background_spawn(serialization)
+     }
+ 
+     pub fn flush_pending_serialization(

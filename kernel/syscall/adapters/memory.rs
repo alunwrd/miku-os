@@ -20,15 +20,16 @@ pub fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64) -> u64 {
 
 // 60  mmap_file(args_ptr) -> addr_or_errno
 //
-// The 4-argument syscall ABI can't carry mmap's six parameters, so file
+// The 4-argument syscall ABI cannot carry mmap's six parameters, so file
 // mappings pass them through a struct in user memory (mmap2 style):
 //   struct MmapFileArgs { addr, length, prot, flags, fd, offset } (u64 x6)
 pub fn sys_mmap_file(args_ptr: u64) -> u64 {
     const N: usize = 6 * 8;
     let cr3 = current_cr3();
-    if !user_ptr_mapped(cr3, args_ptr, N as u64) {
-        return err(EFAULT);
-    }
+    let _ua = match user_ptr_mapped(cr3, args_ptr, N as u64) {
+        Some(g) => g,
+        None => return err(EFAULT),
+    };
     let mut raw = [0u8; N];
     unsafe {
         core::ptr::copy_nonoverlapping(args_ptr as *const u8, raw.as_mut_ptr(), N);
@@ -89,47 +90,18 @@ pub fn sys_brk(addr: u64) -> u64 {
 
 // 8  getcwd(buf, size) -> buf
 //
-// Walks the parent chain from the calling process's cwd (Process::cwd,
-// accessed via sched::current_cwd) up to the root vnode. Returns
-// -EINVAL if the path doesn't fit in 'size'
+// The calling process's cwd (Process::cwd, via sched::current_cwd), named by
+// the VFS's one walk back to the root (`MikuVFS::abs_path`), as `realpath`
+// (119). Returns -EINVAL if the path does not fit in 'size'
 pub fn sys_getcwd(buf: u64, size: u64) -> u64 {
     if size < 2 { return err(EINVAL); }
     let cr3 = current_cr3();
-    // The kernel writes through buf - PTE_WRITABLE required so the user
-    // can't trick us into store-through-a-read-only-mapping (which works
-    // for CPL=0 regardless of WP) or hit a page they should not be able
-    // to clobber
-    if !user_ptr_writable(cr3, buf, size) { return err(EFAULT); }
+    // The kernel writes through buf, so PTE_WRITABLE is required: a store
+    // through a read-only mapping works at CPL=0 regardless of WP
+    let _ua = match user_ptr_writable(cr3, buf, size) { Some(g) => g, None => return err(EFAULT) };
 
     let cwd_id = crate::sched::current_cwd() as usize;
-    let path = crate::fs::vfs::core::with_vfs(|vfs| {
-        let mut cur = cwd_id;
-        let root    = vfs.ctx.root as usize;
-
-        // Collect names walking up to root. Cap iterations so a corrupt
-        // parent cycle can't loop forever; in practice depth is bounded
-        // by the path length
-        let mut parts: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-        let mut steps = 0usize;
-        while cur != root && steps < 1024 {
-            if !vfs.valid_vnode(cur) { return alloc::string::String::from("/"); }
-            let n = vfs.nodes[cur].name.as_str();
-            parts.push(alloc::string::String::from(n));
-            let parent = vfs.nodes[cur].parent as usize;
-            if parent == cur { break; } // self-parent guard
-            cur = parent;
-            steps += 1;
-        }
-        if parts.is_empty() {
-            return alloc::string::String::from("/");
-        }
-        let mut s = alloc::string::String::new();
-        for name in parts.iter().rev() {
-            s.push('/');
-            s.push_str(name);
-        }
-        s
-    });
+    let path = crate::fs::vfs::core::with_vfs(|vfs| vfs.abs_path(cwd_id));
 
     let bytes = path.as_bytes();
     if (bytes.len() as u64) + 1 > size { return err(EINVAL); }
@@ -144,11 +116,10 @@ pub fn sys_getcwd(buf: u64, size: u64) -> u64 {
 }
 
 // 9  set_tls(addr) -> 0
-// Userspace can only set FS.base to a canonical user-half address.
-// A non-canonical or kernel-half value would either #GP wrmsr (kernel
-// DoS) or let a later kernel-side FS-prefixed access read the wrong
-// half of the virtual space. VirtAddr::try_new performs the canonical
-// check for us; we additionally reject anything above USER_MAX
+// Userspace can only set FS.base to a canonical user-half address. A
+// non-canonical or kernel-half value would #GP wrmsr (kernel DoS) or let a
+// later kernel-side FS-prefixed access read the wrong half. VirtAddr::try_new
+// does the canonical check, and anything above USER_MAX is rejected
 pub fn sys_set_tls(addr: u64) -> u64 {
     if addr > USER_MAX { return err(EINVAL); }
     let va = match VirtAddr::try_new(addr) {
@@ -156,7 +127,7 @@ pub fn sys_set_tls(addr: u64) -> u64 {
         Err(_) => return err(EINVAL),
     };
     FsBase::write(va);
-    crate::serial_println!("[syscall] set_tls={:#x}", addr);
+    crate::trace_println!("[syscall] set_tls={:#x}", addr);
     0
 }
 
@@ -169,7 +140,7 @@ pub fn sys_get_tls() -> u64 {
 pub fn sys_map_lib(name_ptr: u64, name_len: u64) -> u64 {
     if name_len == 0 || name_len > 256 { return err(EINVAL); }
     let cr3 = current_cr3();
-    if !user_ptr_mapped(cr3, name_ptr, name_len) { return err(EFAULT); }
+    let _ua = match user_ptr_mapped(cr3, name_ptr, name_len) { Some(g) => g, None => return err(EFAULT) };
     // Copy the name into a kernel-owned buffer before parsing; the
     // user could otherwise rewrite the bytes between validation and the
     // solib lookup that yields on disk I/O

@@ -1,0 +1,16 @@
+# miku: the header a MikuOS program includes to reach the shared libraries
+#
+# `/usr/include` plus the link line, as one crate. The `extern "C"` block names
+# the symbols; the build script generates a link stub per library so the
+# programs link against something with the right soname, and `ld-miku` resolves
+# the real ones at load time. The `cargo:rustc-link-*` directives it prints are
+# applied when the final binary is linked, so `system/` and `apps/` get their
+# linkage by depending on this.
+#
+# It also carries the target spec and the linker script both program crates
+# build with.
+[package]
+name    = "miku"
+version = "0.2.10"
+edition = "2021"
+build   = "build.rs"

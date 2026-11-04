@@ -1,0 +1,272 @@
+--- a/crates/gpui/src/color.rs
++++ b/crates/gpui/src/color.rs
+@@ -742,10 +742,15 @@
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+ #[repr(C)]
+-pub(crate) enum BackgroundTag {
++/// What a [`Background`] is filled with
++pub enum BackgroundTag {
++    /// One color
+     Solid = 0,
++    /// Two color stops along an angle
+     LinearGradient = 1,
++    /// Diagonal stripes of the solid color
+     PatternSlash = 2,
++    /// Squares of the solid color
+     Checkerboard = 3,
+ }
+ 
+@@ -908,6 +913,20 @@
+ }
+ 
+ impl Background {
++    /// The fill field by field, for a renderer that is not a shader reading
++    /// this struct as bytes: its kind, the space a gradient blends in, the
++    /// solid color, the gradient angle (or the pattern's packed size), and
++    /// the two gradient stops
++    pub fn parts(&self) -> (BackgroundTag, ColorSpace, Hsla, f32, [LinearColorStop; 2]) {
++        (
++            self.tag,
++            self.color_space,
++            self.solid,
++            self.gradient_angle_or_pattern_height,
++            self.colors,
++        )
++    }
++
+     /// Returns the solid color if this is a solid background, None otherwise.
+     pub fn as_solid(&self) -> Option<Hsla> {
+         if self.tag == BackgroundTag::Solid {
+--- a/crates/gpui_linux/Cargo.toml
++++ b/crates/gpui_linux/Cargo.toml
+@@ -45,13 +45,22 @@
+     "open",
+     "scap?/x11",
+ ]
++# MikuOS's display server. Mayland speaks the Wayland wire format over its own
++# socket, with shared memory named by a kernel handle instead of a file
++# descriptor, so the Wayland backend cannot be pointed at it; this is a client
++# of its own, over `lib/mayland` from the MikuOS tree, drawing on the processor
++# because MikuOS has no Vulkan or GL for wgpu to use
++mayland = [
++    "gpui_wgpu",
++    "libmay",
++]
+ screen-capture = [
+     "gpui/screen-capture",
+     "scap",
+ ]
+ 
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
++[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "miku"))'.dependencies]
+ accesskit.workspace = true
+ accesskit_unix.workspace = true
+ anyhow.workspace = true
+@@ -60,7 +69,6 @@
+ futures.workspace = true
+ gpui.workspace = true
+ gpui_util.workspace = true
+-gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
+ http_client.workspace = true
+ libc.workspace = true
+ log.workspace = true
+@@ -130,7 +138,18 @@
+ ], package = "zed-xim", version = "0.4.0-zed", optional = true }
+ x11-clipboard = { version = "0.9.3", optional = true }
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dev-dependencies]
++# font-kit finds system fonts through fontconfig, which MikuOS does not have;
++# there the text system is given its fonts (Zed's own, from its assets)
++[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.gpui_wgpu]
++workspace = true
++optional = true
++features = ["font-kit"]
++
++[target.'cfg(target_os = "miku")'.dependencies]
++gpui_wgpu = { workspace = true, optional = true }
++libmay = { path = "../../../../../lib/mayland", optional = true }
++
++[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "miku"))'.dev-dependencies]
+ gpui = { workspace = true, features = ["test-support"] }
+ 
+ [package.metadata.cargo-shear]
+--- a/crates/gpui_linux/src/gpui_linux.rs
++++ b/crates/gpui_linux/src/gpui_linux.rs
+@@ -1,4 +1,4 @@
+-#![cfg(any(target_os = "linux", target_os = "freebsd"))]
++#![cfg(any(target_os = "linux", target_os = "freebsd", target_os = "miku"))]
+ mod linux;
+ 
+ pub use linux::current_platform;
+--- a/crates/gpui_linux/src/linux/platform.rs
++++ b/crates/gpui_linux/src/linux/platform.rs
+@@ -12,6 +12,8 @@
+     os::fd::{AsFd, AsRawFd},
+     time::Duration,
+ };
++#[cfg(all(feature = "mayland", not(any(feature = "wayland", feature = "x11"))))]
++use std::time::Duration;
+ 
+ #[cfg(any(feature = "wayland", feature = "x11"))]
+ use anyhow::ensure;
+@@ -38,17 +40,17 @@
+     PlatformWindow, Result, RunnableVariant, Task, ThermalState, WindowAppearance,
+     WindowButtonLayout, WindowParams,
+ };
+-#[cfg(any(feature = "wayland", feature = "x11"))]
++#[cfg(any(feature = "wayland", feature = "x11", feature = "mayland"))]
+ use gpui::{Pixels, Point, px};
+ 
+-#[cfg(any(feature = "wayland", feature = "x11"))]
++#[cfg(any(feature = "wayland", feature = "x11", feature = "mayland"))]
+ pub(crate) const SCROLL_LINES: f32 = 3.0;
+ 
+ // Values match the defaults on GTK.
+ // Taken from https://github.com/GNOME/gtk/blob/main/gtk/gtksettings.c#L320
+-#[cfg(any(feature = "wayland", feature = "x11"))]
++#[cfg(any(feature = "wayland", feature = "x11", feature = "mayland"))]
+ pub(crate) const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+-#[cfg(any(feature = "wayland", feature = "x11"))]
++#[cfg(any(feature = "wayland", feature = "x11", feature = "mayland"))]
+ pub(crate) const DOUBLE_CLICK_DISTANCE: Pixels = px(5.0);
+ pub(crate) const KEYRING_LABEL: &str = "zed-github-account";
+ 
+@@ -169,7 +171,13 @@
+ 
+         #[cfg(any(feature = "wayland", feature = "x11"))]
+         let text_system = Arc::new(crate::linux::CosmicTextSystem::new("IBM Plex Sans"));
+-        #[cfg(not(any(feature = "wayland", feature = "x11")))]
++        // No system fonts to scan: the program adds its own, as Zed does from
++        // its assets
++        #[cfg(all(feature = "mayland", not(any(feature = "wayland", feature = "x11"))))]
++        let text_system = Arc::new(crate::linux::CosmicTextSystem::new_without_system_fonts(
++            "IBM Plex Sans",
++        ));
++        #[cfg(not(any(feature = "wayland", feature = "x11", feature = "mayland")))]
+         let text_system = Arc::new(gpui::NoopTextSystem::new());
+ 
+         let callbacks = PlatformHandlers::default();
+@@ -893,7 +901,7 @@
+         .detach();
+ }
+ 
+-#[cfg(any(feature = "wayland", feature = "x11"))]
++#[cfg(any(feature = "wayland", feature = "x11", feature = "mayland"))]
+ pub(super) fn is_within_click_distance(a: Point<Pixels>, b: Point<Pixels>) -> bool {
+     let diff = a - b;
+     diff.x.abs() <= DOUBLE_CLICK_DISTANCE && diff.y.abs() <= DOUBLE_CLICK_DISTANCE
+--- a/crates/gpui_linux/src/linux.rs
++++ b/crates/gpui_linux/src/linux.rs
+@@ -3,8 +3,10 @@
+ mod keyboard;
+ mod platform;
+ mod system_notifications;
+-#[cfg(any(feature = "wayland", feature = "x11"))]
++#[cfg(any(feature = "wayland", feature = "x11", feature = "mayland"))]
+ mod text_system;
++#[cfg(feature = "mayland")]
++mod mayland;
+ #[cfg(feature = "wayland")]
+ mod wayland;
+ #[cfg(feature = "x11")]
+@@ -17,8 +19,10 @@
+ pub(crate) use headless::*;
+ pub(crate) use keyboard::*;
+ pub(crate) use platform::*;
+-#[cfg(any(feature = "wayland", feature = "x11"))]
++#[cfg(any(feature = "wayland", feature = "x11", feature = "mayland"))]
+ pub(crate) use text_system::*;
++#[cfg(feature = "mayland")]
++pub(crate) use mayland::*;
+ #[cfg(feature = "wayland")]
+ pub(crate) use wayland::*;
+ #[cfg(feature = "x11")]
+@@ -27,6 +31,7 @@
+ use std::rc::Rc;
+ 
+ /// Returns the default platform implementation for the current OS.
++#[cfg_attr(feature = "mayland", allow(unreachable_code))]
+ pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
+     #[cfg(feature = "x11")]
+     use anyhow::Context as _;
+@@ -37,6 +42,14 @@
+         });
+     }
+ 
++    // On MikuOS there is one display server and nothing to guess between
++    #[cfg(feature = "mayland")]
++    {
++        return Rc::new(LinuxPlatform {
++            inner: MaylandClient::new(),
++        });
++    }
++
+     match gpui::guess_compositor() {
+         #[cfg(feature = "wayland")]
+         "Wayland" => Rc::new(LinuxPlatform {
+--- a/crates/gpui_platform/Cargo.toml
++++ b/crates/gpui_platform/Cargo.toml
+@@ -44,6 +44,10 @@
+ [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+ gpui_linux.workspace = true
+ 
++# Mayland is the only display server MikuOS has, so it is not a choice
++[target.'cfg(target_os = "miku")'.dependencies]
++gpui_linux = { workspace = true, features = ["mayland"] }
++
+ [target.'cfg(target_family = "wasm")'.dependencies]
+ gpui_web.workspace = true
+ console_error_panic_hook.workspace = true
+--- a/crates/gpui_platform/src/gpui_platform.rs
++++ b/crates/gpui_platform/src/gpui_platform.rs
+@@ -68,7 +68,7 @@
+         )
+     }
+ 
+-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
++    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "miku"))]
+     {
+         gpui_linux::current_platform(headless)
+     }
+--- a/crates/gpui_wgpu/Cargo.toml
++++ b/crates/gpui_wgpu/Cargo.toml
+@@ -33,12 +33,16 @@
+ unicode-bidi.workspace = true
+ unicode-segmentation.workspace = true
+ gpui_util.workspace = true
+-wgpu.workspace = true
+ 
+ # Optional: only needed on platforms with multiple font sources (e.g. Linux)
+ # WARNING: If you change this, you must also publish a new version of zed-font-kit to crates.io
+ font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "94b0f28166665e8fd2f53ff6d268a14955c82269", package = "zed-font-kit", version = "0.14.1-zed", optional = true }
+ 
++# Nothing wgpu can render with exists on MikuOS (no Vulkan, no GL); what is
++# used there is the text system, which never needed it
++[target.'cfg(not(target_os = "miku"))'.dependencies]
++wgpu.workspace = true
++
+ [target.'cfg(target_family = "wasm")'.dependencies]
+ web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
+ wgpu = { workspace = true, features = ["webgl"] }
+--- a/crates/gpui_wgpu/src/gpui_wgpu.rs
++++ b/crates/gpui_wgpu/src/gpui_wgpu.rs
+@@ -1,10 +1,17 @@
+ mod cosmic_text_system;
++#[cfg(not(target_os = "miku"))]
+ mod wgpu_atlas;
++#[cfg(not(target_os = "miku"))]
+ mod wgpu_context;
++#[cfg(not(target_os = "miku"))]
+ mod wgpu_renderer;
+ 
+ pub use cosmic_text_system::*;
++#[cfg(not(target_os = "miku"))]
+ pub use wgpu;
++#[cfg(not(target_os = "miku"))]
+ pub use wgpu_atlas::*;
++#[cfg(not(target_os = "miku"))]
+ pub use wgpu_context::*;
++#[cfg(not(target_os = "miku"))]
+ pub use wgpu_renderer::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};

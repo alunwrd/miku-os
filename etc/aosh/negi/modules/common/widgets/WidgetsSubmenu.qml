@@ -1,0 +1,120 @@
+pragma ComponentBehavior: Bound
+
+import qs
+import qs.services
+import qs.modules.common
+import qs.modules.common.widgets
+import QtQuick
+import QtQuick.Layouts
+
+Item {
+    id: root
+    implicitHeight: col.implicitHeight + 16
+
+    readonly property var widgetList: [
+        { key: "visualizer",  icon: "graphic_eq",         name: Translation.tr("Visualizer") },
+        { key: "customImage", icon: "image",              name: Translation.tr("Custom Image") },
+        { key: "weather",     icon: "partly_cloudy_day",  name: Translation.tr("Weather") },
+        { key: "clock",       icon: "schedule",           name: Translation.tr("Clock") },
+        { key: "media",       icon: "music_note",         name: Translation.tr("Media") },
+        { key: "images",      icon: "photo_library",      name: Translation.tr("Image Converter") },
+        { key: "resources",   icon: "monitor_heart",      name: Translation.tr("Resources") },
+        { key: "calendar",    icon: "calendar_month",     name: Translation.tr("Calendar") },
+        { key: "worldClock",  icon: "public",             name: Translation.tr("World Clock") },
+        { key: "userCard",    icon: "person",             name: Translation.tr("User Card") },
+        { key: "notes",       icon: "note_stack_add",     name: Translation.tr("Notes") },
+        { key: "timers",      icon: "timer",              name: Translation.tr("Timers") },
+        { key: "todo",        icon: "add_task",           name: Translation.tr("To-Do") },
+        { key: "sticker",     icon: "sticker",            name: Translation.tr("Sticker") },
+    ]
+
+    Rectangle {
+        anchors.fill: parent
+        radius: Appearance.rounding.verylarge
+        color: Appearance.colors.colLayer0
+    }
+
+    ColumnLayout {
+        id: col
+        anchors { fill: parent; margins: 8 }
+        spacing: 2
+
+        ConfigSwitch {
+            Layout.fillWidth: true
+            buttonIcon: "lock"
+            text: Translation.tr("Lock widget positions")
+            checked: Config.options.background.widgetsLocked
+            onCheckedChanged: Config.options.background.widgetsLocked = checked
+        }
+        ConfigSwitch {
+            Layout.fillWidth: true
+            buttonIcon: "shadow"
+            text: Translation.tr("Shadow")
+            checked: Config.options.background.widgets.shadow 
+            onCheckedChanged: Config.options.background.widgets.shadow = checked
+        }
+        ConfigSwitch {
+            Layout.fillWidth: true
+            buttonIcon: "blur_on"
+            text: Translation.tr("Blur widgets")
+            checked: Config.options.background.widgets.blurWidgets 
+            onCheckedChanged: Config.options.background.widgets.blurWidgets = checked
+        }
+
+        ConfigSlider {
+            Layout.fillWidth: true
+            showLabel: false
+            visible: Config.options.background.widgets.blurWidgets
+            value: Config.options.background.widgets.blurRadius ?? 32
+            usePercentTooltip: false
+            buttonIcon: "aspect_ratio"
+            from: 1
+            to: 64
+            stopIndicatorValues: [32]
+            onValueChanged: Config.options.background.widgets.blurRadius = value
+        }
+
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.topMargin: 4
+            Layout.bottomMargin: 4
+            implicitHeight: 1
+            color: Appearance.colors.colOutlineVariant
+            opacity: 0.4
+        }
+
+        Repeater {
+            model: root.widgetList
+            delegate: ConfigSwitch {
+                required property var modelData
+                Layout.fillWidth: true
+                buttonIcon: modelData.icon
+                text: modelData.name
+                checked: Config.options.background.widgets[modelData.key].enable
+                onCheckedChanged: Config.options.background.widgets[modelData.key].enable = checked
+            }
+        }
+
+        // Extra stickers: each one gets its own image (drop a file on it), position, size and rotation.
+        // Remove one by selecting it on the desktop and pressing Delete.
+        RippleButtonWithIcon {
+            Layout.fillWidth: true
+            Layout.topMargin: 2
+            visible: Config.options.background.widgets.sticker.enable
+            materialIcon: "add"
+            mainText: {
+                const n = Config.options.background.widgets.sticker.items.length;
+                return n > 0 ? Translation.tr("Add sticker") + ` (${n + 1})` : Translation.tr("Add sticker");
+            }
+            onClicked: {
+                const sticker = Config.options.background.widgets.sticker;
+                const n = sticker.items.length;
+                sticker.items = sticker.items.concat([{
+                    path: "", size: 200, rotation: 0,
+                    x: 300 + (n % 8) * 60, y: 250 + (n % 8) * 40, z: 20 + n,
+                    placementStrategy: "free"
+                }]);
+            }
+        }
+    }
+}

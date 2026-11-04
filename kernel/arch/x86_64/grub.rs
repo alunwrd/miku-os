@@ -1,5 +1,6 @@
 use core::ptr::addr_of;
 use core::sync::atomic::{AtomicU64, Ordering};
+use spin::Mutex;
 
 pub const HHDM_OFFSET: u64 = 0xFFFF800000000000;
 pub const KERNEL_VMA:  u64 = 0xFFFFFFFF80000000;
@@ -13,6 +14,7 @@ static KERNEL_PHYS_BASE:       AtomicU64 = AtomicU64::new(KERNEL_PHYS);
 
 pub fn init(mb2_phys: u64) {
     MB2_VIRT.store(mb2_phys + HHDM_OFFSET, Ordering::Relaxed);
+    latch_cmdline();
 }
 
 pub fn set_kernel_address(virt_base: u64, phys_base: u64) {
@@ -35,6 +37,13 @@ pub fn virt_to_phys(virt: u64) -> u64 {
 
 pub fn any_virt_to_phys(virt: u64) -> u64 {
     let hhdm = HHDM.load(Ordering::Relaxed);
+    // The heap's mapped area is single frames side by side: no arithmetic gives
+    // a physical address there, and no device may be handed it. A driver giving
+    // a device heap memory stops here (`dev/kernel-core.md`, "Devices get
+    // device memory")
+    if crate::mm::vmap::contains(virt) {
+        panic!("any_virt_to_phys: {:#x} is in the heap's mapped area, not device memory (mm::dma)", virt);
+    }
     if virt >= 0xFFFFFFFF80000000 {
         virt - KERNEL_VIRT_OFFSET.load(Ordering::Relaxed) + KERNEL_PHYS_BASE.load(Ordering::Relaxed)
     } else if virt >= hhdm {
@@ -48,10 +57,12 @@ fn mb2_virt() -> u64 {
     MB2_VIRT.load(Ordering::Relaxed)
 }
 
+const TAG_CMDLINE: u32 = 1;
 const TAG_MMAP:   u32 = 6;
 const TAG_FB:     u32 = 8;
 const TAG_END:    u32 = 0;
 const TAG_MODULE: u32 = 3;
+const TAG_ELF_SECTIONS: u32 = 9;
 // EFI tags exist only when GRUB itself ran as an EFI application, i.e. the
 // firmware POSTed in UEFI mode (GPU option ROM executed as a GOP driver).
 // All of them are absent on a CSM/legacy boot
@@ -162,6 +173,80 @@ fn find_tag(tag_type: u32) -> Option<u64> {
     None
 }
 
+/// Longer than any line a person types: a `run=` list of selftests outgrew 256
+const CMDLINE_MAX: usize = 1024;
+
+struct CmdLine {
+    buf:     [u8; CMDLINE_MAX],
+    len:     usize,
+    latched: bool,
+}
+
+static CMDLINE: Mutex<CmdLine> =
+    Mutex::new(CmdLine { buf: [0; CMDLINE_MAX], len: 0, latched: false });
+
+/// Copy the boot command line out of the multiboot2 info block, once, from
+/// init(): the block lives in memory GRUB reports as reclaimable, and the PMM
+/// may hand those pages out
+fn latch_cmdline() {
+    let mut cl = CMDLINE.lock();
+    if cl.latched {
+        return;
+    }
+    cl.latched = true;
+    let ptr = match find_tag(TAG_CMDLINE) {
+        Some(p) => p,
+        None => return,
+    };
+    let size = unsafe { read_tag_size(ptr) } as u64;
+    if size <= 8 {
+        return;
+    }
+    let limit = ptr + size;
+    let mut p = ptr + 8;
+    let mut len = 0usize;
+    while p < limit && len < CMDLINE_MAX {
+        let c = unsafe { *(p as *const u8) };
+        if c == 0 {
+            break;
+        }
+        cl.buf[len] = c;
+        len += 1;
+        p += 1;
+    }
+    cl.len = len;
+}
+
+/// Run 'f' over the boot command line ("" when the bootloader gave none)
+pub fn with_cmdline<R>(f: impl FnOnce(&str) -> R) -> R {
+    latch_cmdline();
+    let cl = CMDLINE.lock();
+    let s = core::str::from_utf8(&cl.buf[..cl.len]).unwrap_or("");
+    f(s)
+}
+
+/// Value of a 'key=value' word on the boot line, copied into 'out'. Returns
+/// how many bytes were written, or None when the key is not present
+pub fn cmdline_arg(key: &str, out: &mut [u8]) -> Option<usize> {
+    with_cmdline(|line| {
+        for tok in line.split_ascii_whitespace() {
+            if let Some((k, v)) = tok.split_once('=') {
+                if k == key {
+                    let n = v.len().min(out.len());
+                    out[..n].copy_from_slice(&v.as_bytes()[..n]);
+                    return Some(n);
+                }
+            }
+        }
+        None
+    })
+}
+
+/// True if a bare word (no '=') is present on the boot line
+pub fn cmdline_flag(flag: &str) -> bool {
+    with_cmdline(|line| line.split_ascii_whitespace().any(|t| t == flag))
+}
+
 #[repr(C, packed)]
 struct ModuleTagHeader {
     _tag_type: u32,
@@ -203,6 +288,103 @@ pub fn module(name: &str) -> Option<(u64, u64)> {
         ptr = (ptr + s + 7) & !7;
     }
     None
+}
+
+/// The kernel's own ELF section headers, as GRUB left them.
+///
+/// GRUB loads every section of an ELF kernel, including `.symtab` and
+/// `.strtab`, which have no SHF_ALLOC and are in no PT_LOAD, and hands back a
+/// table of section headers whose `sh_addr` fields point at where it put them.
+/// The kernel names its own functions from these.
+///
+/// Returns (virtual address of the shdr array, count, entry size).
+pub fn elf_sections() -> Option<(u64, usize, usize)> {
+    let base = mb2_virt();
+    if base == HHDM_OFFSET {
+        return None;
+    }
+    let total = unsafe {
+        addr_of!((*(base as *const Mb2Header)).total_size).read_unaligned()
+    } as u64;
+    let end = base + total;
+    let mut ptr = base + 8;
+    while ptr + 8 <= end {
+        let t = unsafe { read_tag_type(ptr) };
+        let s = unsafe { read_tag_size(ptr) } as u64;
+        if t == TAG_END || s == 0 {
+            break;
+        }
+        // tag: type, size, num, entsize, shndx, then num * entsize headers
+        if t == TAG_ELF_SECTIONS && s >= 24 {
+            let num = unsafe { ((ptr + 8) as *const u32).read_unaligned() } as usize;
+            let entsize = unsafe { ((ptr + 12) as *const u32).read_unaligned() } as usize;
+            let arr = ptr + 20;
+            let need = match num.checked_mul(entsize) {
+                Some(v) => v as u64,
+                None    => return None,
+            };
+            if num == 0 || entsize < 64 || arr + need > ptr + s {
+                return None;
+            }
+            return Some((arr, num, entsize));
+        }
+        ptr = (ptr + s + 7) & !7;
+    }
+    None
+}
+
+/// Where the multiboot2 information structure itself lives: (physical, bytes)
+///
+/// It is in ordinary usable RAM, and every `module()` call walks these tags
+/// long after boot, so the frame allocator must not hand its pages out
+pub fn mb2_span() -> Option<(u64, u64)> {
+    let base = mb2_virt();
+    if base == HHDM_OFFSET {
+        return None;
+    }
+    let total = unsafe {
+        addr_of!((*(base as *const Mb2Header)).total_size).read_unaligned()
+    } as u64;
+    Some((base - HHDM_OFFSET, total))
+}
+
+/// Call `f(start, end)` for every module GRUB loaded, in physical addresses
+pub fn for_each_module(f: &mut dyn FnMut(u64, u64)) {
+    let base = mb2_virt();
+    if base == HHDM_OFFSET {
+        return;
+    }
+    let total = unsafe {
+        addr_of!((*(base as *const Mb2Header)).total_size).read_unaligned()
+    } as u64;
+    let end = base + total;
+    let mut ptr = base + 8;
+    while ptr + 8 <= end {
+        let t = unsafe { read_tag_type(ptr) };
+        let s = unsafe { read_tag_size(ptr) } as u64;
+        if t == TAG_END || s == 0 {
+            break;
+        }
+        if t == TAG_MODULE && s >= 16 {
+            let h = ptr as *const ModuleTagHeader;
+            let mod_start = unsafe { addr_of!((*h).mod_start).read_unaligned() } as u64;
+            let mod_end = unsafe { addr_of!((*h).mod_end).read_unaligned() } as u64;
+            if mod_end > mod_start {
+                f(mod_start, mod_end);
+            }
+        }
+        ptr = (ptr + s + 7) & !7;
+    }
+}
+
+/// Highest physical address covered by any GRUB module, 0 if there are none.
+/// Anything the kernel wants to park at a fixed physical address has to sit
+/// above this: GRUB picks module addresses itself and the firmware bundle
+/// alone is tens of megabytes
+pub fn modules_end() -> u64 {
+    let mut top = 0u64;
+    for_each_module(&mut |_, end| { if end > top { top = end; } });
+    top
 }
 
 /// True if the null-terminated module string in [str_ptr, limit) contains

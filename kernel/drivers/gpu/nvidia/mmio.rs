@@ -1,12 +1,8 @@
-/////////////////////////////////////////////////////////////////////////////
-//               MMIO primitives for NVIDIA GPUs                           //
-//                                                                         //
-// A BAR physical address is translated through the higher-half direct     //
-// mapping (HHDM) which in MikuOS covers the full physical range. If a     // 
-// BAR ever lands outside of HHDM (some real hardware), an explicit        //
-// vmm::map_range with PCD/PWT flags will be needed. That can be added     //
-// later without changing the MmioRegion API.                              //
-/////////////////////////////////////////////////////////////////////////////
+// MMIO primitives for NVIDIA GPUs
+//
+// A BAR physical address is translated through the higher-half direct mapping
+// (HHDM), which covers the full physical range. A BAR outside the HHDM would
+// need an explicit vmm::map_range with PCD/PWT flags
 
 use core::ptr;
 
@@ -20,10 +16,9 @@ pub struct MmioRegion {
 
 impl MmioRegion {
     pub fn new(phys: u64, size: u64) -> Self {
-        // Remap the BAR range as strict UC. On real hardware the HHDM 1-GiB
-        // pages default to WB, so MMIO writes (e.g. pmc::mask_all_interrupts)
-        // would sink into L1 instead of reaching silicon. Skip page 0 guard
-        // implicitly via size check - a zero-sized BAR means unassigned
+        // Remap the BAR range as strict UC. The HHDM 1-GiB pages default to WB,
+        // so MMIO writes (e.g. pmc::mask_all_interrupts) would sink into L1
+        // instead of reaching silicon. A zero-sized BAR means unassigned
         if phys != 0 && size != 0 {
             crate::mm::vmm::map_mmio_uc(phys, size);
         }
@@ -49,14 +44,27 @@ impl MmioRegion {
         unsafe { ptr::write_volatile(self.ptr32(off), val); }
     }
 
+    /// True if a read came back as a PRI error, not register data. The widest
+    /// of the three tests in `pri`; that module says when a narrower one is
+    /// meant
     #[inline(always)]
-    pub fn read16(&self, off: u32) -> u16 {
-        unsafe { ptr::read_volatile((self.virt_base + off as u64) as *mut u16) }
+    pub fn is_pri_error(v: u32) -> bool {
+        crate::drivers::gpu::nvidia::pri::is_error(v)
     }
 
-    #[inline(always)]
-    pub fn read8(&self, off: u32) -> u8 {
-        unsafe { ptr::read_volatile((self.virt_base + off as u64) as *mut u8) }
+    /// PTIMER as one 64-bit count of nanoseconds. TIME_1 is read on both
+    /// sides of TIME_0, so a carry between the two halves is seen and the
+    /// read taken again
+    pub fn read_ptimer_ns(&self) -> u64 {
+        use crate::drivers::gpu::nvidia::regs::{PTIMER_TIME_0, PTIMER_TIME_1};
+        loop {
+            let hi1 = self.read32(PTIMER_TIME_1);
+            let lo = self.read32(PTIMER_TIME_0);
+            let hi2 = self.read32(PTIMER_TIME_1);
+            if hi1 == hi2 {
+                return ((hi1 as u64) << 32) | (lo as u64);
+            }
+        }
     }
 
     /// Read-modify-write: (current & !mask)/(new & mask)

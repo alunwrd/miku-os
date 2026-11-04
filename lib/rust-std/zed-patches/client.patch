@@ -1,0 +1,29 @@
+crates/client: the system's name in telemetry.
+
+os_name has one arm per system and none to fall back on; MikuOS gets its own
+rather than FreeBSD's. os_version reads os-release, as on Linux and FreeBSD.
+
+diff --git a/crates/client/src/telemetry.rs b/crates/client/src/telemetry.rs
+index a08dfb4..6298230 100644
+--- a/crates/client/src/telemetry.rs
++++ b/crates/client/src/telemetry.rs
+@@ -119,6 +119,10 @@ pub fn os_name() -> String {
+     {
+         format!("FreeBSD {}", gpui::guess_compositor())
+     }
++    #[cfg(target_os = "miku")]
++    {
++        format!("MikuOS {}", gpui::guess_compositor())
++    }
+ 
+     #[cfg(target_os = "windows")]
+     {
+@@ -148,7 +152,7 @@ pub fn os_version() -> String {
+                .replace_all(&version_string, "")
+                .to_string()
+        }
+-       any(target_os = "linux", target_os = "freebsd") => {
++       any(target_os = "linux", target_os = "freebsd", target_os = "miku") => {
+            use std::path::Path;
+ 
+            let content = if let Ok(file) = std::fs::read_to_string(&Path::new("/etc/os-release")) {

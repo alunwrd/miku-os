@@ -1,0 +1,14 @@
+# An alias and nothing else, for the reason aosh's says: the repository root's
+# config builds every directory under it for the kernel's target, and the
+# tests are for the host.
+#
+#     cd lib/mayland && cargo test-host
+#
+# The kernel links this crate and so does every program that draws, so a
+# `[build]` section here would change what both of them get.
+#
+# `panic-abort-tests` because this crate is a member of the root workspace,
+# whose profiles say `panic = "abort"`, and a workspace member cannot have
+# profiles of its own
+[alias]
+test-host = "test --target x86_64-unknown-linux-gnu -Z build-std=std,panic_abort,test -Z panic-abort-tests"

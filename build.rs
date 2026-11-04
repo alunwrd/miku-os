@@ -1,90 +1,75 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+// Artwork decoded and scaled, and GPU programs compiled, at build time, since
+// the kernel has neither decoder nor compiler
+#[path = "lib/buildgen/imagegen.rs"]
+mod imagegen;
+
+#[path = "lib/buildgen/shadergen.rs"]
+mod shadergen;
+
+// Wallpapers are generated as files, for selection in a config
+#[path = "lib/buildgen/qoigen.rs"]
+mod qoigen;
+
+// The trust store is staged at /etc/ssl/certs/ca-bundle.pem and parsed by
+// `lib/net` at run time
+
+// The font is built by `libmay`'s build script
+
+/// GB206 is Blackwell, compute capability 12.0
+/// (`nvidia-smi --query-gpu=compute_cap`)
+const GPU_ARCH: &str = "sm_120";
+
+/// Width of the greeter's round portrait, the same as the installer's mascot
+const GREETER_ART: u32 = 260;
 
 fn main() {
     generate_miku_libs_table();
 
-    let font_path = Path::new("assets/JetBrainsMono-Regular.ttf");
-    if !font_path.exists() {
-        println!("cargo:warning=JetBrainsMono-Regular.ttf not found, using fallback");
-        generate_empty_font();
-        return;
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    imagegen::generate(Path::new("docs/miku.png"), &out_dir, "mascot", 260, true);
+
+    // Beside the target directory, since OUT_DIR has a hash outside tools do
+    // not know
+    qoigen::generate(
+        Path::new("assets/wallpapers"),
+        &[Path::new("docs/miku.png")],
+        Path::new("target/wallpapers"),
+        qoigen::WALLPAPER, "wallpaper");
+
+    // Launcher icons, through the same converter at icon size
+    qoigen::generate(
+        Path::new("assets/icons"),
+        &[],
+        Path::new("target/icons"),
+        qoigen::ICON, "icon");
+
+    // Greeter portrait, cut to a circle here. A file, since the config can name
+    // another
+    qoigen::generate_round(
+        Path::new("docs/miku.png"),
+        Path::new("target/art"), "miku", GREETER_ART);
+
+    let programs = shadergen::generate(
+        Path::new("kernel/drivers/gpu/nvidia/shaders"), &out_dir, GPU_ARCH);
+    for p in &programs {
+        println!("cargo:warning=gpu program '{}': {} bytes, {} registers, \
+                  {} bytes shared, bank0 {:#x}", p.name, p.code.len(), p.regs, p.shared, p.const0);
     }
 
-    let font_data = std::fs::read(font_path).unwrap();
-    let font = fontdue::Font::from_bytes(
-        font_data,
-        fontdue::FontSettings {
-            scale: 16.0,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-
-    let mut output = String::new();
-    output.push_str("pub const CHAR_WIDTH: usize = 9;\n");
-    output.push_str("pub const CHAR_HEIGHT: usize = 16;\n");
-    output.push_str("pub const GLYPH_COUNT: usize = 95;\n\n");
-    output.push_str("pub static GLYPHS: [([u8; CHAR_WIDTH * CHAR_HEIGHT], u8); GLYPH_COUNT] = [\n");
-
-    for c in 0x20u8..=0x7Eu8 {
-        let ch = c as char;
-        let (metrics, bitmap) = font.rasterize(ch, 16.0);
-
-        let mut glyph = [0u8; 9 * 16];
-
-        let x_offset = if metrics.width < 9 {
-            (9 - metrics.width) / 2
-        } else {
-            0
-        };
-        let y_offset = if metrics.height < 16 {
-            let baseline = 13i32;
-            let top = baseline - metrics.ymin as i32 - metrics.height as i32;
-            top.max(0) as usize
-        } else {
-            0
-        };
-
-        for row in 0..metrics.height.min(16) {
-            for col in 0..metrics.width.min(9) {
-                let dst_y = row + y_offset;
-                let dst_x = col + x_offset;
-                if dst_y < 16 && dst_x < 9 {
-                    glyph[dst_y * 9 + dst_x] = bitmap[row * metrics.width + col];
-                }
-            }
-        }
-
-        let width = metrics.advance_width.round() as u8;
-        output.push_str(&format!("    ({:?}, {}),\n", glyph, width.max(9)));
-    }
-
-    output.push_str("];\n\n");
-    output.push_str("#[inline]\n");
-    output.push_str(
-        "pub fn get_glyph(c: char) -> Option<&'static ([u8; CHAR_WIDTH * CHAR_HEIGHT], u8)> {\n",
-    );
-    output.push_str("    let idx = c as usize;\n");
-    output.push_str("    if idx >= 0x20 && idx <= 0x7E {\n");
-    output.push_str("        Some(&GLYPHS[idx - 0x20])\n");
-    output.push_str("    } else {\n");
-    output.push_str("        None\n");
-    output.push_str("    }\n");
-    output.push_str("}\n");
-
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    let dest = Path::new(&out_dir).join("font_data.rs");
-    std::fs::write(dest, output).unwrap();
-
-    println!("cargo:rerun-if-changed=assets/JetBrainsMono-Regular.ttf");
+    println!("cargo:rerun-if-changed=lib/buildgen/imagegen.rs");
+    println!("cargo:rerun-if-changed=lib/buildgen/shadergen.rs");
+    println!("cargo:rerun-if-changed=lib/buildgen/qoigen.rs");
+    // Reruns on input changes
+    println!("cargo:rerun-if-changed=docs/miku.png");
     println!("cargo:rerun-if-changed=build.rs");
 }
 
-// Generate the MIKU_LIBS preload table (src/ldso.rs includes it) from the
-// shared library manifest, so the kernel can never go out of sync with the
-// set of libraries the builder produces.
+// Generates the MIKU_LIBS preload table (src/ldso.rs) from the shared library
+// manifest
 fn generate_miku_libs_table() {
-    let list = Path::new("src/lib/mikulibs/libs.list");
+    let list = Path::new("lib/mikulibs/libs.list");
     let src = std::fs::read_to_string(list)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", list.display()));
 
@@ -96,30 +81,13 @@ fn generate_miku_libs_table() {
         }
         let name = line.split(':').next().unwrap().trim();
         output.push_str(&format!(
-            "    MikuLib {{ name: \"{name}.so\", bytes: include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/lib/mikulibs/libs/{name}.so\")) }},\n"
+            "    MikuLib {{ name: \"{name}.so\", bytes: include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/lib/mikulibs/libs/{name}.so\")) }},\n"
         ));
     }
     output.push_str("];\n");
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(Path::new(&out_dir).join("miku_libs.rs"), output).unwrap();
-    println!("cargo:rerun-if-changed=src/lib/mikulibs/libs.list");
+    println!("cargo:rerun-if-changed=lib/mikulibs/libs.list");
 }
 
-fn generate_empty_font() {
-    let mut output = String::new();
-    output.push_str("pub const CHAR_WIDTH: usize = 9;\n");
-    output.push_str("pub const CHAR_HEIGHT: usize = 16;\n");
-    output.push_str("pub const GLYPH_COUNT: usize = 0;\n\n");
-    output.push_str("pub static GLYPHS: [([u8; CHAR_WIDTH * CHAR_HEIGHT], u8); 0] = [];\n\n");
-    output.push_str("#[inline]\n");
-    output.push_str(
-        "pub fn get_glyph(_c: char) -> Option<&'static ([u8; CHAR_WIDTH * CHAR_HEIGHT], u8)> {\n",
-    );
-    output.push_str("    None\n");
-    output.push_str("}\n");
-
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    let dest = std::path::Path::new(&out_dir).join("font_data.rs");
-    std::fs::write(dest, output).unwrap();
-}

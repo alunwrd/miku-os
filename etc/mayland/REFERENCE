@@ -1,0 +1,182 @@
+                       THE MAYLAND CONFIG, IN FULL
+
+Nothing reads this file. It is here because `msh` has `cat` and this machine
+has no manual pages and no way to reach the internet - and because eighty
+lines of prose re-parsed on every boot and every reload is eighty lines that
+belong somewhere else.
+
+--------------------------------------------------------------------------
+WHERE THE CONFIG LIVES
+
+    /etc/mayland/default.d/*.conf   what the build ships
+    /etc/mayland/may.conf           this machine's own file
+    /etc/mayland/conf.d/*.conf      yours; nothing is ever installed here
+
+Read in that order, in the order of their names inside a directory, and the
+later line wins. Authority rises down the list without exception - which is
+the one place this differs from systemd, where the main file is read *first*
+and a drop-in shipped by a package can override what you wrote by hand.
+
+Only `*.conf` is read. A file left behind by an editor joins nothing.
+
+A file in conf.d with the same name as one in default.d REPLACES it: the
+shipped one is not read at all. An empty file is therefore an off switch.
+`systemd` spells the same thing as a symlink to /dev/null.
+
+Without any of these files - a disk that was never mounted - `/bin/maywm`
+comes up with the bindings compiled into it, a shorter version of what
+default.d ships, so a machine still has a desktop somebody can drive.
+
+At startup and after every reload, the console lists every file that was
+read. That is `systemd-analyze cat-config`, except that it is not a second
+program and it happens at the moment it matters.
+
+--------------------------------------------------------------------------
+WHAT A LINE MAY SAY
+
+  $name = value      a variable. Collected from EVERY file before any line is
+                     dispatched, so it may be defined in a file read after the
+                     one that uses it, and the most authoritative layer wins.
+                     Its value may not contain another variable - that is what
+                     keeps a cycle unwritable rather than detected
+  source = <path>    another config, read in place, up to four deep. The path
+                     is a path, not a template: `$` in it is not expanded,
+                     because the list of files must be complete before any
+                     variable is known
+  <list> =           a list keyword with nothing after it CLEARS the list.
+                     bind, windowrule, animation, bezier, exec-once, and the
+                     panel's modules-left / modules-center / modules-right
+  exec-once = <cmd>  run once, after the desktop is up. Arguments allowed
+  monitor = NAME, MODE, POSITION, SCALE[, vrr, 0|1][, bitdepth, 8|10]
+                     Hyprland's line, unchanged. NAME is the connector as
+                     Linux names it (`display` lists them: DP-3, HDMI-A-1,
+                     Virtual-1), `desc:` and the start of the monitor's
+                     description, or nothing for every other output. MODE is
+                     preferred, highrr, highres, maxwidth or WxH[@R] - the
+                     closest of the monitor's own modes, width first, then
+                     height, then refresh; no @ means 60 Hz, as in Hyprland.
+                     POSITION is auto or XxY (one output, so it is kept and
+                     not used); SCALE is 1 or auto. `monitor = NAME, disable`
+                     is read, and said to have no effect yet.
+                     Put on when the desktop comes up, on reload and when a
+                     monitor is plugged in - not on every change, so a
+                     `display mode` typed by hand stays until then.
+                     transform, mirror, cm, sdr*, icc and other scales are
+                     refused by name. No monitor line: the outputs stay as
+                     the boot made them
+  misc { vrr = 0|1 } variable refresh for every output whose monitor line does
+                     not say. 2 and 3 (fullscreen only) are refused
+
+  theme        page, card, accent, on_accent, text, text_muted, border
+               the one block both programs read
+    wallpaper = <path>
+               the picture behind everything; no line at all means the
+               gradient. It must be a QOI - the machine decodes exactly one
+               image format, because that decoder is ninety lines and a PNG
+               decoder is an inflate implementation with a picture attached.
+               The build converts anything in `assets/wallpapers/` into
+               /etc/mayland/wallpapers/<name>.qoi, so drop a JPEG in there and
+               name the result here. It is scaled to cover the screen and
+               cropped evenly, which is what a wallpaper wants.
+
+  animations   enabled
+    bezier = <name>, <x1>, <y1>, <x2>, <y2>
+    animation = <class>, <on>, <speed>, <curve>[, <style>]
+      class    windows windowsIn windowsOut layers layersIn layersOut
+               fade workspaces
+      speed    hundreds of milliseconds, so 4 is 400 ms
+      style    slide | fade | popin <n>%
+      fade and popin need the shader pass, so they want decoration.blur on;
+      slide works wherever the desktop is composed at all
+
+  panel        height, position = top | bottom, workspaces
+               modules-left, modules-center, modules-right
+    modules    workspaces window clock mem net uptime
+
+  general      gaps_in, gaps_out, layout = master | dwindle | float
+               border_size, col.active_border, col.inactive_border
+  decoration   rounding, active_opacity, shadow_strength, shadow_range
+  decoration.blur   enabled, size
+  dwindle      split_ratio
+  master       mfact
+  input        kb_layout = us | ru | us,ru (up to four, in switching order)
+               kb_options = grp:alt_shift_toggle (or nothing: no switch)
+               repeat_rate, repeat_delay, follow_mouse, sensitivity,
+               natural_scroll
+
+  submap = <name> ... submap = reset
+    the lines between belong to that map, and it is bound instead of the
+    default one - so a config may have more bindings than the sixty-four
+    the compositor holds at once
+
+  bind[flags] = <mods>, <key>, <dispatcher>[, <argument>]
+    flags        e repeat while held   r on release   n do not swallow
+                 i ignore other mods   l accepted, there is no lock screen
+                 m mouse, which is only the key being a button
+    mods         SUPER SHIFT CTRL ALT, spaces or plus signs between them
+    key          a character; Return Escape Tab Space Backspace;
+                 F1..F12; Up Down Left Right Home End PageUp PageDown
+                 Insert Delete; minus equal comma period slash semicolon
+                 apostrophe grave bracketleft bracketright backslash;
+                 mouse:272 and the rest, or mouse_left mouse_right
+    dispatcher   killactive closewindow killwindow
+                 workspace movetoworkspace movetoworkspacesilent
+                 movefocus cyclenext focuswindow focuswindowbyclass
+                 focuscurrentorlast swapwindow swapnext
+                 togglefloating setfloating settiled fullscreen pin
+                 moveactive resizeactive centerwindow splitratio layout
+                 movewindow resizewindow movecursor movecursortocorner
+                 submap reload exec execr
+    a workspace argument may be a number, +1 / -1, e+1 / e-1 (counting only
+    workspaces with something on them), or `previous`
+
+  windowrule = <what>, class:<pattern> | title:<pattern>
+    what         float tile fullscreen pin nofocus noblur blur center
+                 opacity <n>, rounding <n>, workspace <n>
+                 size <w> <h>, move <x> <y>
+    the pattern is a substring, so `class:term` catches `xterm`
+
+  A colour is written rgb(), rgba() or 0x - never as #rrggbb, because a hash
+  starts a comment here as it does in hyprland.conf, and `page = #0f0d13` is
+  the line `page =` with nothing after it.
+
+  rgba(RRGGBBAA) means see-through, not darker. The bar is a surface the
+  compositor blends over the wallpaper, so `card = rgba(211f24bf)` is a pane
+  with the desktop behind it. A colour written without an alpha is solid, so
+  `card = rgb(211f24)` is the bar it always was. Two things follow:
+
+    - the alpha of `card` is the alpha of the whole bar, because the pills on
+      it are shades of it and inherit what it says
+    - `col.active_border` and `col.inactive_border` accept an alpha and do not
+      use it. A window's ring is put on the screen by the copy engine, which
+      cannot blend, and a config that quietly meant something else would be
+      worse than one that says this out loud
+
+--------------------------------------------------------------------------
+WHAT IT SAYS BACK
+
+Every complaint names its file and its line:
+
+    maywm: /etc/mayland/conf.d/99-mine.conf:4: this desktop has no such
+           setting - gaps_inn
+
+A section this desktop does not have - cursor, debug, group, gestures, and
+every key of misc but vrr - says so once rather than once a line, and a
+keyword it does not have - env, layerrule, plugin - says so once as well.
+
+A monitor line about an output that is not there, or has nothing plugged
+in, says so with the outputs that are:
+
+    maywm: monitor DP-2: nothing is plugged into it - connected: DP-3
+
+and the configuration it sent, or why it was refused:
+
+    maywm: outputs: DP-3 1920x1080@200
+
+Two files of the SAME layer setting one thing is a mistake nobody can see, so
+it is said out loud:
+
+    maywm: /etc/mayland/conf.d/99-mine.conf:4: this setting -
+           already set in /etc/mayland/conf.d/20-look.conf:7
+
+A higher layer overriding a lower one is silent. That is what layers are for.

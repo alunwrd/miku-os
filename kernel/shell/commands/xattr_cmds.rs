@@ -34,7 +34,7 @@ pub fn cmd_setxattr(path: &str, name: &str, value: &str) {
     }
     let result = with_ext2_pub(|fs| -> Result<(), FsError> {
         let ino = fs.resolve_path(path)?;
-        fs.set_xattr(ino, crate::fs::ext::xattr::XATTR_INDEX_USER, name, value.as_bytes())
+        fs.ext3_set_xattr(ino, crate::fs::ext::xattr::XATTR_INDEX_USER, name, value.as_bytes())
     });
     match result {
         Some(Ok(())) => print_success!("  xattr '{}' set", name),

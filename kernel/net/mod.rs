@@ -1,59 +1,69 @@
-pub mod arp;
-pub mod dns;
+// The byte layers are `mikunet`, the same crate `cd lib/net && cargo test` runs
+// against
+pub use mikunet::ipv4;
+pub use mikunet::icmp;
+pub use mikunet::stack::{arp, eth, udp};
+
 pub mod dhcp;
-pub mod eth;
-pub mod icmp;
-pub mod ipv4;
 pub mod tcp;
-pub mod tls;
-pub mod tls_bignum;
-pub mod tls_crypto;
-pub mod tls_rsa;
-pub mod udp;
 pub mod tcp_listener;
-pub mod ntp;
-pub mod traceroute;
-pub mod http;
-pub mod tls_ecdh;
-pub mod http2;
-pub mod tls_gcm;
+
+/// Uptime in milliseconds
+///
+/// `mikunet` counts in milliseconds because its tests need a clock they can
+/// set. This is the one place the kernel's 250 Hz tick is converted
+#[inline]
+pub fn now_ms() -> u64 {
+    crate::fs::procfs::uptime_ticks() * (1000 / crate::arch::x86_64::interrupts::PIT_HZ as u64)
+}
+pub mod irq;
 pub mod socket;
+pub mod raw;
 pub mod rx;
+pub mod selftest;
 
 extern crate alloc;
 use alloc::boxed::Box;
 use arp::ArpTable;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use eth::{EthFrame, ETHERTYPE_IP};
 use crate::drivers::bus::pci::{
     DEV_E1000_82540EM, DEV_E1000_82545EM, DEV_E1000_82574L, DEV_E1000_82579LM, DEV_E1000_I217,
     DEV_RTL8139, DEV_RTL8168, DEV_RTL8169, VENDOR_INTEL, VENDOR_REALTEK, DEV_VIRTIO_NET, VENDOR_VIRTIO,
 };
 use spin::Mutex;
-pub use crate::arch::x86_64::grub::HHDM as HHDM_OFFSET;
-pub use crate::arch::x86_64::grub::phys_to_virt;
-// Net drivers allocate descriptor rings and packet buffers on the kernel
-// heap (Box::new), whose virtual addresses live in HHDM (0xFFFF8000_…),
-// not in the kernel image (0xFFFFFFFF_8000…). Use the range-aware
-// translator so 'virt_to_phys' returns a usable DMA address for both heap
-// and kernel-image pointers - feeding the chip a kernel-image-only
-// 'virt_to_phys' of a HHDM heap address gives garbage and the chip then
-// DMAs into nowhere (TX appears "ok" because send() only checks the OWN
-// bit it set itself; RX is silently dead - exactly the "tx: N rx: 0"
-// symptom on RTL8168).
-pub use crate::arch::x86_64::grub::any_virt_to_phys as virt_to_phys;
 
 static NET_READY: AtomicBool = AtomicBool::new(false);
 pub static CTRL_C: AtomicBool = AtomicBool::new(false);
 static DRIVER_NAME: Mutex<&'static str> = Mutex::new("none");
 
+/// What the driver knows about a frame as it hands it up
+#[derive(Clone, Copy, Default)]
+pub struct RxMeta {
+    /// True when the transport checksum must not be verified in software: the
+    /// device already validated it, or (virtio) the backend handed the frame
+    /// over with a deliberately incomplete checksum only it could complete.
+    /// Verifying either would drop good packets
+    pub skip_l4_csum: bool,
+}
+
 pub trait NetworkDriver: Send {
     fn send(&mut self, data: &[u8]) -> bool;
-    fn recv(&mut self, handler: &mut dyn FnMut(&[u8]));
+    /// Drains the receive ring, passing each frame to `handler`.
+    ///
+    /// The handler returns false to stop. A driver must honour that before it
+    /// releases the descriptor and advances its tail, so the frame it did not
+    /// take stays in the ring for the next call
+    fn recv(&mut self, handler: &mut dyn FnMut(&[u8], RxMeta) -> bool);
     fn has_packet(&self) -> bool;
     fn link_up(&self) -> bool;
     fn get_mac(&self) -> [u8; 6];
     fn diag(&self) {}
+    /// Have the card signal received frames (`net::irq`). Whether it will;
+    /// a driver that cannot is pumped every tick
+    fn enable_irq(&mut self, _f: crate::drivers::bus::msi::PciFn) -> bool {
+        false
+    }
 }
 
 pub(crate) struct NetState {
@@ -66,6 +76,11 @@ pub(crate) struct NetState {
     arp: ArpTable,
     tx_count: u64,
     rx_count: u64,
+    /// Frames the demux threw away, by reason. A healthy loopback run leaves
+    /// all three at zero
+    pub(crate) drop_csum: u64,
+    pub(crate) drop_frag: u64,
+    pub(crate) drop_addr: u64,
 }
 
 impl NetState {
@@ -80,11 +95,30 @@ impl NetState {
             arp: ArpTable::new(),
             tx_count: 0,
             rx_count: 0,
+            drop_csum: 0,
+            drop_frag: 0,
+            drop_addr: 0,
         }
     }
 }
 
 pub static NET: Mutex<NetState> = Mutex::new(NetState::new());
+
+/// Hands one built ethernet frame to the driver.
+///
+/// The single place a frame leaves the machine, and the only place tx_count is
+/// raised, so a full transmit ring does not count as sent
+pub fn tx_frame(frame: &[u8]) -> bool {
+    let mut state = NET.lock();
+    let sent = match state.driver.as_mut() {
+        Some(drv) => drv.send(frame),
+        None => false,
+    };
+    if sent {
+        state.tx_count += 1;
+    }
+    sent
+}
 
 pub fn map_mmio(phys_addr: u64, size: u64) {
     crate::mm::vmm::map_mmio_uc(phys_addr, size);
@@ -166,7 +200,11 @@ pub fn init() -> Result<(), &'static str> {
         _ => return Err("unsupported network adapter"),
     }
 
-    if let Some(drv) = initialized_driver {
+    if let Some(mut drv) = initialized_driver {
+        let f = crate::drivers::bus::msi::PciFn { bus: pci_dev.bus, dev: pci_dev.dev, func: pci_dev.func };
+        if !drv.enable_irq(f) {
+            crate::serial_println!("[net] {} is polled every tick", drv_name);
+        }
         state.driver = Some(drv);
         let mac = state.mac;
         drop(state);
@@ -186,8 +224,8 @@ pub fn is_ready() -> bool {
     NET_READY.load(Ordering::Acquire)
 }
 
-/// Drain and dispatch pending RX. Kept as the historical entry point; all
-/// real work happens in the central demux (see rx.rs)
+/// Drains and dispatches pending RX. All the work is in the central demux (see
+/// rx.rs)
 pub fn poll() {
     rx::pump();
 }
@@ -196,19 +234,19 @@ pub fn send_udp(dst_ip: &[u8; 4], dst_port: u16, src_port: u16, data: &[u8]) -> 
     if !is_ready() {
         return false;
     }
-    let mut state = NET.lock();
-    let mac = state.mac;
-    let ip = state.ip;
-
-    let dst_mac = match state.arp.lookup(dst_ip) {
-        Some(m) => m,
-        None => {
-            let mut arp_req = [0u8; 64];
-            let n = arp::send_request(&mac, &ip, dst_ip, &mut arp_req);
-            if let Some(drv) = state.driver.as_mut() {
-                drv.send(&arp_req[..n]);
+    let (mac, ip, dst_mac) = {
+        let state = NET.lock();
+        let mac = state.mac;
+        let ip = state.ip;
+        match state.arp.lookup(dst_ip, now_ms()) {
+            Some(m) => (mac, ip, m),
+            None => {
+                drop(state);
+                let mut arp_req = [0u8; 64];
+                let n = arp::request_frame(&mac, &ip, dst_ip, &mut arp_req);
+                tx_frame(&arp_req[..n]);
+                return false;
             }
-            return false;
         }
     };
 
@@ -224,13 +262,7 @@ pub fn send_udp(dst_ip: &[u8; 4], dst_port: u16, src_port: u16, data: &[u8]) -> 
     let eth_len = EthFrame::build(&dst_mac, &mac, ETHERTYPE_IP, &ip_buf[..ip_len], &mut eth_buf);
     if eth_len == 0 { return false; }
 
-    if let Some(drv) = state.driver.as_mut() {
-        if drv.send(&eth_buf[..eth_len]) {
-            state.tx_count += 1;
-            return true;
-        }
-    }
-    false
+    tx_frame(&eth_buf[..eth_len])
 }
 
 /// Send one UDP datagram, resolving the destination MAC first (limited
@@ -264,14 +296,39 @@ pub fn udp_send_resolved(src_port: u16, dst_ip: &[u8; 4], dst_port: u16, data: &
     let eth_len = EthFrame::build(&dst_mac, &our_mac, ETHERTYPE_IP, &ip_buf[..ip_len], &mut eth_buf);
     if eth_len == 0 { return false; }
 
-    let mut state = NET.lock();
-    if let Some(drv) = state.driver.as_mut() {
-        if drv.send(&eth_buf[..eth_len]) {
-            state.tx_count += 1;
-            return true;
-        }
+    tx_frame(&eth_buf[..eth_len])
+}
+
+/// Sends one IP packet with a payload the caller has already built
+///
+/// The route, the ARP lookup and the Ethernet frame are as for UDP; the
+/// protocol and the hop limit come from the caller. A raw ICMP socket is the
+/// only user
+pub fn ip_send_ttl(dst_ip: &[u8; 4], proto: u8, payload: &[u8], ttl: u8) -> bool {
+    if !is_ready() {
+        return false;
     }
-    false
+    let our_ip = get_ip();
+    let our_mac = get_mac();
+
+    let dst_mac = if *dst_ip == [255, 255, 255, 255] {
+        eth::BROADCAST_MAC
+    } else {
+        match resolve_arp(dst_ip, &our_ip, &our_mac) {
+            Some(m) => m,
+            None => return false,
+        }
+    };
+
+    let mut ip_buf = [0u8; 1520];
+    let ip_len = ipv4::build_ttl(&our_ip, dst_ip, proto, payload, ttl, &mut ip_buf);
+    if ip_len == 0 { return false; }
+
+    let mut eth_buf = [0u8; 1540];
+    let eth_len = EthFrame::build(&dst_mac, &our_mac, ETHERTYPE_IP, &ip_buf[..ip_len], &mut eth_buf);
+    if eth_len == 0 { return false; }
+
+    tx_frame(&eth_buf[..eth_len])
 }
 
 pub fn set_ip(ip: [u8; 4], gw: [u8; 4], mask: [u8; 4]) {
@@ -282,6 +339,24 @@ pub fn set_ip(ip: [u8; 4], gw: [u8; 4], mask: [u8; 4]) {
 }
 
 pub fn get_mac() -> [u8; 6] { NET.lock().mac }
+
+/// Where the next ephemeral port is taken; `u32::MAX` until the first
+static NEXT_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// An ephemeral port (49152-65535) for a connection or an unbound datagram
+/// socket: each in turn from a random start (RFC 6056 3.3.2). The caller walks
+/// on past one in use.
+///
+/// A port reused at once would give an HTTP client's next connection the
+/// 4-tuple the server just closed and keeps in TIME_WAIT, and its SYN would be
+/// taken for an old duplicate
+pub fn ephemeral_port() -> u16 {
+    if NEXT_PORT.load(Ordering::Relaxed) == u32::MAX {
+        let start = crate::kcore::random::random_u64() as u32 & 0x3FFF;
+        let _ = NEXT_PORT.compare_exchange(u32::MAX, start, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    49152 + (NEXT_PORT.fetch_add(1, Ordering::Relaxed) & 0x3FFF) as u16
+}
 pub fn get_ip() -> [u8; 4] { NET.lock().ip }
 
 pub fn get_dns() -> [u8; 4] { NET.lock().dns }
@@ -289,7 +364,7 @@ pub fn set_dns(dns: [u8; 4]) { NET.lock().dns = dns; }
 
 /// netd is a mikuD background service, roughly analogous to systemd-networkd.
 /// It waits for link-up, runs DHCP, and sleeps once a lease is applied.
-/// Failures are logged but do not block boot; the shell still comes up.
+/// Failures are logged but do not block boot
 fn netd_link_wait(timeout_ticks: u64) -> bool {
     let start = crate::fs::procfs::uptime_ticks();
     loop {
@@ -305,15 +380,24 @@ fn netd_link_wait(timeout_ticks: u64) -> bool {
 }
 
 pub fn netd_thread() -> ! {
-    // Without a NIC there is nothing for us to do; idle quietly
+    // Without a NIC there is nothing to do
     if !is_ready() {
         crate::serial_println!("[netd] no network adapter - going dormant");
         loop { crate::sched::sleep(60_000); }
     }
 
-    // Real switches and PHYs need a moment to come up. 3 s is generous
-    // for most desktop NICs; if the cable is unplugged we still proceed
-    // (the discover will simply time out and we'll retry later)
+    // The card belongs to a program, so the wire is not touched at all: a DHCP
+    // discover from here would be answered to a stack that never sees the
+    // reply, and the lease would be taken from the one that does. Nor does this
+    // pump; the reader's own `poll` drives the receive path
+    if raw::enabled() {
+        crate::serial_println!("[netd] card handed to /dev/net0 - standing down");
+        loop { crate::sched::sleep(60_000); }
+    }
+
+    // Real switches and PHYs need a moment to come up. 3 s is enough for most
+    // desktop NICs; if the cable is unplugged it proceeds anyway (the discover
+    // times out and is retried later)
     let linked = netd_link_wait(750); // 3 s
     if !linked {
         crate::serial_println!("[netd] link not up after 3 s - trying DHCP anyway");
@@ -322,8 +406,8 @@ pub fn netd_thread() -> ! {
     }
 
     loop {
-        // Try a few times before giving up; do_dhcp() already retries
-        // discover 4x internally so this mostly covers cable-unplug scenarios
+        // A few tries before giving up; do_dhcp() already retries discover 4x
+        // internally, so this mostly covers an unplugged cable
         let mut lease_secs: u64 = 0;
         let mut got_lease = false;
         for attempt in 1..=3u32 {
@@ -331,6 +415,9 @@ pub fn netd_thread() -> ! {
                 Some(r) => {
                     set_ip(r.ip, r.gw, r.mask);
                     set_dns(r.dns);
+                    // The resolver cache is a program's, and a program lives
+                    // for one command, so a new lease leaves no stale answer
+                    // behind
                     lease_secs = r.lease_secs as u64;
                     crate::serial_println!(
                         "[netd] DHCP lease: ip={}.{}.{}.{} gw={}.{}.{}.{} dns={}.{}.{}.{} lease={}s",
@@ -352,8 +439,8 @@ pub fn netd_thread() -> ! {
             crate::serial_println!("[netd] no DHCP response - retrying in 5 min ('dhcp' forces it now)");
         }
 
-        // RFC 2131: renew at T1 = lease/2. Servers that send no lease time
-        // get a 1 h default; with no lease at all we retry in 5 min
+        // RFC 2131: renew at T1 = lease/2. A server sending no lease time gets
+        // a 1 h default; with no lease at all retry in 5 min
         let renew_ticks: u64 = if got_lease {
             let secs = if lease_secs > 0 { lease_secs } else { 3600 };
             secs.saturating_mul(TICK_HZ) / 2
@@ -362,11 +449,14 @@ pub fn netd_thread() -> ! {
         };
 
         // Background pump until renewal is due: keeps ARP answered and TCP
-        // segments queued even when no thread is blocked in a socket op
+        // segments queued even when no thread is blocked in a socket op. With
+        // an interrupting card this sleeps until a frame comes; without one, a
+        // tick (`net::irq::wait`)
         let start = crate::fs::procfs::uptime_ticks();
         while crate::fs::procfs::uptime_ticks().wrapping_sub(start) < renew_ticks {
+            irq::take_pending();
             rx::pump();
-            crate::sched::sleep(1);
+            irq::wait();
         }
         crate::serial_println!("[netd] DHCP lease renewal due");
     }
@@ -421,29 +511,34 @@ fn wait_rdtsc_ms(ms: u64) {
         if CTRL_C.load(Ordering::SeqCst) { return; }
         if rdtsc().wrapping_sub(start) >= target_cycles { return; }
         rx::pump();
-        crate::sched::yield_now();
+        crate::sched::sleep(1); // a tick, not a spin: see sched::wait
     }
 }
 
-pub fn cmd_ping(hostname: &str, target_ip: &[u8; 4], count: usize) {
-    if !is_ready() {
-        crate::print_error!("ping: no adapter");
-        return;
-    }
+/// What a run of echo requests came back with. Times are microseconds
+#[derive(Clone, Copy, Default)]
+pub struct PingStats {
+    pub sent: usize,
+    pub received: usize,
+    pub rtt_min_us: u64,
+    pub rtt_max_us: u64,
+    pub rtt_avg_us: u64,
+}
 
-    let our_ip = get_ip();
+/// Sends `count` echo requests and collects the replies, printing a line per
+/// reply when `verbose`.
+///
+/// `/bin/ping` goes over an ICMP socket; this is for the selftest, which checks
+/// reachability of the layer that is in here
+pub fn ping_probe(target_ip: &[u8; 4], our_ip: &[u8; 4], count: usize, verbose: bool) -> PingStats {
+    let mut stats = PingStats::default();
+    if !is_ready() {
+        return stats;
+    }
+    let our_ip = *our_ip;
     let our_mac = get_mac();
     let ping_id: u16 = 0x4D4B;
     let payload = b"MikuOS ping data 56b padding xxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-
-    crate::cprintln!(57, 197, 187,
-        "PING {} ({}.{}.{}.{}): 56 bytes of data.",
-        hostname,
-        target_ip[0], target_ip[1], target_ip[2], target_ip[3]
-    );
-
-    CTRL_C.store(false, Ordering::SeqCst);
-    x86_64::instructions::interrupts::enable();
 
     let mut sent = 0usize;
     let mut received = 0usize;
@@ -454,8 +549,8 @@ pub fn cmd_ping(hostname: &str, target_ip: &[u8; 4], count: usize) {
     let dst_mac = match resolve_arp(target_ip, &our_ip, &our_mac) {
         Some(m) => m,
         None => {
-            crate::print_error!("ping: arp resolution failed");
-            return;
+            if verbose { crate::print_error!("ping: arp resolution failed"); }
+            return stats;
         }
     };
 
@@ -464,32 +559,30 @@ pub fn cmd_ping(hostname: &str, target_ip: &[u8; 4], count: usize) {
     let icmp_h = match rx::register_icmp() {
         Some(h) => h,
         None => {
-            crate::print_error!("ping: too many icmp waiters");
-            return;
+            if verbose { crate::print_error!("ping: too many icmp waiters"); }
+            return stats;
         }
     };
 
     'ping: for seq in 1..=count {
         if CTRL_C.load(Ordering::SeqCst) {
-            crate::println!("^C");
+            if verbose { crate::println!("^C"); }
             break;
         }
 
-        let mut icmp_buf = [0u8; 64];
-        let icmp_len = icmp::build_echo_request(ping_id, seq as u16, &payload[..56], &mut icmp_buf);
+        let icmp_buf = icmp::echo_request(ping_id, seq as u16, &payload[..56]);
         let mut ip_buf = [0u8; 100];
-        let ip_len = ipv4::build(&our_ip, target_ip, ipv4::PROTO_ICMP, &icmp_buf[..icmp_len], &mut ip_buf);
+        let ip_len = ipv4::build(&our_ip, target_ip, ipv4::PROTO_ICMP, &icmp_buf, &mut ip_buf);
         let mut eth_buf = [0u8; 128];
         let eth_len = EthFrame::build(&dst_mac, &our_mac, ETHERTYPE_IP, &ip_buf[..ip_len], &mut eth_buf);
 
         let t_start = rdtsc();
 
-        {
-            let mut state = NET.lock();
-            if let Some(drv) = state.driver.as_mut() {
-                drv.send(&eth_buf[..eth_len]);
+        if !tx_frame(&eth_buf[..eth_len]) {
+            if verbose {
+                crate::print_warn!("ping: transmit ring full, icmp_seq={} not sent", seq);
             }
-            state.tx_count += 1;
+            continue;
         }
         sent += 1;
 
@@ -498,13 +591,13 @@ pub fn cmd_ping(hostname: &str, target_ip: &[u8; 4], count: usize) {
 
         loop {
             if CTRL_C.load(Ordering::SeqCst) {
-                crate::println!("^C");
+                if verbose { crate::println!("^C"); }
                 break 'ping;
             }
 
             rx::pump();
             while let Some(ev) = rx::icmp_take(icmp_h) {
-                if ev.icmp_type == icmp::ICMP_ECHO_REPLY
+                if ev.icmp_type == icmp::ECHO_REPLY
                     && ev.id == ping_id
                     && ev.seq == seq as u16
                 {
@@ -517,21 +610,27 @@ pub fn cmd_ping(hostname: &str, target_ip: &[u8; 4], count: usize) {
                     if rtt_us < rtt_min { rtt_min = rtt_us; }
                     if rtt_us > rtt_max { rtt_max = rtt_us; }
                     received += 1;
-                    crate::cprintln!(100, 220, 150,
-                        "64 bytes from {}.{}.{}.{}: icmp_seq={} ttl={} time={}.{} ms",
-                        target_ip[0], target_ip[1], target_ip[2], target_ip[3],
-                        seq, ev.ttl, ri, rf
-                    );
+                    if verbose {
+                        crate::cprintln!(100, 220, 150,
+                            "64 bytes from {}.{}.{}.{}: icmp_seq={} ttl={} time={}.{} ms",
+                            target_ip[0], target_ip[1], target_ip[2], target_ip[3],
+                            seq, ev.ttl, ri, rf
+                        );
+                    }
                     got_reply = true;
                 }
             }
 
             if got_reply { break; }
             if crate::fs::procfs::uptime_ticks().wrapping_sub(t_start_wait) >= 2000 { break; }
-            crate::sched::yield_now();
+            // Until the reply is queued (`rx::handle_icmp` wakes the key), or
+            // the backstop
+            let deadline = crate::kcore::time::now_ns().saturating_add(irq::backstop_ns());
+            crate::sched::wait::keyed(crate::sched::wait::key::net_icmp(icmp_h))
+                .wait_unless(deadline, || rx::icmp_pending(icmp_h));
         }
 
-        if !got_reply && !CTRL_C.load(Ordering::SeqCst) {
+        if !got_reply && !CTRL_C.load(Ordering::SeqCst) && verbose {
             crate::print_error!("request timeout for icmp_seq={}", seq);
         }
 
@@ -542,25 +641,14 @@ pub fn cmd_ping(hostname: &str, target_ip: &[u8; 4], count: usize) {
 
     rx::unregister_icmp(icmp_h);
 
-    crate::cprintln!(57, 197, 187, "");
-    crate::cprintln!(57, 197, 187,
-        "--- {}.{}.{}.{} ping statistics ---",
-        target_ip[0], target_ip[1], target_ip[2], target_ip[3]
-    );
-    let loss = if sent > 0 { ((sent - received) * 100) / sent } else { 100 };
-    crate::cprintln!(230, 240, 240,
-        "{} packets transmitted, {} received, {}% packet loss",
-        sent, received, loss
-    );
+    stats.sent = sent;
+    stats.received = received;
     if received > 0 {
-        let avg = rtt_sum / received as u64;
-        crate::cprintln!(230, 240, 240,
-            "rtt min/avg/max = {}.{}/{}.{}/{}.{} ms",
-            rtt_min / 1000, (rtt_min % 1000) / 100,
-            avg / 1000, (avg % 1000) / 100,
-            rtt_max / 1000, (rtt_max % 1000) / 100,
-        );
+        stats.rtt_min_us = rtt_min;
+        stats.rtt_max_us = rtt_max;
+        stats.rtt_avg_us = rtt_sum / received as u64;
     }
+    stats
 }
 
 fn is_same_subnet(ip: &[u8; 4], our_ip: &[u8; 4], mask: &[u8; 4]) -> bool {
@@ -582,7 +670,7 @@ pub fn resolve_arp(target_ip: &[u8; 4], our_ip: &[u8; 4], our_mac: &[u8; 6]) -> 
         gw
     };
 
-    if let Some(m) = NET.lock().arp.lookup(&arp_target) {
+    if let Some(m) = NET.lock().arp.lookup(&arp_target, now_ms()) {
         return Some(m);
     }
 
@@ -593,20 +681,19 @@ pub fn resolve_arp(target_ip: &[u8; 4], our_ip: &[u8; 4], our_mac: &[u8; 6]) -> 
 
         {
             let mut req = [0u8; 64];
-            let n = arp::send_request(our_mac, our_ip, &arp_target, &mut req);
-            let mut s = NET.lock();
-            if let Some(d) = s.driver.as_mut() { d.send(&req[..n]); }
+            let n = arp::request_frame(our_mac, our_ip, &arp_target, &mut req);
+            tx_frame(&req[..n]);
         }
 
         let start = crate::fs::procfs::uptime_ticks();
         loop {
             if CTRL_C.load(Ordering::SeqCst) { return None; }
             rx::pump();
-            if let Some(m) = NET.lock().arp.lookup(&arp_target) {
+            if let Some(m) = NET.lock().arp.lookup(&arp_target, now_ms()) {
                 return Some(m);
             }
             if crate::fs::procfs::uptime_ticks().wrapping_sub(start) >= 500 { break; }
-            crate::sched::yield_now();
+            crate::sched::sleep(1); // a tick, not a spin: see sched::wait
         }
     }
     None
@@ -643,7 +730,40 @@ pub fn cmd_net(args: &str) {
         "pci" => cmd_pci_scan(),
         "arp" => cmd_arp(),
         "diag" => cmd_diag(),
-        _ => crate::println!("net status|poll|ip <ip> <gw> <mask>|dns [<ip>]|send ...|pci|arp|diag"),
+        "test" => cmd_selftest(),
+        _ => crate::println!(
+            "net status|poll|ip <ip> <gw> <mask>|dns [<ip>]|send ...|pci|arp|diag|test"),
+    }
+}
+
+/// `net test`: runs the network selftest and prints the result.
+///
+/// Reachable from the boot line as `run=net_test`, so a headless QEMU run gets
+/// a pass or fail from one boot
+fn cmd_selftest() {
+    crate::cprintln!(57, 197, 187, "net: selftest");
+    let report = selftest::run();
+
+    for c in &report.cases {
+        if c.skipped {
+            crate::cprintln!(220, 220, 100, "  skip  {}", c.name);
+        } else if c.ok {
+            crate::cprintln!(100, 220, 150, "  ok    {}", c.name);
+        } else {
+            crate::print_error!("  FAIL  {}", c.name);
+        }
+        crate::println!("          {}", c.detail);
+        crate::serial_println!("[net-test] {} {} - {}",
+            if c.skipped { "SKIP" } else if c.ok { "ok  " } else { "FAIL" },
+            c.name, c.detail);
+    }
+
+    let (pass, fail, skip) = (report.passed(), report.failed(), report.skipped());
+    crate::serial_println!("[net-test] {} passed, {} failed, {} skipped", pass, fail, skip);
+    if fail == 0 {
+        crate::print_success!("net: {} passed, {} skipped", pass, skip);
+    } else {
+        crate::print_error!("net: {} passed, {} FAILED, {} skipped", pass, fail, skip);
     }
 }
 
@@ -672,6 +792,11 @@ fn cmd_status() {
         "  dns:    {}.{}.{}.{}", state.dns[0], state.dns[1], state.dns[2], state.dns[3]);
     crate::cprintln!(120, 200, 200, "  tx:     {}", state.tx_count);
     crate::cprintln!(120, 200, 200, "  rx:     {}", state.rx_count);
+    if state.drop_csum | state.drop_frag | state.drop_addr != 0 {
+        crate::cprintln!(255, 180, 80,
+            "  drops:  csum={} frag={} addr={}",
+            state.drop_csum, state.drop_frag, state.drop_addr);
+    }
 }
 
 fn cmd_setip(ip_str: &str, gw_str: &str, mask_str: &str) {

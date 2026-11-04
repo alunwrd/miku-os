@@ -1,17 +1,24 @@
 // AHCI (SATA) driver behind the 'BlockDriver' trait
 //
-// Modern chipsets expose SATA disks only through an AHCI HBA (PCI class
-// 01.06) - the legacy IDE ports the ATA driver uses simply don't exist
-// there, so this driver is what makes MikuOS's storage stack work on real  hardware
+// Modern chipsets expose SATA disks only through an AHCI HBA (PCI class 01.06);
+// the legacy IDE ports the ATA driver uses do not exist there.
 //
-// Scope mirrors the other drivers: one command slot, one PRD entry into a
-// 64 KiB bounce buffer, polled completion (PxCI). The HBA registers are
-// MMIO behind BAR5, mapped uncached through the HHDM window
+// One command slot, one PRD entry into a 64 KiB bounce buffer. The HBA
+// registers are MMIO behind BAR5, mapped uncached through the HHDM window.
+//
+// Completions arrive by interrupt, as the NVMe driver's do: one MSI for the
+// HBA. Its handler takes each interrupting port's PxIS bits, errors included,
+// into `PORT_EVENTS`, clears them for the next message, and wakes the port's
+// queue. The waiter looks at PxCI itself. It polls where it may not sleep
+// (`nvme::may_sleep`'s rules), and everywhere with `nvmepoll`
 
 extern crate alloc;
 
-use alloc::boxed::Box;
-use spin::Mutex as SpinMutex;
+use crate::mm::dma::DmaBox;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+use crate::kcore::sched_lock::SchedMutex;
+use crate::sched::WaitQueue;
 
 use crate::io::block::driver::{BlkError, BlockDevInfo, BlockDriver};
 use crate::drivers::bus::pci::{pci_read32, pci_read8, PCI_ADDR, PCI_DATA, pci_addr};
@@ -19,9 +26,11 @@ use crate::drivers::bus::pci::{pci_read32, pci_read8, PCI_ADDR, PCI_DATA, pci_ad
 // HBA global registers (offsets from ABAR)
 const HBA_CAP: u64 = 0x00;
 const HBA_GHC: u64 = 0x04;
+const HBA_IS:  u64 = 0x08;
 const HBA_PI:  u64 = 0x0C;
 
 const GHC_AE: u32 = 1 << 31;
+const GHC_IE: u32 = 1 << 1;
 
 // Per-port registers (offsets from ABAR + 0x100 + port * 0x80)
 const PX_CLB:  u64 = 0x00;
@@ -29,6 +38,7 @@ const PX_CLBU: u64 = 0x04;
 const PX_FB:   u64 = 0x08;
 const PX_FBU:  u64 = 0x0C;
 const PX_IS:   u64 = 0x10;
+const PX_IE:   u64 = 0x14;
 const PX_CMD:  u64 = 0x18;
 const PX_TFD:  u64 = 0x20;
 const PX_SIG:  u64 = 0x24;
@@ -49,6 +59,59 @@ const TFD_BSY: u32 = 1 << 7;
 
 // Fatal error bits in PxIS
 const IS_ERR_MASK: u32 = (1 << 30) | (1 << 29) | (1 << 28) | (1 << 27) | (1 << 26);
+
+/// What a port interrupts for: the FISes a command ends with (D2H register,
+/// PIO setup, DMA setup, set device bits, descriptor done) and every error
+/// Linux's `DEF_PORT_IRQ` names
+const PX_IE_EVENTS: u32 = 0x7DC0_007F;
+
+/// The HBA's registers, for the interrupt handler; 0 until interrupts are on
+static HBA: AtomicU64 = AtomicU64::new(0);
+
+/// PxIS bits the handler took off each port since its command was issued
+static PORT_EVENTS: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
+
+/// Who waits for a command on each port
+static PORT_WAIT: [WaitQueue; 32] = [const { WaitQueue::new() }; 32];
+
+static IRQ_READY: AtomicBool = AtomicBool::new(false);
+
+/// How long one sleep on a command lasts with no interrupt
+const WAIT_BACKSTOP_NS: u64 = 10_000_000;
+
+/// The longest a command may take, either way of waiting
+const COMMAND_TIMEOUT_NS: u64 = 30_000_000_000;
+
+/// The HBA's MSI: every port that raised one has its PxIS taken and cleared,
+/// then the HBA's own summary, and the port's waiter is woken
+fn hba_irq(_: usize) {
+    let hba = HBA.load(Ordering::Acquire);
+    if hba == 0 {
+        return;
+    }
+    let is = rd32(hba + HBA_IS);
+    for port in 0..32u64 {
+        if is & (1 << port) == 0 {
+            continue;
+        }
+        let pm = hba + 0x100 + port * 0x80;
+        let pis = rd32(pm + PX_IS);
+        PORT_EVENTS[port as usize].fetch_or(pis, Ordering::AcqRel);
+        wr32(pm + PX_IS, pis);
+        PORT_WAIT[port as usize].wake_all();
+    }
+    wr32(hba + HBA_IS, is);
+}
+
+/// Whether the caller may sleep for a command, by the rules the NVMe driver
+/// keeps
+fn may_sleep() -> bool {
+    IRQ_READY.load(Ordering::Acquire)
+        && crate::sched::started()
+        && x86_64::instructions::interrupts::are_enabled()
+        && !crate::sched::current_is_idle()
+        && !crate::sched::current_is_dead()
+}
 
 const SIG_SATA_DISK: u32 = 0x0000_0101;
 
@@ -78,9 +141,13 @@ struct PortMem {
     bounce:   [u8; BOUNCE_SIZE],
 }
 
+// SAFETY: bytes only
+unsafe impl crate::mm::dma::Zeroed for PortMem {}
+
 pub struct AhciPort {
     port_mmio: u64,             // virtual base of this port's register block
-    mem:       Box<PortMem>,
+    port_no:   u32,
+    mem:       DmaBox<PortMem>,
     capacity:  u64,
     model:     [u8; 40],
     model_len: u8,
@@ -113,41 +180,27 @@ fn wait_clear(addr: u64, mask: u32, max_spins: u64) -> bool {
 /// Find the first AHCI HBA on the PCI bus and bring up every implemented
 /// port with a SATA disk behind it. Returns initialized ports via 'out'
 pub fn find_ports(out: &mut [Option<AhciPort>; 4]) -> usize {
-    let mut abar_phys: Option<u64> = None;
-
-    'scan: for bus in 0..=255u8 {
-        for dev in 0..32u8 {
-            for func in 0..8u8 {
-                let id = pci_read32(bus, dev, func, 0x00);
-                if (id & 0xFFFF) as u16 == 0xFFFF {
-                    if func == 0 { break; }
-                    continue;
-                }
-                let class_rev = pci_read32(bus, dev, func, 0x08);
-                if (class_rev >> 24) as u8 == 0x01 && ((class_rev >> 16) & 0xFF) as u8 == 0x06 {
-                    let bar5 = pci_read32(bus, dev, func, 0x10 + 5 * 4);
-                    if bar5 & 1 == 0 && bar5 != 0 {
-                        // Memory space + bus master on
-                        let cmd = pci_read32(bus, dev, func, 0x04);
-                        unsafe {
-                            use x86_64::instructions::port::Port;
-                            Port::<u32>::new(PCI_ADDR).write(pci_addr(bus, dev, func, 0x04));
-                            Port::<u32>::new(PCI_DATA).write(cmd | 0x0006);
-                        }
-                        abar_phys = Some((bar5 & 0xFFFF_FFF0) as u64);
-                        crate::serial_println!(
-                            "[ahci] HBA {:02x}:{:02x}.{} abar=0x{:08X}",
-                            bus, dev, func, abar_phys.unwrap()
-                        );
-                        break 'scan;
-                    }
-                }
-                if func == 0 && (pci_read8(bus, dev, func, 0x0E) & 0x80) == 0 {
-                    break;
-                }
-            }
+    // Class 01 subclass 06 is AHCI. BAR5 is the HBA register block and has to
+    // be memory-mapped; one left in I/O space or unassigned cannot be driven
+    let hba_dev = crate::drivers::bus::pci::find(|d| {
+        d.class == 0x01 && d.subclass == 0x06 && d.bars[5] & 1 == 0 && d.bars[5] != 0
+    });
+    let hba_fn = hba_dev.map(|d| crate::drivers::bus::msi::PciFn { bus: d.bus, dev: d.dev, func: d.func });
+    let abar_phys = hba_dev.map(|d| {
+        // Memory space + bus master on
+        let cmd = pci_read32(d.bus, d.dev, d.func, 0x04);
+        unsafe {
+            use x86_64::instructions::port::Port;
+            Port::<u32>::new(PCI_ADDR).write(pci_addr(d.bus, d.dev, d.func, 0x04));
+            Port::<u32>::new(PCI_DATA).write(cmd | 0x0006);
         }
-    }
+        let abar = (d.bars[5] & 0xFFFF_FFF0) as u64;
+        crate::serial_println!(
+            "[ahci] HBA {:02x}:{:02x}.{} abar=0x{:08X}",
+            d.bus, d.dev, d.func, abar
+        );
+        abar
+    });
 
     let Some(abar) = abar_phys else { return 0 };
 
@@ -189,7 +242,45 @@ pub fn find_ports(out: &mut [Option<AhciPort>; 4]) -> usize {
             }
         }
     }
+    if count > 0 {
+        if let Some(f) = hba_fn {
+            enable_interrupts(f, hba, out);
+        }
+    }
     count
+}
+
+/// One MSI for the HBA, to the boot CPU, and every driven port told what to
+/// raise it for. Leaves the ports polling if the HBA has no MSI or the
+/// boot line says `nvmepoll`
+fn enable_interrupts(f: crate::drivers::bus::msi::PciFn, hba: u64, ports: &[Option<AhciPort>; 4]) {
+    use crate::arch::x86_64::apic;
+    if crate::arch::x86_64::grub::cmdline_flag("nvmepoll") {
+        return;
+    }
+    let caps = crate::drivers::bus::msi::read_caps(f);
+    let Some(cap) = caps.msi else {
+        crate::serial_println!("[ahci] no MSI capability - polling");
+        return;
+    };
+    let Some(target) = apic::alloc_msi_vector(apic::lapic_id(), hba_irq, 0) else {
+        crate::serial_println!("[ahci] no MSI vector free - polling");
+        return;
+    };
+    HBA.store(hba, Ordering::Release);
+    if crate::drivers::bus::msi::program_msi(f, &cap, target.address, target.data).is_err() {
+        HBA.store(0, Ordering::Release);
+        apic::free_msi_vector(target);
+        return;
+    }
+    for p in ports.iter().flatten() {
+        wr32(p.port_mmio + PX_IS, 0xFFFF_FFFF);
+        wr32(p.port_mmio + PX_IE, PX_IE_EVENTS);
+    }
+    wr32(hba + HBA_IS, 0xFFFF_FFFF);
+    wr32(hba + HBA_GHC, rd32(hba + HBA_GHC) | GHC_IE);
+    IRQ_READY.store(true, Ordering::Release);
+    crate::serial_println!("[ahci] completions by MSI on vector {:#x}", target.vector);
 }
 
 impl AhciPort {
@@ -200,15 +291,11 @@ impl AhciPort {
         wr32(pm + PX_CMD, rd32(pm + PX_CMD) & !CMD_FRE);
         if !wait_clear(pm + PX_CMD, CMD_FR, 5_000_000) { return None; }
 
-        let mem = Box::new(PortMem {
-            cmd_list: [0u8; 1024],
-            fis:      [0u8; 256],
-            cmd_tbl:  [0u8; 256],
-            bounce:   [0u8; BOUNCE_SIZE],
-        });
+        // Below 4 GiB: the upper dwords are written as zero (no S64A use)
+        let mem = DmaBox::<PortMem>::new_below(crate::mm::dma::DMA32).ok()?;
 
-        let clb_phys = crate::net::virt_to_phys(mem.cmd_list.as_ptr() as u64);
-        let fb_phys  = crate::net::virt_to_phys(mem.fis.as_ptr() as u64);
+        let clb_phys = mem.phys_of(mem.cmd_list.as_ptr());
+        let fb_phys  = mem.phys_of(mem.fis.as_ptr());
         if clb_phys > u32::MAX as u64 || fb_phys > u32::MAX as u64 {
             crate::serial_println!("[ahci] port {}: DMA memory above 4 GiB", port_no);
             return None;
@@ -229,6 +316,7 @@ impl AhciPort {
 
         let mut p = AhciPort {
             port_mmio: pm,
+            port_no,
             mem,
             capacity:  0,
             model:     [0u8; 40],
@@ -305,7 +393,7 @@ impl AhciPort {
         // One PRD entry at command-table offset 0x80
         let with_data = bytes > 0;
         if with_data {
-            let dba = crate::net::virt_to_phys(self.mem.bounce.as_ptr() as u64);
+            let dba = self.mem.phys_of(self.mem.bounce.as_ptr());
             if dba + bytes as u64 > u32::MAX as u64 {
                 return Err(BlkError::DeviceFault);
             }
@@ -317,7 +405,7 @@ impl AhciPort {
         }
 
         // Command header, slot 0: CFIS length 5 dwords, write flag, PRDTL
-        let ctba = crate::net::virt_to_phys(self.mem.cmd_tbl.as_ptr() as u64);
+        let ctba = self.mem.phys_of(self.mem.cmd_tbl.as_ptr());
         let prdtl: u32 = if with_data { 1 } else { 0 };
         let dw0: u32 = 5 | ((write as u32) << 6) | (prdtl << 16);
         let hdr = &mut self.mem.cmd_list[..32];
@@ -325,27 +413,50 @@ impl AhciPort {
         hdr[0..4].copy_from_slice(&dw0.to_le_bytes());
         hdr[8..12].copy_from_slice(&(ctba as u32).to_le_bytes());
 
+        let events = &PORT_EVENTS[self.port_no as usize & 31];
+        events.store(0, Ordering::Release);
         wr32(pm + PX_IS, 0xFFFF_FFFF);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         wr32(pm + PX_CI, 1);
 
-        let mut spins = 0u64;
-        loop {
-            let is = rd32(pm + PX_IS);
-            if is & IS_ERR_MASK != 0 {
-                crate::serial_println!("[ahci] error IS=0x{:08X} TFD=0x{:08X}",
-                    is, rd32(pm + PX_TFD));
-                wr32(pm + PX_SERR, 0xFFFF_FFFF);
-                return Err(BlkError::DeviceFault);
+        // What PxIS says now and what the handler has already taken off it
+        let is = || rd32(pm + PX_IS) | events.load(Ordering::Acquire);
+        let finished = || rd32(pm + PX_CI) & 1 == 0 || is() & IS_ERR_MASK != 0;
+        if may_sleep() {
+            let start = crate::kcore::time::now_ns();
+            let give_up = start.saturating_add(COMMAND_TIMEOUT_NS);
+            loop {
+                if finished() {
+                    break;
+                }
+                let now = crate::kcore::time::now_ns();
+                // Polled first, as the NVMe driver does, for a command done
+                // before a sleep would pay for itself
+                if now < start + crate::drivers::block::nvme::SPIN_BEFORE_SLEEP_NS {
+                    core::hint::spin_loop();
+                    continue;
+                }
+                if now > give_up {
+                    return Err(BlkError::Timeout);
+                }
+                PORT_WAIT[self.port_no as usize & 31].wait_unless(now + WAIT_BACKSTOP_NS, finished);
             }
-            if rd32(pm + PX_CI) & 1 == 0 {
-                break;
+        } else {
+            let mut spins = 0u64;
+            while !finished() {
+                crate::io::block::io_relax(spins);
+                spins += 1;
+                if spins > 200_000_000 {
+                    return Err(BlkError::Timeout);
+                }
             }
-            crate::io::block::io_relax(spins);
-            spins += 1;
-            if spins > 200_000_000 {
-                return Err(BlkError::Timeout);
-            }
+        }
+        let status = is();
+        if status & IS_ERR_MASK != 0 {
+            crate::serial_println!("[ahci] error IS=0x{:08X} TFD=0x{:08X}",
+                status, rd32(pm + PX_TFD));
+            wr32(pm + PX_SERR, 0xFFFF_FFFF);
+            return Err(BlkError::DeviceFault);
         }
 
         if rd32(pm + PX_TFD) & TFD_ERR != 0 {
@@ -376,13 +487,11 @@ impl AhciPort {
 
 /// Block-layer wrapper: one AHCI port has a single command slot and bounce
 /// buffer, so concurrent '&self' dispatch serializes on this internal mutex
-/// (no parallelism within one port, same as before - the win is that the
-/// block layer no longer needs a device-wide lock around every backend)
-pub struct AhciBlockDev(SpinMutex<AhciPort>);
+pub struct AhciBlockDev(SchedMutex<AhciPort>);
 
 impl AhciBlockDev {
     pub fn new(port: AhciPort) -> Self {
-        Self(SpinMutex::new(port))
+        Self(SchedMutex::new(port))
     }
 }
 
@@ -425,8 +534,8 @@ impl AhciPort {
     }
 
     /// DATA SET MANAGEMENT / TRIM. The payload is 512-byte blocks of 8-byte
-    /// range entries - 48-bit LBA in the low bits, a 16-bit sector count in
-    /// the top - so one block describes up to 64 ranges; long discards loop
+    /// range entries, 48-bit LBA in the low bits and a 16-bit sector count in
+    /// the top, so one block describes up to 64 ranges; long discards loop
     fn bd_discard(&mut self, lba: u64, count: u32) -> Result<(), BlkError> {
         if !self.has_trim {
             return Err(BlkError::Unsupported);

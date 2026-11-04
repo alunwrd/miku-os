@@ -1,0 +1,48 @@
+# mikunet: the protocols a program speaks, as a library rather than as kernel
+#
+# DNS, NTP, TLS 1.2/1.3 with X.509 verification, HTTP/1.1 and HTTP/2. These
+# parse certificates, ASN.1, header blocks and DNS answers, none of which the
+# sender is obliged to make well-formed, and none of it needs privilege:
+# everything here sits on top of a socket.
+#
+# Three ways to build it, as `libmay` does:
+#   default        pure computation, no I/O. What `cargo test` builds, so the
+#                  crypto, the certificate logic and the L2-L4 stack are
+#                  testable on the host
+#   stack          ethernet, ARP, IPv4, UDP, TCP and DHCP. On by default so
+#                  `cargo test` picks it up with no flags; a program that only
+#                  wants TLS turns defaults off and asks for `userspace`
+#   userspace      adds `sock`, the syscall-backed transport, and the platform
+#                  hooks that need a kernel underneath
+[package]
+name    = "mikunet"
+version = "0.1.0"
+edition = "2021"
+
+# Its own workspace, and `exclude`d by the repository root, even though the
+# kernel links it. As a member the crate shares the root's resolution, `spin`
+# gets compiled against both the sysroot `core` and the one `build-std` builds
+# from source, and the link fails on a duplicate `sized` lang item. The kernel
+# takes this crate as an ordinary path dependency and `cargo test` here builds
+# for the host (`.cargo/config.toml`)
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+miku = { path = "../miku", optional = true }
+# The resolver cache is shared state in a library. Same version the kernel uses
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+
+[features]
+default   = ["stack", "crypto"]
+stack     = []
+# ASN.1, X.509, the bignum arithmetic, RSA, EC, GCM and the chain check.
+# On by default so `cargo test` covers them with no flags, and off in the
+# kernel, which links this crate for `stack` alone
+crypto    = []
+userspace = ["dep:miku", "crypto"]
+
+[profile.release]
+opt-level = 2

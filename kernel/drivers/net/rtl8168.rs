@@ -1,31 +1,33 @@
 // Realtek RTL8111/8118/8168 gigabit driver (the r8169 family)
 //
-// Primary target: RTL8118AS on the Gigabyte B550M K (PCI 10ec:8168,
-// hw_ver in the RTL8168H range). The whole bring-up sequence is a port of
-// Linux r8169_main.c (rtl_hw_start_8168h_1 and friends); register names
-// and magic values reference that file.
+// Primary target: RTL8118AS on the Gigabyte B550M K (PCI 10ec:8168, hw_ver in
+// the RTL8168H range). The bring-up sequence is a port of Linux r8169_main.c
+// (rtl_hw_start_8168h_1 and friends); register names and magic values reference
+// that file.
 //
-// The G/H generations (hw_ver >= 0x500) are NOT just faster 8168Bs:
-//   - the internal PHY is only reachable through GPHY OCP (0xB8); the
-//     classic PHYAR (0x60) interface is dead silicon on these chips
-//   - RX is gated by RXDV_GATED_EN in MISC (0xF0) out of reset; until it
-//     is cleared the MAC processes descriptors but never delivers a frame
-//   - the packet FIFO / flow control / filter live behind the ERI window
-//     (ERIDR 0x70 / ERIAR 0x74, byte-enable mask in bits 15:12)
-//   - assorted MCU tweaks go through MAC OCP (OCPDR 0xB0)
+// The G/H generations (hw_ver >= 0x500) differ from 8168B:
+//   - the internal PHY is reachable only through GPHY OCP (0xB8); the classic
+//     PHYAR (0x60) interface does not work on these chips
+//   - RX is gated by RXDV_GATED_EN in MISC (0xF0) out of reset; until it is
+//     cleared the MAC processes descriptors but delivers no frame
+//   - the packet FIFO / flow control / filter are behind the ERI window (ERIDR
+//     0x70 / ERIAR 0x74, byte-enable mask in bits 15:12)
+//   - MCU tweaks go through MAC OCP (OCPDR 0xB0)
 //
-// Interrupts are not used: netd polls recv() at 250 Hz like every other
-// NIC driver here.
+// Interrupts are MSI (`enable_irq`); without it, the net core pumps recv()
+// every tick.
 
 use crate::drivers::bus::pci::PciDevice;
-use crate::net::NetworkDriver;
-use alloc::boxed::Box;
+use crate::net::{NetworkDriver, RxMeta};
+use crate::mm::dma::{DmaBox, DMA32};
 
 const TX_DESC_COUNT: usize = 16;
-const RX_DESC_COUNT: usize = 32;
+// See e1000's ring depth: a shallow ring loses runs of packets under load, the
+// loss pattern TCP recovers from worst
+const RX_DESC_COUNT: usize = 256;
 const BUF_SIZE: usize = 1536;
 
-// ------------------------------------------------------------- registers
+// registers
 
 const IDR0:      usize = 0x00; // MAC address, 6 bytes
 const MAR0:      usize = 0x08; // multicast filter, 8 bytes
@@ -35,6 +37,23 @@ const CR:        usize = 0x37; // command: RST/TE/RE
 const TPPOLL:    usize = 0x38; // TX poll doorbell
 const IMR:       usize = 0x3C;
 const ISR:       usize = 0x3E;
+
+// Interrupt causes enabled in IMR: a frame in, a receive error, no descriptor
+// left, a link change, FIFO overflow
+const INT_RX_OK:       u16 = 1 << 0;
+const INT_RX_ERR:      u16 = 1 << 1;
+const INT_RX_OVERFLOW: u16 = 1 << 4;
+const INT_LINK_CHG:    u16 = 1 << 5;
+const INT_RX_FIFO:     u16 = 1 << 6;
+
+/// In the interrupt handler: ISR's bits are write-one-to-clear, and the chip
+/// raises no further message while they are set
+fn ack_isr(mmio: u64) {
+    unsafe {
+        let st = core::ptr::read_volatile((mmio + ISR as u64) as *const u16);
+        core::ptr::write_volatile((mmio + ISR as u64) as *mut u16, st);
+    }
+}
 const TXCFG:     usize = 0x40;
 const RXCFG:     usize = 0x44;
 const CFG9346:   usize = 0x50; // config-register lock
@@ -60,9 +79,9 @@ const CR_RST: u8 = 1 << 4;
 const CR_RE:  u8 = 1 << 3;
 const CR_TE:  u8 = 1 << 2;
 
-// TxConfig: IFG = 3 (bits 25:24), MaxDMA = 7 = unlimited (bits 10:8).
-// AUTO_FIFO (bit 7) is required from 8111E-VL on; without it the G/H FIFO
-// sizing programmed over ERI is ignored
+// TxConfig: IFG = 3 (bits 25:24), MaxDMA = 7 = unlimited (bits 10:8). AUTO_FIFO
+// (bit 7) is required from 8111E-VL on; without it the G/H FIFO sizing
+// programmed over ERI is ignored
 const TXCFG_BASE:      u32 = 0x0300_0700;
 const TXCFG_AUTO_FIFO: u32 = 1 << 7;
 
@@ -71,7 +90,7 @@ const RXCFG_RX128_INT_EN: u32 = 1 << 15;
 const RXCFG_RX_MULTI_EN:  u32 = 1 << 14;
 const RXCFG_RX_EARLY_OFF: u32 = 1 << 11;
 const RXCFG_RX_DMA_BURST: u32 = 7 << 8;
-// filter: accept broadcast / multicast / phys-match / all-phys
+// Filter: accept broadcast / multicast / phys-match / all-phys
 const RXCFG_FILTER_ALL:   u32 = 0xF;
 
 const MISC_RXDV_GATED_EN: u32 = 1 << 19;
@@ -80,9 +99,9 @@ const DLLPR_TX_10M_PS_EN: u8 = 1 << 7;
 const MISC1_PFM_D3COLD:   u8 = 1 << 6;
 const CONFIG3_RDY_TO_L23: u8 = 1 << 1;
 
-// ERI window. Byte-enable mask sits in bits 15:12, type (EXGMAC = 0) in
-// bits 17:16, register address in bits 11:0. Bit 31 doubles as the write
-// command flag and the read ready flag
+// ERI window. Byte-enable mask in bits 15:12, type (EXGMAC = 0) in bits 17:16,
+// register address in bits 11:0. Bit 31 is the write command flag and the read
+// ready flag
 const ERIAR_FLAG:      u32 = 1 << 31;
 const ERI_MASK_0001:   u32 = 0x1 << 12;
 const ERI_MASK_0011:   u32 = 0x3 << 12;
@@ -111,11 +130,10 @@ impl Desc {
     }
 }
 
-/// Publish a descriptor to the chip in the correct order: buffer address +
-/// VLAN first, then a full memory fence, then flags (which carries the OWN
-/// bit). A plain struct assignment lets the compiler reorder the field
-/// stores; if flags lands before buf_lo/buf_hi the NIC sees OWN=1 with a
-/// stale buffer pointer and silently drops the frame
+/// Publish a descriptor to the chip in order: buffer address + VLAN, a full
+/// memory fence, then flags (which carries the OWN bit). A plain struct
+/// assignment lets the compiler reorder the stores; with flags first the NIC
+/// sees OWN=1 with a stale buffer pointer and silently drops the frame
 #[inline]
 unsafe fn write_desc(d: *mut Desc, flags: u32, vlan: u32, buf_phys: u64) {
     use core::ptr::{addr_of_mut, write_volatile};
@@ -136,17 +154,24 @@ struct TxBufs([[u8; BUF_SIZE]; TX_DESC_COUNT]);
 #[repr(align(16))]
 struct RxBufs([[u8; BUF_SIZE]; RX_DESC_COUNT]);
 
+// SAFETY: integers and bytes only. Zeroed in place by `DmaBox`, never on the
+// stack: a receive ring's buffers are hundreds of kilobytes
+unsafe impl crate::mm::dma::Zeroed for TxRing {}
+unsafe impl crate::mm::dma::Zeroed for RxRing {}
+unsafe impl crate::mm::dma::Zeroed for TxBufs {}
+unsafe impl crate::mm::dma::Zeroed for RxBufs {}
+
 pub struct Rtl8168 {
     mmio_base: u64,
     pub mac: [u8; 6],
     hwver: u32,
-    tx_ring: Box<TxRing>,
-    rx_ring: Box<RxRing>,
-    tx_bufs: Box<TxBufs>,
-    rx_bufs: Box<RxBufs>,
+    tx_ring: DmaBox<TxRing>,
+    rx_ring: DmaBox<RxRing>,
+    tx_bufs: DmaBox<TxBufs>,
+    rx_bufs: DmaBox<RxBufs>,
     tx_idx: usize,
     rx_idx: usize,
-    /// How many sends we have logged so far. Bring-up diagnostic only
+    /// Sends logged so far, a bring-up diagnostic
     send_log_count: u32,
 }
 
@@ -154,8 +179,8 @@ impl Rtl8168 {
     pub fn new(pci: &PciDevice) -> Option<Self> {
         pci.enable_bus_mastering();
 
-        // Register MMIO lives in BAR2 on real 8168 hardware; BAR0 is I/O,
-        // BAR4 is the MSI-X table
+        // Register MMIO is in BAR2 on real 8168 hardware; BAR0 is I/O, BAR4 the
+        // MSI-X table
         let mem_phys = pci.mem_bar(2)
             .or_else(|| pci.mem_bar(1))
             .or_else(|| pci.mem_bar(0));
@@ -170,17 +195,19 @@ impl Rtl8168 {
         };
         crate::net::map_mmio(mem_phys, 0x1000);
 
-        let hhdm = crate::net::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+        let hhdm = crate::arch::x86_64::HHDM_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
         let mmio_base = mem_phys + hhdm;
 
         let mut drv = Self {
             mmio_base,
             mac: [0; 6],
             hwver: 0,
-            tx_ring: Box::new(TxRing([Desc::zero(); TX_DESC_COUNT])),
-            rx_ring: Box::new(RxRing([Desc::zero(); RX_DESC_COUNT])),
-            tx_bufs: Box::new(TxBufs([[0u8; BUF_SIZE]; TX_DESC_COUNT])),
-            rx_bufs: Box::new(RxBufs([[0u8; BUF_SIZE]; RX_DESC_COUNT])),
+            // Below 4 GiB: Linux's r8169 gives 64-bit DMA only to chips from
+            // RTL_GIGA_MAC_VER_18 on
+            tx_ring: DmaBox::new_below(DMA32).ok()?,
+            rx_ring: DmaBox::new_below(DMA32).ok()?,
+            tx_bufs: DmaBox::new_below(DMA32).ok()?,
+            rx_bufs: DmaBox::new_below(DMA32).ok()?,
             tx_idx: 0,
             rx_idx: 0,
             send_log_count: 0,
@@ -208,13 +235,13 @@ impl Rtl8168 {
         unsafe { core::ptr::write_volatile((self.mmio_base + off as u64) as *mut u32, v) }
     }
 
-    /// True for RTL8168G and later (hw_ver 0x500+): OCP-based PHY access,
-    /// ERI FIFO config, RXDV gate
+    /// True for RTL8168G and later (hw_ver 0x500+): OCP-based PHY access, ERI
+    /// FIFO config, RXDV gate
     fn is_g_plus(&self) -> bool {
         self.hwver >= 0x500
     }
 
-    // -------------------------------------------------- ERI (EXGMAC window)
+    // ERI (EXGMAC window)
 
     fn eri_write(&self, addr: u16, mask: u32, val: u32) {
         self.write32(ERIDR, val);
@@ -226,8 +253,8 @@ impl Rtl8168 {
     }
 
     fn eri_read(&self, addr: u16) -> u32 {
-        // reads always return the full dword; the chip sets bit 31 when
-        // ERIDR holds valid data
+        // Reads return the full dword; the chip sets bit 31 when ERIDR holds
+        // valid data
         self.write32(ERIAR, ERI_MASK_1111 | (addr as u32 & 0xFFF));
         for _ in 0..1_000_000 {
             if self.read32(ERIAR) & ERIAR_FLAG != 0 {
@@ -245,17 +272,17 @@ impl Rtl8168 {
         self.eri_write(addr, mask, (v & !clear) | set);
     }
 
-    /// Toggle bit 0 of ERI 0xDC: flushes the MCU packet filter (stale
-    /// BIOS/PXE filter state otherwise eats ARP/DHCP broadcasts)
+    /// Toggle bit 0 of ERI 0xDC: flushes the MCU packet filter (stale BIOS/PXE
+    /// filter state otherwise eats ARP/DHCP broadcasts)
     fn eri_reset_packet_filter(&self) {
         self.eri_w0w1(0xDC, ERI_MASK_0001, 1, 0);
         self.eri_w0w1(0xDC, ERI_MASK_0001, 0, 1);
     }
 
-    // ----------------------------------------------------------- MAC OCP
+    // MAC OCP
 
-    // MAC-side microcontroller registers. Encoding per r8169: bit 31 =
-    // write flag, bits 30:16 = (even) register << 15, bits 15:0 = data
+    // MAC-side microcontroller registers. Encoding per r8169: bit 31 = write
+    // flag, bits 30:16 = (even) register << 15, bits 15:0 = data
 
     fn mac_ocp_write(&self, reg: u16, val: u16) {
         debug_assert!(reg & 1 == 0);
@@ -272,7 +299,7 @@ impl Rtl8168 {
         self.mac_ocp_write(reg, (v & !mask) | set);
     }
 
-    // -------------------------------------------------------- PCIe ePHY
+    // PCIe ePHY
 
     fn ephy_write(&self, reg: u8, val: u16) {
         self.write32(EPHYAR, ERIAR_FLAG | ((reg as u32 & 0x3F) << 16) | val as u32);
@@ -299,7 +326,7 @@ impl Rtl8168 {
         }
     }
 
-    // ------------------------------------------------------------- MDIO
+    // MDIO
 
     // Classic MDIO through PHYAR: pre-8168G silicon only
     fn phyar_write(&self, reg: u8, val: u16) {
@@ -311,7 +338,7 @@ impl Rtl8168 {
     }
 
     // 8168G+ PHY access through the GPHY OCP window. MII register N of the
-    // standard page lives at OCP address 0xA400 + 2*N
+    // standard page is at OCP address 0xA400 + 2*N
     fn phy_ocp_write(&self, ocp_addr: u32, val: u16) {
         self.write32(GPHY_OCP, OCPAR_FLAG | ((ocp_addr & 0xFFFE) << 15) | val as u32);
         for _ in 0..1_000_000 {
@@ -339,7 +366,7 @@ impl Rtl8168 {
         }
     }
 
-    // -------------------------------------------------------- chip init
+    // chip init
 
     fn init(&mut self) {
         // 1) Mask + ack interrupts before touching anything else
@@ -358,8 +385,8 @@ impl Rtl8168 {
             self.mac[i] = self.read8(IDR0 + i);
         }
 
-        // 4) hw_ver from the read-only TxConfig bits, needed to pick the
-        //    bring-up path. Thresholds after (txc & 0x7CF00000) >> 20:
+        // 4) hw_ver from the read-only TxConfig bits, to pick the bring-up
+        //    path. Thresholds after (txc & 0x7CF00000) >> 20:
         //      8168B/C/D: 0x100..0x27F   8168E: 0x280..0x47F
         //      8168F:     0x480..0x4FF   8168G: 0x500..0x53F
         //      8168H/EP + RTL8118AS: 0x540..0x7CF
@@ -373,10 +400,9 @@ impl Rtl8168 {
         };
         self.write32(RXCFG, rxcfg_base);
 
-        // 6) Unlock Config0..5, clear the WoL latches BIOS/PXE love to
-        //    leave behind (they park the PHY in low-power = eternal
-        //    link-down), and keep the config window open for the per-chip
-        //    sequence below
+        // 6) Unlock Config0..5, clear the WoL latches BIOS/PXE can leave set
+        //    (they park the PHY in low power, link down), keep the config
+        //    window open for the per-chip sequence below
         self.write8(CFG9346, 0xC0);
         let cfg3 = self.read8(CONFIG3);
         self.write8(CONFIG3, cfg3 & !0x61);
@@ -394,20 +420,20 @@ impl Rtl8168 {
         } else if self.hwver >= 0x500 {
             self.hw_start_8168g();
         }
-        // pre-G chips need none of this: FIFO defaults are sane and RX is
-        // not gated
+        // Pre-G chips need none of this: FIFO defaults are sane and RX is not
+        // gated
 
         // 9) Descriptor rings
-        let tx_phys = crate::net::virt_to_phys(self.tx_ring.0.as_ptr() as u64);
-        let rx_phys = crate::net::virt_to_phys(self.rx_ring.0.as_ptr() as u64);
+        let tx_phys = self.tx_ring.phys_of(self.tx_ring.0.as_ptr());
+        let rx_phys = self.rx_ring.phys_of(self.rx_ring.0.as_ptr());
 
         for i in 0..TX_DESC_COUNT {
-            let buf_phys = crate::net::virt_to_phys(self.tx_bufs.0[i].as_ptr() as u64);
+            let buf_phys = self.tx_bufs.phys_of(self.tx_bufs.0[i].as_ptr());
             let eor = if i == TX_DESC_COUNT - 1 { DESC_EOR } else { 0 };
             unsafe { write_desc(&mut self.tx_ring.0[i] as *mut Desc, eor, 0, buf_phys); }
         }
         for i in 0..RX_DESC_COUNT {
-            let buf_phys = crate::net::virt_to_phys(self.rx_bufs.0[i].as_ptr() as u64);
+            let buf_phys = self.rx_bufs.phys_of(self.rx_bufs.0[i].as_ptr());
             let eor = if i == RX_DESC_COUNT - 1 { DESC_EOR } else { 0 };
             unsafe {
                 write_desc(
@@ -428,19 +454,19 @@ impl Rtl8168 {
         self.write16(RXMAXSIZE, BUF_SIZE as u16);
         self.write8(MTPS, 0x3F);
 
-        // 11) Multicast filter wide open so DHCP/ARP broadcasts land
+        // 11) Multicast filter open, so DHCP/ARP broadcasts arrive
         self.write32(MAR0, 0xFFFF_FFFF);
         self.write32(MAR0 + 4, 0xFFFF_FFFF);
 
         // 12) Re-lock config space
         self.write8(CFG9346, 0x00);
 
-        // 13) Everything above must be visible before the engines start
+        // 13) All of the above visible before the engines start
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
-        // 14) Enable TX/RX, then TxConfig + RxConfig filter bits (this
-        //     ordering matches r8169: several revisions ignore TxConfig/
-        //     RxConfig writes while the engines are disabled)
+        // 14) Enable TX/RX, then TxConfig + RxConfig filter bits. This order
+        //     matches r8169: several revisions ignore TxConfig/RxConfig writes
+        //     while the engines are disabled
         self.write8(CR, CR_TE | CR_RE);
         let txcfg = if self.hwver >= 0x2C0 {
             // 8111E-VL and everything after wants AUTO_FIFO
@@ -472,8 +498,8 @@ impl Rtl8168 {
             self.hwver, family, self.read8(CR), self.read32(TXCFG), self.read32(RXCFG)
         );
 
-        // 16) Wake the PHY and restart auto-negotiation (through the right
-        //     transport for this generation)
+        // 16) Wake the PHY and restart auto-negotiation, through the transport
+        //     for this generation
         self.phy_init();
     }
 
@@ -500,9 +526,8 @@ impl Rtl8168 {
         self.pcie_l2l3_disable();
     }
 
-    /// rtl_hw_start_8168h_1: everything 8168G gets, plus the H-specific
-    /// ePHY fixes and MCU (MAC OCP) tuning. This is the path the B550M K's
-    /// RTL8118AS takes
+    /// rtl_hw_start_8168h_1: everything 8168G gets, plus the H-specific ePHY
+    /// fixes and MCU (MAC OCP) tuning. The path of the B550M K's RTL8118AS
     fn hw_start_8168h(&self) {
         const EPHY_8168H_1: [(u8, u16, u16); 6] = [
             (0x1E, 0x0800, 0x0001),
@@ -539,8 +564,8 @@ impl Rtl8168 {
 
         self.pcie_l2l3_disable();
 
-        // MCU tuning per rtl_hw_start_8168h_1 (the rg_saw_cnt PHY
-        // calibration is skipped: it only trims a green-ethernet timer)
+        // MCU tuning per rtl_hw_start_8168h_1 (the rg_saw_cnt PHY calibration
+        // is skipped: it only trims a green-ethernet timer)
         self.mac_ocp_modify(0xE056, 0x00F0, 0x0000);
         self.mac_ocp_modify(0xE052, 0x6000, 0x8008);
         self.mac_ocp_modify(0xE0D6, 0x01FF, 0x017F);
@@ -552,9 +577,9 @@ impl Rtl8168 {
         self.mac_ocp_write(0xC09E, 0x0000);
     }
 
-    /// Clear RXDV_GATED_EN (MISC bit 19). 8168G+ comes out of reset with
-    /// RX gated: descriptors are consumed but no frame is ever delivered
-    /// until this bit goes away. THE classic "tx works, rx: 0" cause
+    /// Clear RXDV_GATED_EN (MISC bit 19). 8168G+ comes out of reset with RX
+    /// gated: descriptors are consumed but no frame is delivered until this bit
+    /// clears (symptom: tx works, rx 0)
     fn disable_rxdv_gate(&self) {
         let m = self.read32(MISC);
         self.write32(MISC, m & !MISC_RXDV_GATED_EN);
@@ -567,12 +592,11 @@ impl Rtl8168 {
         self.write8(CONFIG3, c3 & !CONFIG3_RDY_TO_L23);
     }
 
-    /// Advertise 10/100/1000 and restart auto-negotiation. Does not wait
-    /// for convergence (takes seconds); netd polls link_up() and picks the
-    /// link up whenever it lands
+    /// Advertise 10/100/1000 and restart auto-negotiation. Convergence takes
+    /// seconds and is not waited for; netd polls link_up()
     fn phy_init(&self) {
-        // ANAR: 10/100 half+full, 802.3 selector; GBCR: 1000T half+full;
-        // BMCR: auto-neg enable + restart (also clears isolate/power-down)
+        // ANAR: 10/100 half+full, 802.3 selector; GBCR: 1000T half+full; BMCR:
+        // auto-neg enable + restart (also clears isolate/power-down)
         self.mdio_write(4, 0x01E1);
         self.mdio_write(9, 0x0300);
         self.mdio_write(0, 0x1200);
@@ -613,8 +637,8 @@ impl Rtl8168 {
             else if phy & 0x04 != 0 { "10M" }
             else { "?" }
         );
-        let tx_phys = crate::net::virt_to_phys(self.tx_ring.0.as_ptr() as u64);
-        let rx_phys = crate::net::virt_to_phys(self.rx_ring.0.as_ptr() as u64);
+        let tx_phys = self.tx_ring.phys_of(self.tx_ring.0.as_ptr());
+        let rx_phys = self.rx_ring.phys_of(self.rx_ring.0.as_ptr());
         crate::cprintln!(230, 240, 240,
             "  TX ring: want={:#010x}  chip={:#010x}", tx_phys as u32, self.read32(TNPDS_LO));
         crate::cprintln!(230, 240, 240,
@@ -640,8 +664,7 @@ impl NetworkDriver for Rtl8168 {
             return false;
         }
         let i = self.tx_idx;
-        // Volatile read so we always pick up the chip's most recent
-        // OWN-clear, not a cached value
+        // Volatile read for the chip's latest OWN-clear
         let cur_flags = unsafe {
             core::ptr::read_volatile(core::ptr::addr_of!(self.tx_ring.0[i].flags))
         };
@@ -650,7 +673,7 @@ impl NetworkDriver for Rtl8168 {
         }
 
         let eor = if i == TX_DESC_COUNT - 1 { DESC_EOR } else { 0 };
-        let buf_phys = crate::net::virt_to_phys(self.tx_bufs.0[i].as_ptr() as u64);
+        let buf_phys = self.tx_bufs.phys_of(self.tx_bufs.0[i].as_ptr());
         self.tx_bufs.0[i][..data.len()].copy_from_slice(data);
 
         unsafe {
@@ -665,8 +688,8 @@ impl NetworkDriver for Rtl8168 {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.write8(TPPOLL, 0x40); // NPQ
 
-        // Bring-up diagnostic for the first frames: if OWN never clears,
-        // the chip is ignoring the ring (bad TNPDS/TxConfig)
+        // Bring-up diagnostic for the first frames: if OWN never clears, the
+        // chip is ignoring the ring (bad TNPDS/TxConfig)
         if self.send_log_count < 3 {
             for _ in 0..200_000 { core::hint::spin_loop(); }
             let post = unsafe {
@@ -683,7 +706,7 @@ impl NetworkDriver for Rtl8168 {
         true
     }
 
-    fn recv(&mut self, handler: &mut dyn FnMut(&[u8])) {
+    fn recv(&mut self, handler: &mut dyn FnMut(&[u8], RxMeta) -> bool) {
         loop {
             let i = self.rx_idx;
             let flags = unsafe {
@@ -693,10 +716,13 @@ impl NetworkDriver for Rtl8168 {
                 break;
             }
             let len = (flags & 0x3FFF) as usize;
+            let mut go_on = true;
             if len > 4 && len <= BUF_SIZE {
-                handler(&self.rx_bufs.0[i][..len - 4]);
+                // Receive checksum offload is off in hw_start, so the sender's
+                // checksums are intact and verified here
+                go_on = handler(&self.rx_bufs.0[i][..len - 4], RxMeta::default());
             }
-            let buf_phys = crate::net::virt_to_phys(self.rx_bufs.0[i].as_ptr() as u64);
+            let buf_phys = self.rx_bufs.phys_of(self.rx_bufs.0[i].as_ptr());
             let eor = if i == RX_DESC_COUNT - 1 { DESC_EOR } else { 0 };
             unsafe {
                 write_desc(
@@ -707,8 +733,28 @@ impl NetworkDriver for Rtl8168 {
                 );
             }
             self.rx_idx = (i + 1) % RX_DESC_COUNT;
+
+            // Descriptor is back with the chip; the rest of the ring waits for
+            // the next call
+            if !go_on {
+                break;
+            }
         }
         self.write16(ISR, 0xFFFF);
+    }
+
+    /// MSI, as r8169 uses on every 8168 since version 07. The handler clears
+    /// ISR; `recv` clears it again after a drain
+    fn enable_irq(&mut self, f: crate::drivers::bus::msi::PciFn) -> bool {
+        if !crate::net::irq::has_msi(f) {
+            return false;
+        }
+        if !crate::net::irq::enable(f, None, Some((ack_isr, self.mmio_base))) {
+            return false;
+        }
+        self.write16(ISR, 0xFFFF);
+        self.write16(IMR, INT_RX_OK | INT_RX_ERR | INT_RX_OVERFLOW | INT_LINK_CHG | INT_RX_FIFO);
+        true
     }
 
     fn has_packet(&self) -> bool {

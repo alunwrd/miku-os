@@ -15,6 +15,17 @@ _mb2_hdr_start:
     .long  0
     .long  0
     .long  0
+
+    # Information request, optional (flags=1): tag 9, the ELF section
+    # headers. GRUB provides them for an ELF kernel anyway, but asking is
+    # what makes it contractual - without them the kernel cannot find its
+    # own .symtab, and a panic prints bare addresses
+    .align 8
+    .short 1
+    .short 1
+    .long  12
+    .long  9
+
     .align 8
     .short 0
     .short 0

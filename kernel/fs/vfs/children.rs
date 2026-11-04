@@ -1,10 +1,37 @@
+// A directory's names (`dev/vfs-dentries-inodes.md`, "Stage 5: dentries and
+// inodes")
+//
+// Linux keeps a dentry for every name it has looked up, and a negative one for
+// every name it looked up and did not find. Here a name is an entry in its
+// directory's table, one of three kinds:
+//
+// - positive: the name, and the vnode it names;
+// - negative: a name the filesystem does not have. The next lookup of it is
+//   answered here;
+// - whiteout: a name still on the disk whose file was unlinked while open. The
+//   disk keeps the name until the last close; without this a lookup or a
+//   listing would find it there and make the file again.
+//
+// `find_by_name`, `iter`, `len` and `is_empty` see positive entries only;
+// `probe` tells a known absence from a name never asked.
+//
+// Open addressing with tombstones. Negative entries come and go far more often
+// than files, so tombstones are counted and the table is rebuilt in place when
+// they and the entries fill three quarters of it.
+//
+// A listing reads the positive entries in slot order, and `getdents` asks for
+// them by position (`docs/MikuOS_ABI.md`). The table remembers where the last
+// pass stopped (position and slot) for as long as its positive entries have not
+// moved (`gen`), and the next pass from that position starts there; otherwise a
+// directory read in passes costs the square of its size.
+
 extern crate alloc;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use crate::fs::vfs::hash::name_hash;
 use crate::fs::vfs::types::{InodeId, INVALID_ID};
 
 const INITIAL_CAPACITY: usize = 16;
-const CHILD_NAME_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -14,68 +41,101 @@ pub enum SlotState {
     Tombstone = 2,
 }
 
-#[derive(Clone, Copy)]
+/// What an occupied slot says about its name
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EntryKind {
+    Positive = 0,
+    Negative = 1,
+    Whiteout = 2,
+}
+
+/// What a directory's table knows about one name
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// It names this vnode
+    Node(InodeId),
+    /// Known not to be there: a negative entry or a whiteout
+    Absent,
+    /// The table has no record of it
+    Unknown,
+}
+
+/// One entry: a name, and the vnode it names.
+///
+/// The name is boxed and whole, so two files sharing a prefix cannot resolve to
+/// one vnode. Boxed, not widened to 255: a directory of four thousand children
+/// would cost two megabytes of slots for names averaging a dozen bytes.
+#[derive(Clone)]
 pub struct ChildSlot {
-    pub hash:     u32,
-    pub id:       InodeId,
-    pub state:    SlotState,
-    pub name_len: u8,
-    pub name:     [u8; CHILD_NAME_LEN],
+    pub hash:  u32,
+    /// The vnode, for a positive entry; `INVALID_ID` for the other two
+    pub id:    InodeId,
+    pub state: SlotState,
+    pub kind:  EntryKind,
+    name:      Option<Box<str>>,
 }
 
 impl ChildSlot {
     pub const EMPTY: Self = Self {
-        hash:     0,
-        id:       INVALID_ID,
-        state:    SlotState::Empty,
-        name_len: 0,
-        name:     [0; CHILD_NAME_LEN],
+        hash:  0,
+        id:    INVALID_ID,
+        state: SlotState::Empty,
+        kind:  EntryKind::Positive,
+        name:  None,
     };
+
+    fn new(hash: u32, name: &str, id: InodeId, kind: EntryKind) -> Self {
+        Self { hash, id, state: SlotState::Occupied, kind, name: Some(name.into()) }
+    }
 
     #[inline]
     pub fn used(&self) -> bool {
-        self.state == SlotState::Occupied
+        self.state == SlotState::Occupied && self.kind == EntryKind::Positive
     }
 
+    pub fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or("")
+    }
+
+    /// Whole name against whole name. No prefix, no "close enough"
     pub fn name_matches(&self, name: &str) -> bool {
-        let slen = self.name_len as usize;
-        if slen == 0 {
-            return false;
-        }
-        let nb = name.as_bytes();
-        if slen <= CHILD_NAME_LEN {
-            nb.len() == slen && nb == &self.name[..slen]
-        } else {
-            // name was truncated at storage time - fall back to hash-only match
-            nb.len() >= CHILD_NAME_LEN && nb[..CHILD_NAME_LEN] == self.name[..]
-        }
-    }
-
-    pub fn set_name(&mut self, name: &str) {
-        let bytes = name.as_bytes();
-        let copy_len = bytes.len().min(CHILD_NAME_LEN);
-        self.name[..copy_len].copy_from_slice(&bytes[..copy_len]);
-        if copy_len < CHILD_NAME_LEN {
-            self.name[copy_len..].fill(0);
-        }
-        self.name_len = bytes.len().min(255) as u8;
+        self.name() == name
     }
 }
 
 pub struct Children {
     pub slots: Vec<ChildSlot>,
+    /// Positive entries
     pub count: u32,
+    /// Negative entries and whiteouts
+    negatives: u32,
+    whiteouts: u32,
+    tombstones: u32,
+    /// Moves whenever a positive entry is added, removed or moved; makes a
+    /// listing's resume point stale
+    gen: u32,
+    /// Where the last listing stopped: position << 32 | slot, and `gen` then.
+    /// Atomics: a `getdents` under the VFS lock held to read writes them beside
+    /// others (`dev/vfs-locking.md`, "4c"). Those writers all see one `gen`, as
+    /// nothing changes the directory while they hold the lock, so any pair one
+    /// of them wrote is right; the pair is stored before the `gen` it is for,
+    /// and read after it
+    resume: core::sync::atomic::AtomicU64,
+    resume_gen: core::sync::atomic::AtomicU32,
 }
 
 impl Children {
     pub const fn new() -> Self {
-        Self { slots: Vec::new(), count: 0 }
-    }
-
-    fn ensure_init(&mut self) {
-        if self.slots.is_empty() {
-            self.slots = Vec::with_capacity(INITIAL_CAPACITY);
-            self.slots.resize(INITIAL_CAPACITY, ChildSlot::EMPTY);
+        Self {
+            slots: Vec::new(),
+            count: 0,
+            negatives: 0,
+            whiteouts: 0,
+            tombstones: 0,
+            gen: 0,
+            resume: core::sync::atomic::AtomicU64::new(0),
+            resume_gen: core::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 
@@ -84,186 +144,239 @@ impl Children {
         self.slots.len()
     }
 
-    fn needs_rehash(&self) -> bool {
-        self.count as usize * 4 >= self.cap() * 3
+    /// Room for one more: the table made, or rebuilt when its entries and
+    /// tombstones fill three quarters of it; twice as large when the entries
+    /// alone fill half, otherwise the same size
+    fn make_room(&mut self) {
+        if self.slots.is_empty() {
+            self.slots.resize(INITIAL_CAPACITY, ChildSlot::EMPTY);
+            return;
+        }
+        let live = (self.count + self.negatives) as usize;
+        if (live + self.tombstones as usize) * 4 >= self.cap() * 3 {
+            let cap = if live * 2 >= self.cap() { self.cap() * 2 } else { self.cap() };
+            self.rebuild(cap, |_| true);
+        }
     }
 
-    fn rehash(&mut self) {
-        let new_cap = self.cap() * 2;
-        let mut new_slots = Vec::with_capacity(new_cap);
-        new_slots.resize(new_cap, ChildSlot::EMPTY);
-
-        for slot in &self.slots {
-            if slot.state != SlotState::Occupied {
+    /// Every entry `keep` keeps, into a table of `cap` slots with no
+    /// tombstones. `take`: a slot owns its name, and rebuilding moves it
+    fn rebuild(&mut self, cap: usize, keep: impl Fn(&ChildSlot) -> bool) {
+        let mut slots = Vec::with_capacity(cap);
+        slots.resize(cap, ChildSlot::EMPTY);
+        let (mut count, mut negatives, mut whiteouts) = (0, 0, 0);
+        for slot in self.slots.iter_mut() {
+            if slot.state != SlotState::Occupied || !keep(slot) {
                 continue;
             }
-            let start = (slot.hash as usize) % new_cap;
-            for i in 0..new_cap {
-                let idx = (start + i) % new_cap;
-                if new_slots[idx].state == SlotState::Empty {
-                    new_slots[idx] = *slot;
+            let moved = core::mem::replace(slot, ChildSlot::EMPTY);
+            match moved.kind {
+                EntryKind::Positive => count += 1,
+                EntryKind::Negative => negatives += 1,
+                EntryKind::Whiteout => {
+                    negatives += 1;
+                    whiteouts += 1;
+                }
+            }
+            let start = moved.hash as usize % cap;
+            for i in 0..cap {
+                let idx = (start + i) % cap;
+                if slots[idx].state == SlotState::Empty {
+                    slots[idx] = moved;
                     break;
                 }
             }
         }
-        self.slots = new_slots;
+        self.slots = slots;
+        self.count = count;
+        self.negatives = negatives;
+        self.whiteouts = whiteouts;
+        self.tombstones = 0;
+        self.gen = self.gen.wrapping_add(1);
     }
 
-    pub fn insert(&mut self, name: &str, id: InodeId) -> bool {
-        self.ensure_init();
-        if self.needs_rehash() {
-            self.rehash();
-        }
-        let h = name_hash(name);
-
-        if self.contains_name(h, name) {
-            return false;
-        }
-
+    /// The slot holding `name`, of any kind
+    fn slot_of(&self, h: u32, name: &str) -> Option<usize> {
         let cap = self.cap();
-        let start = (h as usize) % cap;
-        let mut tombstone_idx: Option<usize> = None;
+        if cap == 0 {
+            return None;
+        }
+        let start = h as usize % cap;
+        for i in 0..cap {
+            let idx = (start + i) % cap;
+            match self.slots[idx].state {
+                SlotState::Empty => return None,
+                SlotState::Tombstone => continue,
+                SlotState::Occupied => {
+                    if self.slots[idx].hash == h && self.slots[idx].name_matches(name) {
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+        None
+    }
 
+    /// A new slot for a name that has none: the first tombstone on its
+    /// chain, or the empty slot that ends it
+    fn put(&mut self, h: u32, name: &str, id: InodeId, kind: EntryKind) -> bool {
+        self.make_room();
+        let cap = self.cap();
+        let start = h as usize % cap;
+        let mut at = None;
         for i in 0..cap {
             let idx = (start + i) % cap;
             match self.slots[idx].state {
                 SlotState::Empty => {
-                    let dst = tombstone_idx.unwrap_or(idx);
-                    self.slots[dst] = ChildSlot {
-                        hash: h, id, state: SlotState::Occupied,
-                        name_len: 0, name: [0; CHILD_NAME_LEN],
-                    };
-                    self.slots[dst].set_name(name);
-                    self.count += 1;
-                    return true;
+                    at = at.or(Some(idx));
+                    break;
                 }
                 SlotState::Tombstone => {
-                    if tombstone_idx.is_none() {
-                        tombstone_idx = Some(idx);
-                    }
+                    at = at.or(Some(idx));
                 }
-                SlotState::Occupied => continue,
+                SlotState::Occupied => {}
             }
         }
-
-        if let Some(idx) = tombstone_idx {
-            self.slots[idx] = ChildSlot {
-                hash: h, id, state: SlotState::Occupied,
-                name_len: 0, name: [0; CHILD_NAME_LEN],
-            };
-            self.slots[idx].set_name(name);
-            self.count += 1;
-            return true;
+        let Some(idx) = at else { return false };
+        if self.slots[idx].state == SlotState::Tombstone {
+            self.tombstones -= 1;
         }
-
-        false
+        self.slots[idx] = ChildSlot::new(h, name, id, kind);
+        match kind {
+            EntryKind::Positive => {
+                self.count += 1;
+                self.gen = self.gen.wrapping_add(1);
+            }
+            EntryKind::Negative => self.negatives += 1,
+            EntryKind::Whiteout => {
+                self.negatives += 1;
+                self.whiteouts += 1;
+            }
+        }
+        true
     }
 
-    fn contains_name(&self, h: u32, name: &str) -> bool {
-        let cap = self.cap();
-        if cap == 0 { return false; }
-        let start = (h as usize) % cap;
-        for i in 0..cap {
-            let idx = (start + i) % cap;
-            match self.slots[idx].state {
-                SlotState::Empty     => return false,
-                SlotState::Tombstone => continue,
-                SlotState::Occupied  => {
-                    if self.slots[idx].hash == h && self.slots[idx].name_matches(name) {
-                        return true;
-                    }
-                }
+    fn bury(&mut self, idx: usize) {
+        match self.slots[idx].kind {
+            EntryKind::Positive => {
+                self.count -= 1;
+                self.gen = self.gen.wrapping_add(1);
+            }
+            EntryKind::Negative => self.negatives -= 1,
+            EntryKind::Whiteout => {
+                self.negatives -= 1;
+                self.whiteouts -= 1;
             }
         }
-        false
+        self.slots[idx] = ChildSlot::EMPTY;
+        self.slots[idx].state = SlotState::Tombstone;
+        self.tombstones += 1;
+    }
+
+    /// Moved by every name that comes or goes (positive entries): a read of the
+    /// directory made with the VFS lock released goes in only if this has not
+    /// moved since it was planned (`core/fill.rs`, `Deferred`)
+    pub fn gen(&self) -> u32 {
+        self.gen
+    }
+
+    /// `name` names `id`. A negative entry for it becomes positive; a positive
+    /// one or a whiteout already there refuses
+    pub fn insert(&mut self, name: &str, id: InodeId) -> bool {
+        let h = name_hash(name);
+        if let Some(idx) = self.slot_of(h, name) {
+            if self.slots[idx].kind != EntryKind::Negative {
+                return false;
+            }
+            self.slots[idx].kind = EntryKind::Positive;
+            self.slots[idx].id = id;
+            self.negatives -= 1;
+            self.count += 1;
+            self.gen = self.gen.wrapping_add(1);
+            return true;
+        }
+        self.put(h, name, id, EntryKind::Positive)
+    }
+
+    /// `name` is not in the directory. Does nothing when the table already has
+    /// an entry for it
+    pub fn insert_negative(&mut self, name: &str) -> bool {
+        let h = name_hash(name);
+        self.slot_of(h, name).is_none() && self.put(h, name, INVALID_ID, EntryKind::Negative)
+    }
+
+    /// `name` is still on the disk and must not be found there: its file
+    /// was unlinked while open. Over a negative entry, or a new one
+    pub fn insert_whiteout(&mut self, name: &str) -> bool {
+        let h = name_hash(name);
+        match self.slot_of(h, name) {
+            Some(idx) if self.slots[idx].kind == EntryKind::Negative => {
+                self.slots[idx].kind = EntryKind::Whiteout;
+                self.whiteouts += 1;
+                true
+            }
+            Some(_) => false,
+            None => self.put(h, name, INVALID_ID, EntryKind::Whiteout),
+        }
+    }
+
+    /// The whiteout for `name` gone: the disk has let go of the name
+    pub fn remove_whiteout(&mut self, name: &str) -> bool {
+        match self.slot_of(name_hash(name), name) {
+            Some(idx) if self.slots[idx].kind == EntryKind::Whiteout => {
+                self.bury(idx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn probe(&self, name: &str) -> Probe {
+        match self.slot_of(name_hash(name), name) {
+            Some(idx) if self.slots[idx].kind == EntryKind::Positive => Probe::Node(self.slots[idx].id),
+            Some(_) => Probe::Absent,
+            None => Probe::Unknown,
+        }
+    }
+
+    /// Whether `name` has a whiteout: still on the disk, and not to be seen
+    pub fn is_whiteout(&self, name: &str) -> bool {
+        matches!(self.slot_of(name_hash(name), name), Some(idx) if self.slots[idx].kind == EntryKind::Whiteout)
     }
 
     pub fn find_by_name(&self, name: &str) -> Option<InodeId> {
-        let h = name_hash(name);
-        let cap = self.cap();
-        if cap == 0 { return None; }
-        let start = (h as usize) % cap;
-        for i in 0..cap {
-            let idx = (start + i) % cap;
-            match self.slots[idx].state {
-                SlotState::Empty     => return None,
-                SlotState::Tombstone => continue,
-                SlotState::Occupied  => {
-                    if self.slots[idx].hash == h && self.slots[idx].name_matches(name) {
-                        return Some(self.slots[idx].id);
-                    }
-                }
-            }
+        match self.probe(name) {
+            Probe::Node(id) => Some(id),
+            _ => None,
         }
-        None
     }
 
+    /// A positive entry out, by its name
     pub fn remove_by_name(&mut self, name: &str) -> Option<InodeId> {
-        let h = name_hash(name);
-        let cap = self.cap();
-        if cap == 0 { return None; }
-        let start = (h as usize) % cap;
-        for i in 0..cap {
-            let idx = (start + i) % cap;
-            match self.slots[idx].state {
-                SlotState::Empty     => return None,
-                SlotState::Tombstone => continue,
-                SlotState::Occupied  => {
-                    if self.slots[idx].hash == h && self.slots[idx].name_matches(name) {
-                        let id = self.slots[idx].id;
-                        self.slots[idx].state = SlotState::Tombstone;
-                        if self.count > 0 { self.count -= 1; }
-                        return Some(id);
-                    }
-                }
-            }
+        let idx = self.slot_of(name_hash(name), name)?;
+        if self.slots[idx].kind != EntryKind::Positive {
+            return None;
         }
-        None
+        let id = self.slots[idx].id;
+        self.bury(idx);
+        Some(id)
     }
 
-    pub fn find_by_hash(&self, h: u32) -> ChildHashIter<'_> {
-        let cap = self.cap();
-        let start = if cap == 0 { 0 } else { (h as usize) % cap };
-        ChildHashIter {
-            children: self,
-            hash: h,
-            pos: 0,
-            start,
-        }
-    }
-
-    pub fn get_first(&self, h: u32) -> Option<InodeId> {
-        let cap = self.cap();
-        if cap == 0 { return None; }
-        let start = (h as usize) % cap;
-        for i in 0..cap {
-            let idx = (start + i) % cap;
-            match self.slots[idx].state {
-                SlotState::Empty     => return None,
-                SlotState::Tombstone => continue,
-                SlotState::Occupied  => {
-                    if self.slots[idx].hash == h {
-                        return Some(self.slots[idx].id);
-                    }
-                }
-            }
-        }
-        None
-    }
-
+    /// A positive entry out, by its name's hash and the vnode it names
     pub fn remove(&mut self, h: u32, id: InodeId) -> bool {
         let cap = self.cap();
-        if cap == 0 { return false; }
-        let start = (h as usize) % cap;
+        if cap == 0 {
+            return false;
+        }
+        let start = h as usize % cap;
         for i in 0..cap {
             let idx = (start + i) % cap;
             match self.slots[idx].state {
-                SlotState::Empty     => return false,
+                SlotState::Empty => return false,
                 SlotState::Tombstone => continue,
-                SlotState::Occupied  => {
-                    if self.slots[idx].hash == h && self.slots[idx].id == id {
-                        self.slots[idx].state = SlotState::Tombstone;
-                        if self.count > 0 { self.count -= 1; }
+                SlotState::Occupied => {
+                    if self.slots[idx].used() && self.slots[idx].hash == h && self.slots[idx].id == id {
+                        self.bury(idx);
                         return true;
                     }
                 }
@@ -272,26 +385,13 @@ impl Children {
         false
     }
 
-    pub fn remove_by_hash(&mut self, h: u32) -> Option<InodeId> {
-        let cap = self.cap();
-        if cap == 0 { return None; }
-        let start = (h as usize) % cap;
-        for i in 0..cap {
-            let idx = (start + i) % cap;
-            match self.slots[idx].state {
-                SlotState::Empty     => return None,
-                SlotState::Tombstone => continue,
-                SlotState::Occupied  => {
-                    if self.slots[idx].hash == h {
-                        let id = self.slots[idx].id;
-                        self.slots[idx].state = SlotState::Tombstone;
-                        if self.count > 0 { self.count -= 1; }
-                        return Some(id);
-                    }
-                }
-            }
+    /// Every negative entry gone, whiteouts kept: too many of them, or the
+    /// directory is complete and answers a miss without them
+    pub fn drop_negatives(&mut self) {
+        if self.negatives > self.whiteouts {
+            let cap = self.cap();
+            self.rebuild(cap, |s| s.kind != EntryKind::Negative);
         }
-        None
     }
 
     pub fn clear(&mut self) {
@@ -299,63 +399,50 @@ impl Children {
             *slot = ChildSlot::EMPTY;
         }
         self.count = 0;
+        self.negatives = 0;
+        self.whiteouts = 0;
+        self.tombstones = 0;
+        self.gen = self.gen.wrapping_add(1);
     }
 
     pub fn is_empty(&self) -> bool { self.count == 0 }
     pub fn len(&self) -> usize { self.count as usize }
-    pub fn is_full(&self) -> bool { false }
+    /// Negative entries, whiteouts not counted
+    pub fn negatives(&self) -> usize { (self.negatives - self.whiteouts) as usize }
+    pub fn whiteouts(&self) -> usize { self.whiteouts as usize }
 
-    pub fn iter(&self) -> ChildIter<'_> {
-        ChildIter { children: self, pos: 0 }
+    /// Positive entries: (hash, vnode)
+    pub fn iter(&self) -> impl Iterator<Item = (u32, InodeId)> + '_ {
+        self.slots.iter().filter(|s| s.used()).map(|s| (s.hash, s.id))
     }
-}
 
-pub struct ChildIter<'a> {
-    children: &'a Children,
-    pos:      usize,
-}
-
-impl<'a> Iterator for ChildIter<'a> {
-    type Item = (u32, InodeId);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while self.pos < self.children.slots.len() {
-            let idx = self.pos;
-            self.pos += 1;
-            if self.children.slots[idx].state == SlotState::Occupied {
-                return Some((self.children.slots[idx].hash, self.children.slots[idx].id));
-            }
-        }
-        None
+    /// Positive entries with their names: a hard link's name is its entry's,
+    /// not the vnode's first name
+    pub fn iter_named(&self) -> impl Iterator<Item = (&str, InodeId)> + '_ {
+        self.slots.iter().filter(|s| s.used()).map(|s| (s.name(), s.id))
     }
-}
 
-pub struct ChildHashIter<'a> {
-    children: &'a Children,
-    hash:     u32,
-    pos:      usize,
-    start:    usize,
-}
+    /// Positive entries from slot `from` on, with their slots
+    pub fn named_from(&self, from: usize) -> impl Iterator<Item = (usize, &str, InodeId)> + '_ {
+        self.slots.iter().enumerate().skip(from).filter(|(_, s)| s.used()).map(|(i, s)| (i, s.name(), s.id))
+    }
 
-impl<'a> Iterator for ChildHashIter<'a> {
-    type Item = InodeId;
-
-    fn next(&mut self) -> Option<InodeId> {
-        let cap = self.children.slots.len();
-        if cap == 0 { return None; }
-        while self.pos < cap {
-            let idx = (self.start + self.pos) % cap;
-            self.pos += 1;
-            match self.children.slots[idx].state {
-                SlotState::Empty     => return None,
-                SlotState::Tombstone => continue,
-                SlotState::Occupied  => {
-                    if self.children.slots[idx].hash == self.hash {
-                        return Some(self.children.slots[idx].id);
-                    }
-                }
-            }
+    /// The slot to start at for listing position `pos`, if the last listing
+    /// stopped exactly there and nothing has moved since
+    pub fn resume_at(&self, pos: usize) -> Option<usize> {
+        use core::sync::atomic::Ordering;
+        if self.resume_gen.load(Ordering::Acquire) != self.gen {
+            return None;
         }
-        None
+        let w = self.resume.load(Ordering::Acquire);
+        ((w >> 32) as usize == pos).then_some(w as u32 as usize)
+    }
+
+    /// The last listing stopped before position `pos`, which is at slot
+    /// `slot` or after it
+    pub fn stopped_at(&self, pos: usize, slot: usize) {
+        use core::sync::atomic::Ordering;
+        self.resume.store((pos as u64) << 32 | slot as u32 as u64, Ordering::Release);
+        self.resume_gen.store(self.gen, Ordering::Release);
     }
 }

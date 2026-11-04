@@ -1,0 +1,6 @@
+# An alias and nothing else, for the reason `aosh/.cargo/config.toml` gives:
+# the repository root's config builds for the kernel's target.
+#
+#     cd lib/freetype && cargo test-host
+[alias]
+test-host = "test --target x86_64-unknown-linux-gnu -Z build-std=std,panic_unwind,proc_macro,test"

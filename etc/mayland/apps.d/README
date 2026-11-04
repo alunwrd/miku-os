@@ -1,0 +1,52 @@
+What there is to launch
+=======================
+
+`/bin` is a flat directory of ELF files with not one byte of metadata in it, so
+a launcher that listed it could offer a filename and nothing else - no name
+somebody chose, no picture, no arguments. What a program is called is written
+down, and this is where.
+
+One file, one program:
+
+    app {
+        name = Терминал
+        icon = /etc/mayland/icons/terminal.qoi
+        exec = /bin/mayterm
+    }
+
+Three keys and no others:
+
+    name    what the launcher shows. Anything, in any language - the list is
+            searched on what is written here
+    icon    a QOI file. Missing, unreadable, or bigger than 64 by 64 and the
+            row draws its tile without a picture rather than refusing to open
+    exec    the command, with its arguments if it takes any. A path: nothing
+            here searches a PATH, because nothing here has one
+
+`title` is accepted for `name` and `command` for `exec`, because both are what
+somebody writes first.
+
+The order is the order the filenames sort in, which is why the shipped one is
+numbered - the same convention `default.d` keeps. Drop in `50-editor.conf` and
+it appears between 10 and 90 without touching anything else.
+
+A key nobody knows about is complained about on the serial line with the file
+and the line number it was on. A file that describes nothing usable - no name,
+or no command - is skipped in silence: half a block somebody is still writing
+is not an error yet.
+
+Pictures
+--------
+
+Put a PNG or a JPEG in `assets/icons/` in the source tree and the build
+converts it to QOI at 64 pixels a side, into `/etc/mayland/icons/`. Name it
+here by the path it lands at. Anything already in QOI can be dropped straight
+into `/etc/mayland/icons` on the running machine.
+
+What draws this
+---------------
+
+Nothing in this directory says what the list *looks* like. That is
+`/etc/mayland/shell/20-launcher.conf`, which describes the card, the search row
+and the rows - and knows nothing about which programs are on it. The two halves
+meet at one word: `source = apps.list`.

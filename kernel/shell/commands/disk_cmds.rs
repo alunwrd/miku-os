@@ -116,11 +116,10 @@ pub fn cmd_blkstat() {
     );
 }
 
-/// Concurrent NVMe stress test: several kernel threads hammer distinct
-/// regions of the NVMe device at once. Because the block layer now
-/// dispatches with no device-wide lock and NVMe spreads requests across
-/// per-CPU queues, the I/O really overlaps - this checks it stays correct
-/// (no cross-queue corruption) under that parallelism
+/// Concurrent NVMe stress test: several kernel threads hammer distinct regions
+/// of the NVMe device at once. The block layer dispatches with no device-wide
+/// lock and NVMe spreads requests across per-CPU queues, so the I/O overlaps,
+/// and this checks it stays correct (no cross-queue corruption)
 const NS_WORKERS: usize = 4;
 static NS_DEV:    core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
 static NS_NEXT:   core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -252,7 +251,7 @@ pub fn cmd_blkonline(drive_str: &str) {
     }
 }
 
-/// Zero a sector range - blkdiscard(8) with --zeroout. Uses the device's
+/// Zeroes a sector range: blkdiscard(8) with --zeroout. Uses the device's
 /// native Write Zeroes command when present, zero-filled writes otherwise
 pub fn cmd_blkzero(args: &str) {
     let mut it = args.split_whitespace();
@@ -297,7 +296,7 @@ pub fn cmd_fstrim() {
     }
 
     let res = crate::shell::commands::ext2_cmds::with_ext2_pub(|fs| {
-        let dev = fs.reader.dev_id;
+        let dev = fs.reader.host.dev;
         if !crate::io::block::info(dev).map_or(false, |i| i.discard) {
             return Outcome::Unsupported(dev);
         }
@@ -324,8 +323,8 @@ pub fn cmd_fstrim() {
     }
 }
 
-/// Discard (TRIM) a sector range, or the whole device when no range is
-/// given - MikuOS's blkdiscard(8)
+/// Discards (TRIMs) a sector range, or the whole device when no range is given:
+/// MikuOS's blkdiscard(8)
 pub fn cmd_blkdiscard(args: &str) {
     let mut it = args.split_whitespace();
     let Some(idx) = it.next().and_then(parse_drive) else {

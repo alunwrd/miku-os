@@ -1,281 +1,201 @@
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use spin::Mutex;
+// What a program reads from the keyboard
+//
+// The line discipline is `io::tty::ldisc`, one per terminal. Here are the names
+// the rest of the kernel calls, each answering for the caller's own terminal.
+// Each function names a terminal and passes the question on. See
+// `dev/terminal-architecture.md`.
 
-const READ_BUF_SIZE: usize = 1024;
-const LINE_BUF_SIZE: usize = 256;
+use crate::io::tty::{self, TtyId};
 
-static FOREGROUND_PID: AtomicU64 = AtomicU64::new(0);
+pub use crate::io::tty::ldisc::Termios;
 
-struct ReadRing {
-    buf:  [u8; READ_BUF_SIZE],
-    head: usize,
-    tail: usize,
-}
-
-impl ReadRing {
-    const fn new() -> Self {
-        Self { buf: [0; READ_BUF_SIZE], head: 0, tail: 0 }
-    }
-
-    fn push(&mut self, byte: u8) {
-        let next = (self.tail + 1) % READ_BUF_SIZE;
-        if next == self.head { return; }
-        self.buf[self.tail] = byte;
-        self.tail = next;
-    }
-
-    fn pop(&mut self) -> Option<u8> {
-        if self.head == self.tail { return None; }
-        let b = self.buf[self.head];
-        self.head = (self.head + 1) % READ_BUF_SIZE;
-        Some(b)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.head == self.tail
-    }
-
-    fn clear(&mut self) {
-        self.head = 0;
-        self.tail = 0;
-    }
-}
-
-struct LineBuf {
-    buf: [u8; LINE_BUF_SIZE],
-    len: usize,
-}
-
-impl LineBuf {
-    const fn new() -> Self {
-        Self { buf: [0; LINE_BUF_SIZE], len: 0 }
-    }
-
-    fn push(&mut self, b: u8) -> bool {
-        if self.len >= LINE_BUF_SIZE { return false; }
-        self.buf[self.len] = b;
-        self.len += 1;
-        true
-    }
-
-    fn pop(&mut self) -> bool {
-        if self.len == 0 { return false; }
-        self.len -= 1;
-        true
-    }
-
-    fn clear(&mut self) {
-        self.len = 0;
-    }
-}
-
-/// Terminal settings, the subset a line discipline actually needs.
+/// The terminal the running task is at
 ///
-/// Until now the discipline was hardwired: always canonical, always echoing,
-/// and Ctrl-C always killed. Nothing in ring 3 could read a password without
-/// showing it, implement a pager, or take over the keys - the settings simply
-/// did not exist to be changed. These flags mirror the POSIX names so a libc
-/// can map termios onto them without inventing its own vocabulary
-#[derive(Clone, Copy)]
-pub struct Termios {
-    /// Canonical mode: input is delivered a line at a time, with editing
-    pub icanon: bool,
-    /// Echo input characters back to the terminal
-    pub echo: bool,
-    /// Turn INTR/QUIT/SUSP characters into signals instead of data
-    pub isig: bool,
+/// `Process::ctty` is inherited on fork and preserved across exec, and `print!`
+/// routes output by it. This is the input half
+pub fn mine() -> TtyId {
+    ctty().unwrap_or(tty::SYSTEM)
 }
 
-impl Termios {
-    pub const fn cooked() -> Self {
-        Self { icanon: true, echo: true, isig: true }
-    }
+/// The caller's controlling terminal, or nothing
+///
+/// `mine()` cannot tell the console from no terminal, answering both with the
+/// console. `/dev/tty` needs the difference: a process with no controlling
+/// terminal cannot open it
+pub fn ctty() -> Option<TtyId> {
+    let raw = crate::sched::current_tty();
+    if raw == 0 { None } else { Some(TtyId(raw)) }
 }
-
-struct UserStdinInner {
-    read_ring: ReadRing,
-    line_buf:  LineBuf,
-    termios:   Termios,
-    /// Set by Ctrl-D on an empty line; the next read returns 0 (EOF)
-    eof:       bool,
-}
-
-impl UserStdinInner {
-    const fn new() -> Self {
-        Self {
-            read_ring: ReadRing::new(),
-            line_buf:  LineBuf::new(),
-            termios:   Termios::cooked(),
-            eof:       false,
-        }
-    }
-}
-
-static INNER: Mutex<UserStdinInner> = Mutex::new(UserStdinInner::new());
 
 pub fn termios() -> Termios {
-    INNER.lock().termios
+    tty::termios(mine())
+}
+
+/// How wide and tall the caller's terminal is, in characters: what `TIOCGWINSZ`
+/// answers
+pub fn size() -> (usize, usize) {
+    tty::size(mine())
 }
 
 pub fn set_termios(t: Termios) {
-    INNER.lock().termios = t;
+    tty::set_termios(mine(), t);
 }
 
-pub fn set_foreground(pid: u64) {
-    {
-        let mut inner = INNER.lock();
-        inner.read_ring.clear();
-        inner.line_buf.clear();
-        inner.eof = false;
-        // A new foreground program inherits a sane terminal rather than
-        // whatever mode its predecessor happened to die in
-        inner.termios = Termios::cooked();
-    }
-    FOREGROUND_PID.store(pid, Ordering::Release);
+/// Hand this terminal to a job
+pub fn set_foreground(pgid: u64) {
+    tty::set_foreground(mine(), pgid);
 }
 
 pub fn clear_foreground() {
-    FOREGROUND_PID.store(0, Ordering::Release);
+    tty::clear_foreground(mine());
 }
 
+/// The job holding this terminal's keys, 0 for nobody
 pub fn foreground_pid() -> u64 {
-    FOREGROUND_PID.load(Ordering::Acquire)
+    tty::foreground(mine())
 }
 
 pub fn is_foreground_active() -> bool {
     foreground_pid() != 0
 }
 
+/// One character from the keyboard
+///
+/// To the terminal the keyboard is pointed at, not necessarily the caller's:
+/// this is reached from the shell's keyboard thread, deciding where a keystroke
+/// goes
 pub fn feed_char(c: char) {
-    if !is_foreground_active() { return; }
+    tty::feed_char(tty::active(), c);
+}
 
-    let t = INNER.lock().termios;
+/// Would `read` return without sleeping?
+///
+/// Mirrors the top of `read`'s loop line for line: a poll reporting the
+/// keyboard ready is followed by a read, and if the two disagree the read
+/// blocks.
+///
+/// The cases where `read` refuses are included: it returns end-of-file without
+/// blocking when this terminal's keys are not the caller's, and a call
+/// returning at once is ready in poll's sense
+pub fn readable() -> bool {
+    readable_on(mine())
+}
 
-    // Signal characters come first and are consumed, never delivered as data
-    if t.isig {
-        match c {
-            '\u{0003}' => {                       // Ctrl-C -> INTR
-                let pid = foreground_pid();
-                if pid != 0 {
-                    if t.echo { crate::print!("^C\n"); }
-                    let mut inner = INNER.lock();
-                    inner.line_buf.clear();
-                    inner.read_ring.clear();
-                    drop(inner);
-                    // Deliver a signal instead of killing outright: a program
-                    // with a SIGINT handler now gets a chance to run it, and
-                    // the default action is still fatal
-                    crate::process::signal::send_signal(pid, crate::process::signal::SIGINT);
-                }
-                return;
-            }
-            '\u{001C}' => {                       // Ctrl-\ -> QUIT
-                let pid = foreground_pid();
-                if pid != 0 {
-                    if t.echo { crate::print!("^\\\n"); }
-                    crate::process::signal::send_signal(pid, crate::process::signal::SIGQUIT);
-                }
-                return;
-            }
-            _ => {}
-        }
-    }
+/// The same question about a named terminal: what `poll` asks of a descriptor
+/// open on `/dev/tty` or `/dev/console`
+pub fn readable_on(id: TtyId) -> bool {
+    if !may_read(id) { return true; }
+    tty::readable(id)
+}
 
-    if !t.icanon {
-        // Raw mode: every byte goes straight through, no editing, no
-        // line assembly. This is what a pager or an editor wants
-        let mut inner = INNER.lock();
-        inner.read_ring.push(c as u8);
-        drop(inner);
-        if t.echo { crate::print!("{}", c); }
-        return;
-    }
-
-    match c {
-        '\n' => {
-            if t.echo { crate::print!("\n"); }
-            let mut inner = INNER.lock();
-            for i in 0..inner.line_buf.len {
-                let b = inner.line_buf.buf[i];
-                inner.read_ring.push(b);
-            }
-            inner.read_ring.push(b'\n');
-            inner.line_buf.clear();
-        }
-        '\u{0008}' | '\u{007F}' => {
-            let mut inner = INNER.lock();
-            if inner.line_buf.pop() && t.echo {
-                drop(inner);
-                crate::print!("\u{0008} \u{0008}");
-            }
-        }
-        '\u{0004}' => {                            // Ctrl-D
-            let mut inner = INNER.lock();
-            if inner.line_buf.len == 0 {
-                // End of input: the pending read returns 0
-                inner.eof = true;
-            } else {
-                // Mid-line it just flushes what has been typed so far
-                for i in 0..inner.line_buf.len {
-                    let b = inner.line_buf.buf[i];
-                    inner.read_ring.push(b);
-                }
-                inner.line_buf.clear();
-            }
-        }
-        '\u{0015}' => {                            // Ctrl-U: kill the line
-            let mut inner = INNER.lock();
-            let n = inner.line_buf.len;
-            inner.line_buf.clear();
-            drop(inner);
-            if t.echo {
-                for _ in 0..n { crate::print!("\u{0008} \u{0008}"); }
-            }
-        }
-        c if c >= ' ' && (c as u32) < 127 => {
-            let mut inner = INNER.lock();
-            if inner.line_buf.push(c as u8) {
-                drop(inner);
-                if t.echo { crate::print!("{}", c); }
-            }
-        }
-        _ => {}
-    }
+/// Are this terminal's keys the caller's to read?
+///
+/// The foreground is a job, and only the job holding a terminal may read it. A
+/// background reader must not succeed: two readers on one terminal take
+/// alternate halves of every line typed. POSIX stops such a reader with SIGTTIN
+/// (`sched::stop_current`, `tty::background_read`), where a job waits until
+/// brought forward
+pub fn may_read(id: TtyId) -> bool {
+    let fg = tty::foreground(id);
+    if fg == 0 { return false; }
+    fg == crate::sched::pgid_of(crate::sched::current_pid())
 }
 
 pub fn read(buf_ptr: u64, len: u64) -> u64 {
+    read_from(mine(), buf_ptr, len)
+}
+
+/// Read a named terminal
+///
+/// `read` is this with the caller's own filled in. A descriptor open on
+/// `/dev/tty` resolves to the same terminal by another route, and one on
+/// `/dev/console` names tty0 whoever asks. Both wait here, outside the VFS
+/// lock, not in `devfs::dev_read`
+pub fn read_from(id: TtyId, buf_ptr: u64, len: u64) -> u64 {
     if buf_ptr == 0 || len == 0 || buf_ptr < 0x1000 || buf_ptr > 0x0000_7FFF_FFFF_FFFF {
         return u64::MAX;
     }
 
-    let max_read = (len as usize).min(READ_BUF_SIZE);
+    let max_read = (len as usize).min(tty::ldisc::READ_BUF_SIZE);
+    // Staged, not written a byte at a time under the discipline's lock: the
+    // user pointer is another address space's and the copy must not happen with
+    // interrupts off
+    let mut staging = [0u8; tty::ldisc::READ_BUF_SIZE];
+
+    // VMIN and VTIME, which apply only in raw mode; canonical mode delivers a
+    // line.
+    //
+    //   VMIN 0, VTIME 0: take whatever is there, even nothing. A poll.
+    //   VMIN n, VTIME 0: wait for n characters, however long that takes.
+    //   VTIME t: give up after t tenths of a second and return what there is,
+    //            which is how a program tells a lone ESC from the start of an arrow key
+    let t = tty::termios(id);
+    let (vmin, vtime) = if t.icanon { (1u8, 0u8) } else { (t.vmin, t.vtime) };
+    // 250 Hz, so a tenth of a second is 25 ticks
+    let deadline = if vtime == 0 { None } else {
+        Some(crate::fs::procfs::uptime_ticks() + vtime as u64 * 25)
+    };
+    use crate::sched::wait::{join, key, keyed, POLL};
+    let queues = [keyed(key::tty_input(id)), &POLL];
+    let mut joined = None;
 
     loop {
-        if foreground_pid() == 0 {
+        // Asked again on every pass: a shell moves the terminal's keys to a job
+        // it has just started, and this read may be that job's
+        if !may_read(id) {
+            // SIGTTIN, as POSIX says: the caller stops until made the
+            // foreground. If it survives that (ignored or caught), the read
+            // ends in end of file
+            if tty::background_read(id) {
+                continue;
+            }
             return 0;
         }
 
-        {
-            let mut inner = INNER.lock();
-            if inner.read_ring.is_empty() && inner.eof {
-                inner.eof = false;
-                return 0;
-            }
-            if !inner.read_ring.is_empty() {
-                let mut count = 0usize;
-                while count < max_read {
-                    match inner.read_ring.pop() {
-                        Some(b) => {
-                            unsafe { *((buf_ptr + count as u64) as *mut u8) = b; }
-                            count += 1;
-                        }
-                        None => break,
-                    }
+        match tty::read_input(id, &mut staging, max_read) {
+            // End of input
+            None => return 0,
+            // Nothing there. With VMIN 0 that is the answer: a program that
+            // asked not to block is told there was nothing, as `poll` on a
+            // terminal relies on
+            Some(0) => {
+                if vmin == 0 && vtime == 0 {
+                    return 0;
                 }
-                return count as u64;
+            }
+            Some(n) => {
+                // Fewer than asked for, with time left to wait for the rest.
+                // Put back, not a short read: VMIN means not before this many
+                if n < vmin as usize && deadline.is_some_and(|d| crate::fs::procfs::uptime_ticks() < d) {
+                    tty::unread(id, &staging[..n]);
+                } else {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            staging.as_ptr(), buf_ptr as *mut u8, n);
+                    }
+                    return n as u64;
+                }
             }
         }
 
-        crate::sched::sleep(1);
+        // The timer ran out. Whatever is there is the answer, including none
+        if deadline.is_some_and(|d| crate::fs::procfs::uptime_ticks() >= d) {
+            return 0;
+        }
+
+        // Off the run queue until something is typed. `tty::feed_char` wakes
+        // this queue after the discipline has taken the character and the lock
+        // is gone, the rule in `sched::wait`.
+        //
+        // The backstop turns a missed wakeup into a late read. Joined before
+        // the look that decides it, so a key typed in between is not left to
+        // the backstop (`wait::join`)
+        match joined.take() {
+            None => joined = Some(join(&queues)),
+            Some(j) => { j.sleep(crate::sched::tick_deadline(READ_BACKSTOP)); }
+        }
     }
 }
+
+/// Ticks a blocked read sleeps for when nothing wakes it (4 ms each)
+const READ_BACKSTOP: u64 = 25;

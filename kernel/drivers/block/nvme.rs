@@ -1,17 +1,25 @@
 // NVMe driver behind the 'BlockDriver' trait
-// 
-// Completes the real-hardware storage trio (legacy ATA, AHCI SATA, NVMe):
-// most modern machines boot from an NVMe SSD where neither of the other two
-// controllers exists
-// 
-// Scope matches the rest of the block layer: one admin queue pair plus one
-// I/O queue pair, single outstanding command, polled completion via the
-// CQ phase bit, data through a 64 KiB bounce buffer addressed with  PRP1 + a PRP list page
+//
+// One admin queue pair plus NUM_IO_QUEUES I/O queue pairs, one outstanding
+// command per queue, data through a 64 KiB bounce buffer per queue addressed
+// with PRP1 + a PRP list page.
+//
+// Completions arrive by interrupt (`dev/fs-architecture.md`, "NVMe on
+// interrupts"). Each I/O completion queue has its own MSI-X entry, and its
+// handler only wakes whoever waits on that queue (`IO_WAIT`); the waiter reads
+// the completion itself. The admin queue polls (it runs at bring-up), and so
+// does an I/O command that cannot sleep: no scheduler yet, interrupts off, the
+// idle task, a dead task (`dev/kernel-core.md`, "A dead task never comes
+// back"). `nvmepoll` on the boot line polls every command
 
 extern crate alloc;
 
-use alloc::boxed::Box;
+use crate::mm::dma::DmaBox;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex as SpinMutex;
+
+use crate::kcore::sched_lock::SchedMutex;
+use crate::sched::WaitQueue;
 
 use crate::io::block::driver::{BlkError, BlockDevInfo, BlockDriver, HealthInfo};
 use crate::drivers::bus::pci::{pci_read32, pci_read8, PCI_ADDR, PCI_DATA, pci_addr};
@@ -48,9 +56,48 @@ const NVM_WRITE_ZEROES: u8 = 0x08;
 const ADMIN_QD: usize = 16; // admin queue depth
 const IO_QD:    usize = 64; // I/O queue depth
 
-/// Independent I/O queue pairs. Requests route to one by CPU, so this many
-/// CPUs can submit and poll NVMe commands at the same time - true blk-mq
+/// Independent I/O queue pairs. Requests route to one by CPU, so this many CPUs
+/// can have NVMe commands in flight at once
 const NUM_IO_QUEUES: usize = 4;
+
+/// Who waits for a completion on each I/O queue, woken by that queue's
+/// interrupt. Static, and indexed by queue: the handler has nothing else to
+/// find them by
+static IO_WAIT: [WaitQueue; NUM_IO_QUEUES] = [const { WaitQueue::new() }; NUM_IO_QUEUES];
+
+/// Completions are signalled. False until every queue's MSI-X entry is set and
+/// the function's MSI-X is on, and always with `nvmepoll`
+static IRQ_READY: AtomicBool = AtomicBool::new(false);
+
+/// How long one sleep on a completion lasts with no interrupt: the backstop,
+/// for an interrupt that was lost
+const WAIT_BACKSTOP_NS: u64 = 10_000_000;
+
+/// The longest a command may take, either way of waiting
+const COMMAND_TIMEOUT_NS: u64 = 30_000_000_000;
+
+/// How long a waiter polls before it sleeps. A read from a fast SSD finishes
+/// inside this with no interrupt and no switch; a longer one frees the
+/// processor. In QEMU, where a 64 KiB read takes ~0.6 ms, a sleep and its wake
+/// cost about a quarter on top of polling (87 against 111 MB/s cold)
+pub const SPIN_BEFORE_SLEEP_NS: u64 = 50_000;
+
+/// A queue's MSI-X handler: in interrupt context, so it reads nothing and
+/// only wakes
+fn completion_irq(queue: usize) {
+    if let Some(w) = IO_WAIT.get(queue) {
+        w.wake_all();
+    }
+}
+
+/// Whether the caller may sleep for a completion rather than poll for it
+fn may_sleep() -> bool {
+    IRQ_READY.load(Ordering::Acquire)
+        && crate::sched::started()
+        && x86_64::instructions::interrupts::are_enabled()
+        && !crate::sched::current_is_idle()
+        && !crate::sched::current_is_dead()
+}
 
 pub const MAX_XFER_SECTORS: u32 = 128; // 64 KiB per command
 const BOUNCE_SIZE: usize = MAX_XFER_SECTORS as usize * 512;
@@ -63,6 +110,9 @@ struct AdminMem {
     ident: [u8; 4096],
 }
 
+// SAFETY: bytes only
+unsafe impl crate::mm::dma::Zeroed for AdminMem {}
+
 /// One I/O queue pair's controller-visible memory, page-aligned. Each queue
 /// has its own bounce buffer and PRP list, so the queues never touch each
 /// other's DMA region and can run fully in parallel
@@ -73,6 +123,9 @@ struct IoQueueMem {
     prp:    [u8; 4096],
     bounce: [u8; BOUNCE_SIZE],
 }
+
+// SAFETY: bytes only
+unsafe impl crate::mm::dma::Zeroed for IoQueueMem {}
 
 /// Mutable ring cursors for one queue, guarded so concurrent submitters on
 /// the same queue serialize while different queues proceed independently
@@ -89,17 +142,20 @@ impl QState {
     }
 }
 
-/// One I/O queue: its DMA memory plus a lock over its cursors
+/// One I/O queue: its DMA memory plus a lock over its cursors. A sleeping
+/// lock: its holder sleeps for the completion, and so does whoever is next
 struct IoQueue {
     qid: u16,
-    mem: Box<IoQueueMem>,
-    st:  SpinMutex<QState>,
+    mem: DmaBox<IoQueueMem>,
+    st:  SchedMutex<QState>,
 }
 
 pub struct Nvme {
     mmio:      u64,   // virtual base of BAR0
+    /// Where it is on the bus, for its MSI-X capability
+    pci:       Option<crate::drivers::bus::msi::PciFn>,
     db_stride: u64,
-    admin_mem: Box<AdminMem>,
+    admin_mem: DmaBox<AdminMem>,
     admin:     SpinMutex<QState>,
     admin_depth: u16,
     io_depth:  u16,
@@ -138,38 +194,13 @@ fn wr64(addr: u64, val: u64) {
 
 /// Find the first NVMe controller (PCI class 01.08) and bring it up
 pub fn find_controller() -> Option<Nvme> {
-    let mut found: Option<(u8, u8, u8, u64)> = None;
-
-    'scan: for bus in 0..=255u8 {
-        for dev in 0..32u8 {
-            for func in 0..8u8 {
-                let id = pci_read32(bus, dev, func, 0x00);
-                if (id & 0xFFFF) as u16 == 0xFFFF {
-                    if func == 0 { break; }
-                    continue;
-                }
-                let class_rev = pci_read32(bus, dev, func, 0x08);
-                if (class_rev >> 24) as u8 == 0x01
-                    && ((class_rev >> 16) & 0xFF) as u8 == 0x08
-                {
-                    let bar_lo = pci_read32(bus, dev, func, 0x10);
-                    if bar_lo & 1 != 0 { continue; } // must be MMIO
-                    let mut bar = (bar_lo & 0xFFFF_FFF0) as u64;
-                    if (bar_lo >> 1) & 3 == 2 {
-                        bar |= (pci_read32(bus, dev, func, 0x14) as u64) << 32;
-                    }
-                    if bar == 0 { continue; }
-                    found = Some((bus, dev, func, bar));
-                    break 'scan;
-                }
-                if func == 0 && (pci_read8(bus, dev, func, 0x0E) & 0x80) == 0 {
-                    break;
-                }
-            }
-        }
-    }
-
-    let (bus, dev, func, bar) = found?;
+    // Class 01 subclass 08 is NVM Express. BAR0 must be memory, and may be
+    // a 64-bit BAR whose upper half lives in BAR1
+    let ctrl = crate::drivers::bus::pci::find(|d| {
+        d.class == 0x01 && d.subclass == 0x08 && d.mem_bar(0).unwrap_or(0) != 0
+    })?;
+    let (bus, dev, func) = (ctrl.bus, ctrl.dev, ctrl.func);
+    let bar = ctrl.mem_bar(0)?;
 
     // Memory space + bus master on
     let cmd = pci_read32(bus, dev, func, 0x04);
@@ -184,11 +215,11 @@ pub fn find_controller() -> Option<Nvme> {
     crate::mm::vmm::map_mmio_uc(bar, 0x4000);
     let mmio = crate::arch::x86_64::grub::phys_to_virt(bar);
 
-    Nvme::init(mmio)
+    Nvme::init(mmio, Some(crate::drivers::bus::msi::PciFn { bus, dev, func }))
 }
 
 impl Nvme {
-    fn init(mmio: u64) -> Option<Self> {
+    fn init(mmio: u64, pci: Option<crate::drivers::bus::msi::PciFn>) -> Option<Self> {
         let cap = rd64(mmio + REG_CAP);
         let db_stride = 4u64 << ((cap >> 32) & 0xF);
         let mqes = (cap & 0xFFFF) as usize + 1;
@@ -199,12 +230,10 @@ impl Nvme {
 
         let mut drv = Nvme {
             mmio,
+            pci,
             db_stride,
-            admin_mem: Box::new(AdminMem {
-                sq:    [0u8; 4096],
-                cq:    [0u8; 4096],
-                ident: [0u8; 4096],
-            }),
+            // NVMe addresses 64 bits: anywhere in memory
+            admin_mem: DmaBox::new().ok()?,
             admin: SpinMutex::new(QState::new()),
             admin_depth,
             io_depth,
@@ -225,15 +254,15 @@ impl Nvme {
             return None;
         }
 
-        let asq = crate::net::virt_to_phys(drv.admin_mem.sq.as_ptr() as u64);
-        let acq = crate::net::virt_to_phys(drv.admin_mem.cq.as_ptr() as u64);
+        let asq = drv.admin_mem.phys_of(drv.admin_mem.sq.as_ptr());
+        let acq = drv.admin_mem.phys_of(drv.admin_mem.cq.as_ptr());
         let aqa = ((admin_depth as u32 - 1) << 16) | (admin_depth as u32 - 1);
         wr32(mmio + REG_AQA, aqa);
         wr64(mmio + REG_ASQ, asq);
         wr64(mmio + REG_ACQ, acq);
 
-        // Program the config first, then flip EN in a second write - some
-        // controllers reject config changes in the same write that enables
+        // Program the config first, then flip EN in a second write: some
+        // controllers reject config changes in the write that enables
         wr32(mmio + REG_CC, CC_CONFIG & !CC_ENABLE);
         wr32(mmio + REG_CC, CC_CONFIG);
         if !drv.wait_csts(CSTS_RDY, timeout_500ms) {
@@ -242,7 +271,7 @@ impl Nvme {
         }
 
         // IDENTIFY controller (CNS=1): model string for blkstat
-        let ident_phys = crate::net::virt_to_phys(drv.admin_mem.ident.as_ptr() as u64);
+        let ident_phys = drv.admin_mem.phys_of(drv.admin_mem.ident.as_ptr());
         if drv.admin_cmd(ADM_IDENTIFY, 0, ident_phys, 1, 0).is_err() {
             crate::serial_println!("[nvme] IDENTIFY controller failed");
             return None;
@@ -277,22 +306,35 @@ impl Nvme {
         }
         drv.capacity = nsze;
 
+        // Interrupts, if the function has MSI-X with an entry for every I/O
+        // queue (entry 0 is the admin queue's, which polls). Without, or with
+        // `nvmepoll`, every queue is created without one and polls
+        let msix = drv.pci.and_then(|f| {
+            let caps = crate::drivers::bus::msi::read_caps(f);
+            crate::drivers::bus::msi::log_capabilities("nvme", &caps);
+            caps.msix
+        }).filter(|c| c.table_size as usize > NUM_IO_QUEUES)
+          .filter(|_| !crate::arch::x86_64::grub::cmdline_flag("nvmepoll"));
+        // Before the queues: a controller refuses a completion queue with a
+        // vector while MSI-X is off ("invalid interrupt vector", 01h/08h)
+        let irq = match (drv.pci, msix) {
+            (Some(f), Some(cap)) => drv.enable_interrupts(f, &cap),
+            _ => false,
+        };
+
         // Create NUM_IO_QUEUES independent I/O queue pairs (qid 1..=N). Each
         // gets its own CQ then SQ; a per-queue PRP list is filled once
         let qsize = (io_depth as u32 - 1) << 16;
         for i in 0..NUM_IO_QUEUES {
             let qid = (i + 1) as u32;
-            let mut mem = Box::new(IoQueueMem {
-                sq:     [0u8; 4096],
-                cq:     [0u8; 4096],
-                prp:    [0u8; 4096],
-                bounce: [0u8; BOUNCE_SIZE],
-            });
+            let mut mem = DmaBox::<IoQueueMem>::new().ok()?;
 
-            let cq_phys = crate::net::virt_to_phys(mem.cq.as_ptr() as u64);
-            let sq_phys = crate::net::virt_to_phys(mem.sq.as_ptr() as u64);
-            // CREATE_IO_CQ: cdw10 = qsize|qid, cdw11 = PC (no interrupts: poll)
-            if drv.admin_cmd(ADM_CREATE_IO_CQ, 0, cq_phys, qsize | qid, 1).is_err() {
+            let cq_phys = mem.phys_of(mem.cq.as_ptr());
+            let sq_phys = mem.phys_of(mem.sq.as_ptr());
+            // CREATE_IO_CQ: cdw10 = qsize|qid, cdw11 = IV (MSI-X entry qid)
+            // in 31:16, IEN in bit 1, PC in bit 0
+            let cq_flags = if irq { (qid << 16) | 2 | 1 } else { 1 };
+            if drv.admin_cmd(ADM_CREATE_IO_CQ, 0, cq_phys, qsize | qid, cq_flags).is_err() {
                 crate::serial_println!("[nvme] create IO CQ {} failed", qid);
                 return None;
             }
@@ -303,21 +345,24 @@ impl Nvme {
             }
 
             // PRP list for bounce pages 1.. (page 0 goes in PRP1)
-            let bounce_phys = crate::net::virt_to_phys(mem.bounce.as_ptr() as u64);
+            let bounce_phys = mem.phys_of(mem.bounce.as_ptr());
             for p in 1..(BOUNCE_SIZE / 4096) {
                 let entry = bounce_phys + p as u64 * 4096;
                 let off = (p - 1) * 8;
                 mem.prp[off..off + 8].copy_from_slice(&entry.to_le_bytes());
             }
 
-            drv.io.push(IoQueue { qid: qid as u16, mem, st: SpinMutex::new(QState::new()) });
+            drv.io.push(IoQueue { qid: qid as u16, mem, st: SchedMutex::new(QState::new()) });
         }
+        // Waits sleep from here: every queue that will raise one exists
+        IRQ_READY.store(irq, Ordering::Release);
 
         crate::serial_println!(
-            "[nvme] '{}' ns{} {} sectors ({} MB) {} io-queues x qd={} dsm={} wz={}",
+            "[nvme] '{}' ns{} {} sectors ({} MB) {} io-queues x qd={} dsm={} wz={} completions={}",
             core::str::from_utf8(&drv.model[..drv.model_len as usize]).unwrap_or("?"),
             drv.nsid, drv.capacity, drv.capacity * 512 / (1024 * 1024),
-            NUM_IO_QUEUES, io_depth, drv.has_dsm, drv.has_wz
+            NUM_IO_QUEUES, io_depth, drv.has_dsm, drv.has_wz,
+            if IRQ_READY.load(Ordering::Acquire) { "msi-x" } else { "polled" }
         );
         Some(drv)
     }
@@ -346,27 +391,52 @@ impl Nvme {
         self.mmio + DOORBELLS + (2 * qid + 1) * self.db_stride
     }
 
-    /// Submit one command on a specific queue and poll its completion. The
-    /// queue's cursor lock is held for the whole submit/poll, so concurrent
-    /// callers on the same queue serialize while different queues run in
-    /// parallel. Takes '&self' - the per-queue lock provides the mutability,
-    /// and each queue owns disjoint SQ/CQ memory
-    fn submit_on(
-        &self,
-        sq: *mut u8,
-        cq: *const u8,
-        st: &SpinMutex<QState>,
-        qid: u64,
-        depth: u16,
-        entry: &[u8; 64],
-    ) -> Result<(), BlkError> {
-        let mut q = st.lock();
-        self.submit_locked(sq, cq, &mut q, qid, depth, entry)
+    /// One MSI-X entry per I/O queue, all to the boot CPU, the only one up when
+    /// the block layer probes, and the function's MSI-X on. Every queue polls
+    /// if any part of it cannot be had. Entry 0 is the admin queue's and stays
+    /// masked
+    fn enable_interrupts(&self, f: crate::drivers::bus::msi::PciFn, cap: &crate::drivers::bus::msi::MsixCapability) -> bool {
+        use crate::arch::x86_64::apic;
+        let Some(table) = crate::drivers::bus::msi::map_msix(f, cap) else {
+            crate::serial_println!("[nvme] MSI-X table not in a memory BAR - polling");
+            return false;
+        };
+        let lapic = apic::lapic_id();
+        let mut taken = alloc::vec::Vec::new();
+        for i in 0..NUM_IO_QUEUES {
+            let Some(t) = apic::alloc_msi_vector(lapic, completion_irq, i) else {
+                crate::serial_println!("[nvme] no MSI vector free for queue {} - polling", i + 1);
+                for (k, t) in taken.into_iter().enumerate() {
+                    table.mask((k + 1) as u16);
+                    apic::free_msi_vector(t);
+                }
+                return false;
+            };
+            table.set((i + 1) as u16, t.address, t.data);
+            taken.push(t);
+        }
+        crate::drivers::bus::msi::enable_msix(f, cap);
+        true
     }
 
-    /// Core submit+poll with the queue's cursor lock already held by the
-    /// caller (read/write hold it across the bounce-buffer copy, so the
-    /// whole transfer is exclusive on that queue)
+    /// One command on I/O queue `qi`, waited for (`submit_locked`). The queue's
+    /// lock is held throughout, so callers on one queue take turns while
+    /// different queues run in parallel. Takes '&self': the per-queue lock
+    /// provides the mutability, and each queue owns disjoint SQ/CQ memory
+    fn io_cmd(&self, qi: usize, entry: &[u8; 64]) -> Result<(), BlkError> {
+        let q = &self.io[qi];
+        let sq = q.mem.sq.as_ptr() as *mut u8;
+        let cq = q.mem.cq.as_ptr();
+        let mut g = q.st.lock();
+        self.submit_locked(sq, cq, &mut g, q.qid as u64, self.io_depth, entry, Some(qi))
+    }
+
+    /// Core submit-and-wait with the queue's cursor lock already held by the
+    /// caller (read/write hold it across the bounce-buffer copy).
+    ///
+    /// `wait` is the I/O queue to sleep on for the completion; `None`, or a
+    /// caller that may not sleep, polls the completion's phase bit
+    #[allow(clippy::too_many_arguments)]
     fn submit_locked(
         &self,
         sq: *mut u8,
@@ -375,6 +445,7 @@ impl Nvme {
         qid: u64,
         depth: u16,
         entry: &[u8; 64],
+        wait: Option<usize>,
     ) -> Result<(), BlkError> {
         q.cid = q.cid.wrapping_add(1);
         let cid = q.cid;
@@ -393,18 +464,44 @@ impl Nvme {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         wr32(self.sq_doorbell(qid), tail as u32);
 
-        // Poll this queue's completion entry phase bit
+        // This queue's completion entry: done when its phase bit is the
+        // queue's current phase
         let cqe = unsafe { cq.add(head as usize * 16) };
-        let mut spins = 0u64;
-        let status: u16 = loop {
-            let dw3 = unsafe { core::ptr::read_volatile((cqe as *const u32).add(3)) };
-            if ((dw3 >> 16) & 1) as u8 == phase {
-                break (dw3 >> 17) as u16;
+        let dw3 = || unsafe { core::ptr::read_volatile((cqe as *const u32).add(3)) };
+        let done = || ((dw3() >> 16) & 1) as u8 == phase;
+        let status: u16 = match wait {
+            Some(qi) if may_sleep() => {
+                let start = crate::kcore::time::now_ns();
+                let give_up = start.saturating_add(COMMAND_TIMEOUT_NS);
+                loop {
+                    if done() {
+                        break (dw3() >> 17) as u16;
+                    }
+                    let now = crate::kcore::time::now_ns();
+                    if now < start + SPIN_BEFORE_SLEEP_NS {
+                        core::hint::spin_loop();
+                        continue;
+                    }
+                    if now > give_up {
+                        return Err(BlkError::Timeout);
+                    }
+                    // On the queue and asleep-on-request before the bit is
+                    // looked at, so the interrupt cannot fall in between
+                    IO_WAIT[qi].wait_unless(now + WAIT_BACKSTOP_NS, done);
+                }
             }
-            crate::io::block::io_relax(spins);
-            spins += 1;
-            if spins > 200_000_000 {
-                return Err(BlkError::Timeout);
+            _ => {
+                let mut spins = 0u64;
+                loop {
+                    if done() {
+                        break (dw3() >> 17) as u16;
+                    }
+                    crate::io::block::io_relax(spins);
+                    spins += 1;
+                    if spins > 200_000_000 {
+                        return Err(BlkError::Timeout);
+                    }
+                }
             }
         };
 
@@ -435,7 +532,8 @@ impl Nvme {
         e[44..48].copy_from_slice(&cdw11.to_le_bytes());
         let sq = self.admin_mem.sq.as_ptr() as *mut u8;
         let cq = self.admin_mem.cq.as_ptr();
-        self.submit_on(sq, cq, &self.admin, 0, self.admin_depth, &e)
+        let mut g = self.admin.lock();
+        self.submit_locked(sq, cq, &mut g, 0, self.admin_depth, &e, None)
     }
 
     /// Pick an I/O queue for the current CPU (falls back to round-robin)
@@ -454,13 +552,13 @@ impl Nvme {
     fn read_chunk(&self, qi: usize, lba: u64, sectors: u32, out: &mut [u8]) -> Result<(), BlkError> {
         let q = &self.io[qi];
         let bytes = sectors as usize * 512;
-        let bounce_phys = crate::net::virt_to_phys(q.mem.bounce.as_ptr() as u64);
-        let prp_phys = crate::net::virt_to_phys(q.mem.prp.as_ptr() as u64);
+        let bounce_phys = q.mem.phys_of(q.mem.bounce.as_ptr());
+        let prp_phys = q.mem.phys_of(q.mem.prp.as_ptr());
         let e = build_rw(NVM_READ, self.nsid, bounce_phys, prp_phys, lba, sectors, false);
         let sq = q.mem.sq.as_ptr() as *mut u8;
         let cq = q.mem.cq.as_ptr();
         let mut g = q.st.lock();
-        self.submit_locked(sq, cq, &mut g, q.qid as u64, self.io_depth, &e)?;
+        self.submit_locked(sq, cq, &mut g, q.qid as u64, self.io_depth, &e, Some(qi))?;
         out[..bytes].copy_from_slice(&q.mem.bounce[..bytes]);
         Ok(())
     }
@@ -469,8 +567,8 @@ impl Nvme {
     fn write_chunk(&self, qi: usize, lba: u64, sectors: u32, data: &[u8], fua: bool) -> Result<(), BlkError> {
         let q = &self.io[qi];
         let bytes = sectors as usize * 512;
-        let bounce_phys = crate::net::virt_to_phys(q.mem.bounce.as_ptr() as u64);
-        let prp_phys = crate::net::virt_to_phys(q.mem.prp.as_ptr() as u64);
+        let bounce_phys = q.mem.phys_of(q.mem.bounce.as_ptr());
+        let prp_phys = q.mem.phys_of(q.mem.prp.as_ptr());
         let e = build_rw(NVM_WRITE, self.nsid, bounce_phys, prp_phys, lba, sectors, fua);
         let sq = q.mem.sq.as_ptr() as *mut u8;
         let cq = q.mem.cq.as_ptr();
@@ -480,7 +578,7 @@ impl Nvme {
             let dst = q.mem.bounce.as_ptr() as *mut u8;
             core::ptr::copy_nonoverlapping(data.as_ptr(), dst, bytes);
         }
-        self.submit_locked(sq, cq, &mut g, q.qid as u64, self.io_depth, &e)
+        self.submit_locked(sq, cq, &mut g, q.qid as u64, self.io_depth, &e, Some(qi))
     }
 }
 
@@ -558,10 +656,7 @@ impl BlockDriver for Nvme {
         let mut e = [0u8; 64];
         e[0] = NVM_FLUSH;
         e[4..8].copy_from_slice(&self.nsid.to_le_bytes());
-        let q = &self.io[self.pick_queue()];
-        let sq = q.mem.sq.as_ptr() as *mut u8;
-        let cq = q.mem.cq.as_ptr();
-        self.submit_on(sq, cq, &q.st, q.qid as u64, self.io_depth, &e)
+        self.io_cmd(self.pick_queue(), &e)
     }
 
     fn info(&self) -> BlockDevInfo {
@@ -582,7 +677,7 @@ impl BlockDriver for Nvme {
             return Err(BlkError::Unsupported);
         }
         let q = &self.io[0];
-        let bounce_phys = crate::net::virt_to_phys(q.mem.bounce.as_ptr() as u64);
+        let bounce_phys = q.mem.phys_of(q.mem.bounce.as_ptr());
         let sq = q.mem.sq.as_ptr() as *mut u8;
         let cq = q.mem.cq.as_ptr();
         let mut g = q.st.lock();
@@ -599,7 +694,7 @@ impl BlockDriver for Nvme {
         e[24..32].copy_from_slice(&bounce_phys.to_le_bytes());
         // cdw10 = number of ranges - 1 = 0; cdw11 bit 2 (AD) = deallocate
         e[44..48].copy_from_slice(&(1u32 << 2).to_le_bytes());
-        self.submit_locked(sq, cq, &mut g, q.qid as u64, self.io_depth, &e)
+        self.submit_locked(sq, cq, &mut g, q.qid as u64, self.io_depth, &e, Some(0))
     }
 
     /// Write Zeroes: zeroes the range on the device without moving data.
@@ -608,9 +703,7 @@ impl BlockDriver for Nvme {
         if !self.has_wz {
             return Err(BlkError::Unsupported);
         }
-        let q = &self.io[self.pick_queue()];
-        let sq = q.mem.sq.as_ptr() as *mut u8;
-        let cq = q.mem.cq.as_ptr();
+        let qi = self.pick_queue();
         let mut done = 0u32;
         while done < count {
             let n = (count - done).min(65536);
@@ -621,7 +714,7 @@ impl BlockDriver for Nvme {
             e[40..44].copy_from_slice(&(cur as u32).to_le_bytes());
             e[44..48].copy_from_slice(&((cur >> 32) as u32).to_le_bytes());
             e[48..52].copy_from_slice(&(n - 1).to_le_bytes());
-            self.submit_on(sq, cq, &q.st, q.qid as u64, self.io_depth, &e)?;
+            self.io_cmd(qi, &e)?;
             done += n;
         }
         Ok(())
@@ -630,7 +723,7 @@ impl BlockDriver for Nvme {
     /// Smart / Health Information log page (LID 0x02, 512 bytes). Uses the
     /// admin queue's scratch page
     fn health(&self) -> Option<HealthInfo> {
-        let prp1 = crate::net::virt_to_phys(self.admin_mem.ident.as_ptr() as u64);
+        let prp1 = self.admin_mem.phys_of(self.admin_mem.ident.as_ptr());
         let numd = (512 / 4 - 1) as u32;
         if self.admin_cmd(ADM_GET_LOG_PAGE, 0xFFFF_FFFF, prp1, (numd << 16) | 0x02, 0).is_err() {
             return None;

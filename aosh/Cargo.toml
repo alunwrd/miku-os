@@ -1,0 +1,53 @@
+# aosh: the desktop shell, written in QML
+[package]
+name = "aosh"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+rquickjs = "0.14"
+# Text as Qt sets it (`scene/text/`): rustybuzz shapes (ligatures and kerning,
+# and the font tables through the ttf-parser it re-exports) and FreeType 2.14.3,
+# Arch's version, loads, hints and renders the glyphs as Qt has it do
+# (`lib/freetype`); its rasteriser also fills a Canvas's paths
+# (`scene/canvas/`). The crates are the versions Zed's lock pins
+rustybuzz = "0.20.1"
+freetype = { path = "../lib/freetype" }
+unicode-linebreak = "0.1.5"
+# The display protocol and the shared-memory pools (`dev/aosh-architecture.md`,
+# "Decisions")
+libmay = { path = "../lib/mayland" }
+# `poll(2)`, for the loop: the display socket with a timeout until the next
+# timer. MikuOS's `libc` (`lib/rust-libc/README.md`), patched below
+libc = "0.2"
+# Pictures as their files hold them (PNG, JPEG, WebP), decoded at run time
+# (`scene/picture.rs`; `dev/aosh-negi.md`, "What changes in aosh's decisions").
+# The version Zed's lock pins, already built for the miku target.
+# PNG is also what `aosh shot` writes
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+
+# `rquickjs-sys` with a bindings file for `x86_64-unknown-miku` beside the ones
+# it ships (the x86_64 Linux one, which is all QuickJS and no Linux). Assembled
+# by the builder's overlay (`builder/src/stdport/arms.rs`), which every `std`
+# build runs, so a host `cargo test` needs it to have run once: `cd builder &&
+# cargo run --release -- overlay`
+[patch.crates-io]
+rquickjs-sys = { path = "../target/rust-src-miku/rquickjs-sys-miku" }
+libc = { path = "../target/rust-src-miku/libc-miku" }
+
+# Built for speed: the painter is aosh's own (`scene/gpu/`, `scene/effect/`) and
+# runs over every pixel drawn (a background's first paint is three times as long
+# at `-Oz`, for a binary 4% smaller), and the picture decoders, the shaper and
+# FreeType are as hot
+[profile.release]
+panic = "abort"
+opt-level = 3
+# LTO off, as in `stdapps/Cargo.toml`: with it on, a missing symbol becomes a
+# missing call rather than a link error
+lto = false
+
+# MikuOS's own target name, which the host's rustc does not know
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("miku"))'] }

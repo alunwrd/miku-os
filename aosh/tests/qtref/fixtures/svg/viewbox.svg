@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A viewBox away from the origin and in other units than the picture -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="100 200 16 16">
+  <rect x="101" y="201" width="14" height="14" rx="2" fill="#2c3e50"/>
+  <circle cx="108" cy="208" r="4" fill="#ecf0f1"/>
+</svg>

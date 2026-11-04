@@ -16,6 +16,17 @@ pub const GUID_LINUX_FS: [u8; 16] = [
     0x8E,0x79, 0x3D,0x69,0xD8,0x47,0x7D,0xE4,
 ];
 
+/// Where a BIOS machine's bootloader lives on a GPT disk. With no gap in front
+/// of the table as on MBR, it gets a partition with no filesystem: GRUB's
+/// core.img is written to the raw sectors and the BIOS is pointed at them.
+///
+/// The bytes spell "Hah!IdontNeedEFI", the GUID's definition and a check on the
+/// mixed-endian encoding
+pub const GUID_BIOS_BOOT: [u8; 16] = [
+    0x48,0x61,0x68,0x21, 0x49,0x64, 0x6F,0x6E,
+    0x74,0x4E, 0x65,0x65,0x64,0x45,0x46,0x49,
+];
+
 pub const GUID_LINUX_SWAP: [u8; 16] = [
     0x6D,0xFD,0x57,0x06, 0xAB,0xA4, 0xC4,0x43,
     0x84,0xE5, 0x09,0x33,0xC8,0x4B,0x4F,0x4F,
@@ -102,6 +113,7 @@ impl GptEntry {
     pub fn type_name(&self) -> &'static str {
         if self.type_guid == GUID_LINUX_FS   { "Linux FS" }
         else if self.type_guid == GUID_LINUX_SWAP { "Linux Swap" }
+        else if self.type_guid == GUID_BIOS_BOOT  { "BIOS boot" }
         else                                      { "Unknown" }
     }
 }
@@ -382,9 +394,9 @@ pub fn gpt_read(dev: BlockDevId) -> Result<GptTable, GptReadError> {
         }
     }
 
-    // Full 64-bit LBA addressing via the block layer (LBA48 in the ATA
-    // driver), so >2 TB disks no longer need to be rejected - only guard
-    // against a corrupt header overflowing the arithmetic
+    // Full 64-bit LBA addressing via the block layer (LBA48 in the ATA driver),
+    // so >2 TB disks work. This only guards against a corrupt header
+    // overflowing the arithmetic
     let total_sectors = match header.alternate_lba.checked_add(1) {
         Some(v) => v,
         None    => return Err(GptReadError::InvalidFormat),
@@ -392,6 +404,7 @@ pub fn gpt_read(dev: BlockDevId) -> Result<GptTable, GptReadError> {
     Ok(GptTable { header, entries, total_sectors })
 }
 
+/// Add a partition wherever there is room, straight after the last one
 pub fn gpt_add_partition(
     dev:          BlockDevId,
     type_guid:    [u8; 16],
@@ -399,13 +412,37 @@ pub fn gpt_add_partition(
     name:         &str,
     seed:         u32,
 ) -> Result<usize, GptWriteError> {
+    let start = gpt_read(dev).map_err(|_| GptWriteError::ReadFailed)?.next_free_lba();
+    gpt_add_partition_at(dev, type_guid, start, size_sectors, name, seed)
+}
+
+/// Add a partition at an LBA the caller chose
+///
+/// For an installer: the bootloader partition starts where the boot sector was
+/// told it starts, a number fixed when the boot sector was built. Alignment is
+/// the caller's too: 2048 is one mebibyte in
+pub fn gpt_add_partition_at(
+    dev:          BlockDevId,
+    type_guid:    [u8; 16],
+    start:        u64,
+    size_sectors: u64,
+    name:         &str,
+    seed:         u32,
+) -> Result<usize, GptWriteError> {
     let mut tbl = gpt_read(dev).map_err(|_| GptWriteError::ReadFailed)?;
 
-    let slot  = tbl.first_free_slot().ok_or(GptWriteError::NoFreeSlot)?;
-    let start = tbl.next_free_lba();
+    let slot = tbl.first_free_slot().ok_or(GptWriteError::NoFreeSlot)?;
     if size_sectors == 0 { return Err(GptWriteError::NotEnoughSpace); }
-    // checked_add - size_sectors is caller-supplied and could overflow
-    // when combined with start (which itself derives from disk metadata)
+    if start < tbl.header.first_usable_lba { return Err(GptWriteError::NotEnoughSpace); }
+    // Nothing may be laid over an existing entry. `gpt_add_partition` cannot
+    // hit this; a caller choosing its own LBA can
+    if tbl.entries.iter().any(|e| e.is_used()
+        && start <= e.end_lba && e.start_lba < start + size_sectors)
+    {
+        return Err(GptWriteError::NotEnoughSpace);
+    }
+    // checked_add: size_sectors is caller-supplied, and start derives from disk
+    // metadata
     let end = match start.checked_add(size_sectors).and_then(|v| v.checked_sub(1)) {
         Some(e) => e,
         None    => return Err(GptWriteError::NotEnoughSpace),
@@ -454,15 +491,18 @@ pub fn gpt_del_partition(dev: BlockDevId, index: usize) -> Result<(), GptWriteEr
 }
 
 pub fn gpt_probe_sectors(dev: BlockDevId) -> u64 {
-    // IDENTIFY DEVICE reports the exact capacity; trust it when present
+    // IDENTIFY DEVICE reports the exact capacity; it is trusted when present,
+    // including zero.
+    //
+    // The search below reads LBA 0, which on an empty IDE slot or an ATAPI
+    // drive with no disc fails, and the block layer retries twice with a
+    // hardware timeout each: most of a second per absent device
     if let Some(info) = crate::io::block::info(dev) {
-        if info.total_sectors > 0 {
-            return info.total_sectors;
-        }
+        return info.total_sectors;
     }
 
-    // Fallback for devices that fail IDENTIFY: binary-search the highest
-    // readable LBA
+    // Fallback for devices failing IDENTIFY: binary-search the highest readable
+    // LBA
     let mut buf = [0u8; 512];
     if crate::io::block::read(dev, 0, 1, &mut buf).is_err() { return 0; }
     let mut lo: u64 = 2048;

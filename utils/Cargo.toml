@@ -1,0 +1,170 @@
+# The commands
+#
+# `ls`, `cat`, `rm`, `mv` and the rest of what a person types at a prompt. Each
+# acts on a path somebody typed, so a mistake is made with the caller's
+# credential rather than the kernel's, and `ls` is a file in /bin that can be
+# replaced.
+#
+# The kernel keeps what needs ring 0: `dd`, `mount`, `df`, the ext tools, the
+# block layer, `mkfs`, `nvidia`, the selftests. Those have no twin here.
+#
+# Built for `x86_64-miku-app` like `system/` and `apps/`; the target spec and
+# the linker script live in `lib/miku/`, shared with both.
+[package]
+name    = "miku-utils"
+version = "0.2.10"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+miku = { path = "../lib/miku" }
+# `/etc/passwd` and `/etc/group`, so `ls -l` and `ps` can say `miku` where the
+# filesystem says 1000. Without the `userspace` feature it is the pure-parser
+# half of the crate, the same code `login` and `mikudod` use, host-tested in
+# `cargo test`
+mikuauth = { path = "../lib/mikuauth" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+
+[[bin]]
+name = "ls"
+path = "src/ls.rs"
+
+[[bin]]
+name = "cat"
+path = "src/cat.rs"
+
+[[bin]]
+name = "cp"
+path = "src/cp.rs"
+
+[[bin]]
+name = "mv"
+path = "src/mv.rs"
+
+[[bin]]
+name = "rm"
+path = "src/rm.rs"
+
+[[bin]]
+name = "mkdir"
+path = "src/mkdir.rs"
+
+[[bin]]
+name = "rmdir"
+path = "src/rmdir.rs"
+
+[[bin]]
+name = "ln"
+path = "src/ln.rs"
+
+[[bin]]
+name = "readlink"
+path = "src/readlink.rs"
+
+[[bin]]
+name = "touch"
+path = "src/touch.rs"
+
+[[bin]]
+name = "stat"
+path = "src/stat.rs"
+
+[[bin]]
+name = "chmod"
+path = "src/chmod.rs"
+
+[[bin]]
+name = "chown"
+path = "src/chown.rs"
+
+[[bin]]
+name = "du"
+path = "src/du.rs"
+
+[[bin]]
+name = "df"
+path = "src/df.rs"
+
+[[bin]]
+name = "tree"
+path = "src/tree.rs"
+
+[[bin]]
+name = "head"
+path = "src/head.rs"
+
+[[bin]]
+name = "tail"
+path = "src/tail.rs"
+
+[[bin]]
+name = "wc"
+path = "src/wc.rs"
+
+[[bin]]
+name = "grep"
+path = "src/grep.rs"
+
+[[bin]]
+name = "sort"
+path = "src/sort.rs"
+
+[[bin]]
+name = "uniq"
+path = "src/uniq.rs"
+
+[[bin]]
+name = "tee"
+path = "src/tee.rs"
+
+[[bin]]
+name = "ps"
+path = "src/ps.rs"
+
+[[bin]]
+name = "kill"
+path = "src/kill.rs"
+
+[[bin]]
+name = "sleep"
+path = "src/sleep.rs"
+
+[[bin]]
+name = "date"
+path = "src/date.rs"
+
+[[bin]]
+name = "uptime"
+path = "src/uptime.rs"
+
+[[bin]]
+name = "uname"
+path = "src/uname.rs"
+
+[[bin]]
+name = "free"
+path = "src/free.rs"
+
+[[bin]]
+name = "clear"
+path = "src/clear.rs"
+
+[[bin]]
+name = "echo"
+path = "src/echo.rs"
+
+[[bin]]
+name = "which"
+path = "src/which.rs"
+
+[[bin]]
+name = "env"
+path = "src/env.rs"
+
+[[bin]]
+name = "mikuctl"
+path = "src/mikuctl.rs"

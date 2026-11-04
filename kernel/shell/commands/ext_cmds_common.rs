@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use crate::fs::ext::structs::*;
 use crate::fs::ext::FsError;
 use crate::{cprint, cprintln, print_error, print_success, println};
@@ -20,19 +21,25 @@ pub fn impl_ls(
 ) {
     use crate::shell::commands::ext2_cmds::with_ext2_pub;
     let path = if path.is_empty() { "/" } else { path };
-    let result = with_ext2_pub(|fs| -> Result<([DirEntry; 256], usize), FsError> {
+    // Collected on the heap: a `[DirEntry; 256]` on the stack is about 67 KiB
+    // and stops at the 256th entry
+    let result = with_ext2_pub(|fs| -> Result<(Vec<DirEntry>, &'static str), FsError> {
         let ino = fs.resolve_path(path)?;
         let inode = fs.read_inode(ino)?;
         if !inode.is_directory() { return Err(FsError::NotDirectory); }
-        let mut entries = [const { DirEntry::empty() }; 256];
-        let count = fs.read_dir(&inode, &mut entries)?;
-        Ok((entries, count))
+        let mut entries: Vec<DirEntry> = Vec::new();
+        fs.read_dir_each(&inode, |e| {
+            entries.push(*e);
+            true
+        })?;
+        // The heading names the filesystem mounted, not the command typed:
+        // `ext2ls` on an ext4 root says ext4
+        Ok((entries, fs.superblock.fs_version_str()))
     });
     match result {
-        Some(Ok((entries, count))) => {
-            println!("  {}:{} ({} entries)", prefix, path, count);
-            for i in 0..count {
-                let e = &entries[i];
+        Some(Ok((entries, fs_name))) => {
+            println!("  {}:{} ({} entries)", fs_name, path, entries.len());
+            for e in entries.iter() {
                 let name = e.name_str();
                 match e.file_type {
                     FT_DIR     => cprintln!(0, 220, 220, "  d {}/", name),
@@ -77,7 +84,9 @@ pub fn impl_stat(path: &str, prefix: &'static str) {
     let result = with_ext2_pub(|fs| -> Result<(u32, Inode, Option<bool>), FsError> {
         let ino = fs.resolve_path(path)?;
         let inode = fs.read_inode(ino)?;
-        let journal = if prefix == "ext2" { None } else { Some(fs.journal_active) };
+        // Whether there is a journal to report is the filesystem's answer, not
+        // the command name's
+        let journal = fs.superblock.has_journal().then_some(fs.journal_active);
         Ok((ino, inode, journal))
     });
     match result {
@@ -119,6 +128,8 @@ pub fn impl_write(path: &str, text: &str, prefix: &'static str) {
         Ok(ino)
     });
     let ms = sw.elapsed_ms();
+    // Written by inode, past the VFS: no cached page of it may outlive this
+    crate::fs::vfs::core::changed_below_vfs();
     match result {
         Some(Ok(ino)) => print_success!("  written to inode {}  [disk {}ms]", ino, ms),
         Some(Err(e))  => print_error!("  {}write: {:?}", prefix, e),
@@ -138,6 +149,8 @@ pub fn impl_mkdir(path: &str, prefix: &'static str) {
             fs.ext2_create_dir(parent_ino, dirname, 0o755)
         }
     });
+    // Changed past the VFS, by inode number
+    crate::fs::vfs::core::changed_below_vfs();
     match result {
         Some(Ok(ino)) => print_success!("  created dir inode {}", ino),
         Some(Err(e))  => print_error!("  {}mkdir: {:?}", prefix, e),
@@ -160,6 +173,8 @@ pub fn impl_rm(path: &str, prefix: &'static str) {
             fs.ext2_delete_file(parent_ino, name)
         }
     });
+    // Changed past the VFS, by inode number
+    crate::fs::vfs::core::changed_below_vfs();
     match result {
         Some(Ok(())) => print_success!("  deleted"),
         Some(Err(e)) => print_error!("  {}rm: {:?}", prefix, e),
@@ -182,6 +197,8 @@ pub fn impl_rmdir(path: &str, prefix: &'static str) {
             fs.ext2_delete_dir(parent_ino, name)
         }
     });
+    // Changed past the VFS, by inode number
+    crate::fs::vfs::core::changed_below_vfs();
     match result {
         Some(Ok(())) => print_success!("  removed dir"),
         Some(Err(e)) => print_error!("  {}rmdir: {:?}", prefix, e),
@@ -203,6 +220,8 @@ pub fn impl_append(path: &str, text: &str, prefix: &'static str) {
             fs.ext2_append_file(ino, text.as_bytes())
         }
     });
+    // Changed past the VFS, by inode number
+    crate::fs::vfs::core::changed_below_vfs();
     match result {
         Some(Ok(n))  => print_success!("  appended {} bytes", n),
         Some(Err(e)) => print_error!("  {}append: {:?}", prefix, e),
@@ -274,7 +293,7 @@ pub fn impl_info(prefix: &'static str) {
     let result = with_ext2_pub(|fs| fs.fs_info());
     match result {
         Some(info) => {
-            cprintln!(57, 197, 187, "  {} Filesystem Info", prefix.to_ascii_uppercase());
+            cprintln!(57, 197, 187, "  {} Filesystem Info", info.version.to_ascii_uppercase());
             println!("  Version:    {}", info.version);
             println!("  Block size: {} bytes", info.block_size);
             println!("  Blocks:     {} / {} used",
@@ -289,62 +308,77 @@ pub fn impl_info(prefix: &'static str) {
     }
 }
 
+/// `sync`: makes every mounted filesystem durable.
+///
+/// `MikuFS::sync` commits the running transaction before it checkpoints, the
+/// ordering the journal exists to keep
 pub fn impl_sync(prefix: &'static str) {
-    use crate::shell::commands::ext2_cmds::with_ext2_pub;
     let sw = crate::kcore::time::Stopwatch::start();
-    let result = with_ext2_pub(|fs| -> Result<(u32, u32), FsError> {
-        fs.reader.reset_io();
-        
-        if fs.journal_active {
-            let dirty_count = match fs.block_cache {
-                Some(ref c) => c.dirty_entries(),
-                None => 0,
-            };
-            if dirty_count > 0 || fs.superblock_dirty
-                || fs.groups_dirty.iter().any(|&d| d)
-            {
-                fs.ext3_begin_txn()?;
-                
-                if let Some(ref c) = fs.block_cache {
-                    let dirty = c.get_dirty_blocks();
-                    for &(block_num, _) in dirty.iter().take(64) {
-                        let _ = fs.ext3_journal_current_block(block_num);
-                    }
-                }
-                fs.ext3_commit_txn()?;
-            }
-        }
-        
-        fs.sync_dirty_blocks()?;
-        fs.flush_all_dirty_metadata()?;
-        fs.reader.flush_drive();
-        
-        let io = fs.reader.io_count;
-        let dirty_left = match fs.block_cache {
-            Some(ref c) => c.dirty_entries() as u32,
-            None => 0,
-        };
-        Ok((io, dirty_left))
-    });
-    
+    // The page cache's dirty pages first: the filesystems' sync makes durable
+    // only what they have been given
+    crate::fs::vfs::core::writeback::writeback_all();
+    let result = crate::fs::ext::mount::sync_all_mounts();
     let ms = sw.elapsed_ms();
     match result {
-        Some(Ok((io, dirty))) => {
-            print_success!("  synced [{}ms] ({} ATA cmds, {} dirty remaining)", ms, io, dirty);
-            crate::serial_println!("[timing] sync disk={}ms io={}", ms, io);
+        Ok(0) => print_error!("  {} not mounted", prefix),
+        Ok(n) => {
+            print_success!("  synced {} filesystem(s) [{}ms]", n, ms);
+            crate::serial_println!("[timing] sync {} mounts in {}ms", n, ms);
         }
-        Some(Err(e)) => print_error!("  sync: {:?}", e),
-        None => print_error!("  {} not mounted", prefix),
+        Err(e) => print_error!("  sync: {:?}", e),
     }
 }
 
-pub fn periodic_flush_check() {
-    use crate::shell::commands::ext2_cmds::is_ext2_ready;
+/// `extfsck`, and `extfsck -y` to let it write.
+///
+/// One implementation for all three flavours: the check does not care which is
+/// mounted
+pub fn impl_fsck(repair: bool) {
+    use crate::fs::ext::fsck::FsckOptions;
     use crate::shell::commands::ext2_cmds::with_ext2_pub;
 
-    if !is_ext2_ready() { return; }
+    let opts = if repair { FsckOptions::repair() } else { FsckOptions::check() };
+    let result = with_ext2_pub(|fs| (fs.fsck(opts), fs.superblock.fs_version_str()));
 
-    with_ext2_pub(|fs| {
-        fs.check_periodic_sync();
-    });
+    let (report, fs_name) = match result {
+        Some(v) => v,
+        None => { print_error!("  no ext2/3/4 filesystem mounted"); return; }
+    };
+    let r = match report {
+        Ok(r) => r,
+        Err(e) => { print_error!("  fsck could not run: {:?}", e); return; }
+    };
+    if !r.checked {
+        print_error!("  fsck stopped: the superblock is not usable");
+        return;
+    }
+
+    cprintln!(57, 197, 187, "  {} filesystem check", fs_name);
+    println!("  Block size:   {} bytes", r.block_size);
+    println!("  Blocks:       {} used / {} total", r.used_blocks, r.total_blocks);
+    println!("  Inodes:       {} used / {} total, {} directories",
+             r.used_inodes, r.total_inodes, r.used_dirs);
+
+    for f in r.examples() {
+        if f.fixed {
+            print_success!("  fixed: {}", f.problem);
+        } else {
+            print_error!("  {}", f.problem);
+        }
+    }
+    let hidden = r.findings.truncated();
+    if hidden > 0 {
+        println!("  ... and {} more", hidden);
+    }
+
+    if r.errors() == 0 {
+        print_success!("  filesystem ok");
+    } else if r.left == 0 {
+        print_success!("  {} problems, all repaired", r.errors());
+    } else if r.repairing {
+        print_error!("  {} problems, {} repaired, {} left", r.errors(), r.fixed, r.left);
+    } else {
+        print_error!("  {} problems found - `extfsck -y` to repair", r.errors());
+    }
 }
+

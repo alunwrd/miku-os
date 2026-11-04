@@ -1,0 +1,20 @@
+This directory is yours.
+
+Nothing is ever installed here, so what you leave survives an image rebuild -
+which is exactly what does not happen to the files in ../default.d, since the
+build rewrites those every time.
+
+Files are read after ../default.d and after ../may.conf, in the order of their
+names, and the later line wins. Call yours 99-mine.conf and it is read last.
+
+Two things a drop-in can do that adding lines cannot:
+
+  A file named after one in ../default.d replaces it. An empty
+  50-keys.conf here means the shipped key bindings are never read at all.
+
+  A list keyword with an empty value clears the list rather than adding to
+  it, so `bind =` on a line of its own throws away every binding read so far
+  and lets the lines below it start over. The same works for windowrule,
+  animation, bezier, exec-once and the panel's modules-* lines.
+
+Everything the config can say is in ../REFERENCE.
