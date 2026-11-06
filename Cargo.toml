@@ -54,6 +54,9 @@ log                   = "0.4"
 lazy_static           = { version = "1.4.0", features = ["spin_no_std"] }
 pc-keyboard           = "0.7.0"
 pic8259               = "0.10.1"
+# The VFS's directory-entry name hash (`kernel/fs/vfs/hash.rs`). Without `std`
+# it is `#![no_std]`, allocates nothing and does no run-time CPU detection
+hassh64               = { version = "2.1", default-features = false }
 
 [build-dependencies]
 # Build-time only: artwork goes in as a file and comes out as pixels. The font

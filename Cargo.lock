@@ -130,6 +130,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hassh64"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b32efc608646edf2e0c63401f3cb51b6973aaf4f2f3b6f086bf20cd4728a994"
+
+[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -191,6 +197,7 @@ dependencies = [
  "btrfs",
  "extfs",
  "fshost",
+ "hassh64",
  "image",
  "lazy_static",
  "libmay",

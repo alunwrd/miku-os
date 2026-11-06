@@ -1,16 +1,14 @@
-#[inline]
-pub fn fnv32(data: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c9dc5;
-    for &b in data {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x01000193);
-    }
-    h
-}
+// A directory's table (`children.rs`) places a name by this hash. It lives
+// only in memory: nothing on a disk or across the ABI holds it, so it can
+// change between builds. A fixed seed: the tables are not keyed against
+// hostile names
+const NAME_SEED: u64 = 0x6d69_6b75_5f76_6673;
 
+/// hassh64, low 32 bits. Without the `aes` target feature (the kernel's target
+/// has none) this is the crate's portable integer code: no SIMD, no FPU
 #[inline]
 pub fn name_hash(name: &str) -> u32 {
-    fnv32(name.as_bytes())
+    hassh64::hassh64(name.as_bytes(), NAME_SEED) as u32
 }
 
 
