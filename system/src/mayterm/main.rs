@@ -158,7 +158,7 @@ pub extern "C" fn _start_main(argc: i32, argv: *const *const u8) -> ! {
     // Actual window shape; a master opens at 80 by 24
     if master >= 0 {
         let ws = [rows0.max(1) as u16, cols0.max(1) as u16, 0u16, 0u16];
-        const TIOCSWINSZ: u64 = 0x5414;
+        use miku_abi::ioctl::TIOCSWINSZ;
         unsafe { miku::miku_ioctl(master as u64, TIOCSWINSZ, ws.as_ptr() as u64) };
     }
 

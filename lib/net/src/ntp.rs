@@ -56,7 +56,7 @@ pub struct NtpFormatted {
 }
 
 fn is_leap(y: u32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    miku_base::date::is_leap(y as i64)
 }
 
 fn build_ntp_request(out: &mut [u8; 48]) {

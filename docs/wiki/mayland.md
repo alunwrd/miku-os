@@ -42,7 +42,7 @@ Mayland is the MikuOS display system: a protocol, a compositor and the desktop p
 | Desktop policy | `kernel/mayland/shell` | Tiling arithmetic, workspaces, animations, closing-window afterimages, the wallpaper |
 | Compositor | `kernel/mayland/render` | The frame loop: damage, copy engine, compute pass, cursor, processor blending |
 | Input | `kernel/mayland/input` | Keyboard and mouse from the interrupt to the focused surface; chords; pointer grabs |
-| Protocol library | `lib/mayland` (crate `libmay`) | Wire format, protocol table, request encoder, client connection, keymaps, config grammar, drawing toolkit |
+| Protocol library | `lib/gfx/mayland` (crate `libmay`) | Wire format, protocol table, request encoder, client connection, keymaps, config grammar, drawing toolkit |
 | Window manager | `system/src/maywm` | Reads `/etc/mayland`, holds `may_wm`, sends layout, params, key chords, window rules, monitor lines |
 | Desktop shell | `aosh/` | Bar, launcher, overview, written in QML. See [aosh.md](aosh.md) |
 | Terminal | `system/src/mayterm` | Draws a terminal's character grid; hosts `/bin/msh` on its own pty |
@@ -77,9 +77,9 @@ Design history: [../../dev/mayland-architecture.md](../../dev/mayland-architectu
 
 ### Transport and wire format
 
-A client opens a Mayland connection with `socket(AF_MAYLAND, SOCK_STREAM, 0)`, where `AF_MAYLAND` is 42 (`lib/mayland/src/conn.rs`), then uses `send` (58) and `recv` (59). Object id 1 is the display and exists before anything is said. A process may hold at most 4 Mayland sockets (`MAX_MAYLAND_PER_PID` in `kernel/net/socket.rs`); they come out of the same socket table as TCP.
+A client opens a Mayland connection with `socket(AF_MAYLAND, SOCK_STREAM, 0)`, where `AF_MAYLAND` is 42 (`lib/gfx/mayland/src/conn.rs`), then uses `send` (58) and `recv` (59). Object id 1 is the display and exists before anything is said. A process may hold at most 4 Mayland sockets (`MAX_MAYLAND_PER_PID` in `kernel/net/socket.rs`); they come out of the same socket table as TCP.
 
-The encoding (`lib/mayland/src/wire.rs`) is Wayland's:
+The encoding (`lib/gfx/mayland/src/wire.rs`) is Wayland's:
 
 ```
 u32  sender object id
@@ -101,7 +101,7 @@ There is no `h` (file descriptor) type. The largest message is 4096 bytes includ
 
 ### Interfaces and versions
 
-The table is `lib/mayland/src/protocol.rs`. Versions are what the code implements.
+The table is `lib/gfx/mayland/src/protocol.rs`. Versions are what the code implements.
 
 | Interface | Version | Requests (opcode) | Events (opcode) |
 |---|---|---|---|
@@ -355,7 +355,7 @@ Effects are on when `decoration:blur:enabled` (param `EFFECTS`) is set. On the c
 - **`effects::TAKEN`** decides who dresses a window: what the pass took is drawn by the pass; what it refused is drawn by the processor (`compose::dressed_by`).
 - **Inter-launch ordering.** QMDs in one submission run concurrently, so the chain puts `INVALIDATE_SHADER_CACHES` between launches. See [../Nvidia_gb206.md](../Nvidia_gb206.md).
 
-**The window shape.** Windows are outlined as Hyprland v0.56.2 does it: a superellipse ("squircle") corner whose radius is `rounding · rounding_power / 2` (22 at power 2.5 is 27.5 px), cut one pixel inside; a blended border whose colour carries its alpha (alpha 0 means solid); `inactive_opacity` and `dim_inactive`/`dim_strength` on every window but the active one. The one definition is `libmay::shape` (`lib/mayland/src/shape.rs`); the processor reads it through tables (`render/outline.rs`) and the card through `composite.cu`. Change it there and nowhere else. Design: [../../dev/mayland-window-shape.md](../../dev/mayland-window-shape.md).
+**The window shape.** Windows are outlined as Hyprland v0.56.2 does it: a superellipse ("squircle") corner whose radius is `rounding · rounding_power / 2` (22 at power 2.5 is 27.5 px), cut one pixel inside; a blended border whose colour carries its alpha (alpha 0 means solid); `inactive_opacity` and `dim_inactive`/`dim_strength` on every window but the active one. The one definition is `libmay::shape` (`lib/gfx/mayland/src/shape.rs`); the processor reads it through tables (`render/outline.rs`) and the card through `composite.cu`. Change it there and nowhere else. Design: [../../dev/mayland-window-shape.md](../../dev/mayland-window-shape.md).
 
 **The processor path** (`render/compose.rs`) blends, pixel by pixel in integer arithmetic, whatever is see-through and not taken by the pass: fades, shadows, rounded corners, translucent layers. In QEMU it is the only path.
 
@@ -410,7 +410,7 @@ Every algorithm measures against the work area (the screen less `gaps_out` and l
 
 ## may.conf: the config language in full
 
-The grammar is `lib/mayland/src/conf.rs` (shared by every reader); the window manager's dictionary is `system/src/maywm/config.rs`; the file list is `lib/mayland/src/manifest.rs`. `/etc/mayland/REFERENCE` is a shipped summary that nothing parses; where it disagrees with this page, the code (and this page) is current.
+The grammar is `lib/gfx/mayland/src/conf.rs` (shared by every reader); the window manager's dictionary is `system/src/maywm/config.rs`; the file list is `lib/gfx/mayland/src/manifest.rs`. `/etc/mayland/REFERENCE` is a shipped summary that nothing parses; where it disagrees with this page, the code (and this page) is current.
 
 ### Where the config lives
 
@@ -662,7 +662,7 @@ monitor = NAME, MODE, POSITION, SCALE[, vrr, 0|1][, bitdepth, 8|10]
 monitor = NAME, disable
 ```
 
-Hyprland's line (`lib/mayland/src/monitor.rs`). `NAME` is the connector as Linux names it (`DP-3`, `HDMI-A-1`, `Virtual-1`; `display` lists them), `desc:` followed by the start of the monitor's description, or empty for every other output. Rules are matched by name first, then description, then the catch-all.
+Hyprland's line (`lib/gfx/mayland/src/monitor.rs`). `NAME` is the connector as Linux names it (`DP-3`, `HDMI-A-1`, `Virtual-1`; `display` lists them), `desc:` followed by the start of the monitor's description, or empty for every other output. Rules are matched by name first, then description, then the catch-all.
 
 | Field | Accepted |
 |---|---|
@@ -789,7 +789,7 @@ Run it with `run=mayland_test` on the GRUB command line (results to serial), or 
 
 ## Writing a client with libmay
 
-A client is a ring-3 program built for the `x86_64-miku-app` target with `libmay` as a path dependency (`libmay = { path = "../lib/mayland" }`; add `features = ["userspace"]` if it reads config files through `manifest`). libmay is `core`-only and does not allocate. See [sdk.md](sdk.md) for building programs. `apps/src/maydemo.rs` is a complete, small example (a bouncing square with two buffers); the skeleton is:
+A client is a ring-3 program built for the `x86_64-miku-app` target with `libmay` as a path dependency (`libmay = { path = "../lib/gfx/mayland" }`; add `features = ["userspace"]` if it reads config files through `manifest`). libmay is `core`-only and does not allocate. See [sdk.md](sdk.md) for building programs. `apps/src/maydemo.rs` is a complete, small example (a bouncing square with two buffers); the skeleton is:
 
 ```rust
 use libmay::conn::{Conn, Event, Pool};
@@ -923,7 +923,7 @@ Boot flags that affect Mayland: `notex` (no VRAM window copies), `nohwcursor` (s
 | `kernel/shell/commands/mayland_cmds.rs` | The `mayland` command |
 | `kernel/shell/commands/display_cmds.rs` | The `display` command |
 | `kernel/drivers/gpu/{edid,bochs,display,softscan,scanout}.rs`, `kms/` | Mode selection, Bochs DISPI, the software scanout, the display layer |
-| `lib/mayland/src/` | `wire`, `protocol`, `requests`, `conn`, `keymap`, `conf`, `manifest`, `monitor`, `shape`, `qoi`, `font`, `paint`, `text`, `ui`, `ease`, `spawn` |
+| `lib/gfx/mayland/src/` | `wire`, `protocol`, `requests`, `conn`, `keymap`, `conf`, `manifest`, `monitor`, `shape`, `qoi`, `font`, `paint`, `text`, `ui`, `ease`, `spawn` |
 | `system/src/maywm/` | The window manager |
 | `system/src/mayterm/` | The terminal (`grid.rs`, `size.rs`, `menu.rs`) |
 | `system/src/maygreet.rs`, `system/src/maysession.rs` | Greeter and session starter |

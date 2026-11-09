@@ -412,7 +412,7 @@ a newline or a NUL; changing your own needs the old one, changing somebody
 else's is a root operation the policy decides.
 
 The implementation is checked against **RFC 9106 §5.3's published tag**, and
-BLAKE2b against RFC 7693's published digests. `cd lib/mikuauth && cargo test`.
+BLAKE2b against RFC 7693's published digests. `cd lib/admin/mikuauth && cargo test`.
 
 ---
 
@@ -520,7 +520,7 @@ account cannot exhaust it and stop the display server accepting anybody.
 ## 10. Verifying it
 
 ```bash
-cd lib/mikuauth && cargo test      # about a hundred cases: RFC vectors, hostile corpora
+cd lib/admin/mikuauth && cargo test      # about a hundred cases: RFC vectors, hostile corpora
 ```
 
 * `tests/argon2.rs` — RFC 9106 §5.3's published tag, RFC 7693's digests, and

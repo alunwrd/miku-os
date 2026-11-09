@@ -1,7 +1,7 @@
 // The ext driver, tested on the machine
 //
 // Most tests of this driver are on the host, where a filesystem can be built in
-// memory, corrupted and crashed mid-transaction: `cd lib/extfs && cargo test`.
+// memory, corrupted and crashed mid-transaction: `cd lib/fs/extfs && cargo test`.
 // New tests belong there by default.
 //
 // Here is what the host cannot reach:

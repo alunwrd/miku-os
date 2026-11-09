@@ -1,6 +1,6 @@
 // The seat's keyboard layouts: the switch, the group on the wire, the keymap
 //
-// The tables themselves are tested on the host (`lib/mayland`,
+// The tables themselves are tested on the host (`lib/gfx/mayland`,
 // `cargo test-host`); here is what only a running compositor has: the switch in
 // the keyboard interrupt, the group in `modifiers`, the bar's event, and a
 // config's list reaching keymaps already sent.

@@ -250,7 +250,7 @@ fn install<'js>(ctx: &Ctx<'js>, core: &Core) -> rquickjs::Result<()> {
 
 /// Started programs do not keep `CAP_MAY_PRIV`, which aosh needs to bind
 /// `may_layer` and `may_desktop`. Also dropped from the bounding set, as in
-/// `spawn::run` (`lib/mayland/src/spawn.rs`)
+/// `spawn::run` (`lib/gfx/mayland/src/spawn.rs`)
 #[cfg(target_os = "miku")]
 pub fn unprivileged(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
@@ -258,7 +258,7 @@ pub fn unprivileged(cmd: &mut std::process::Command) {
         fn miku_capget(buf: *mut u64) -> i64;
         fn miku_capset(permitted: u64, effective: u64, bounding: u64) -> i64;
     }
-    const CAP_MAY_PRIV: u64 = 1 << 13;
+    const CAP_MAY_PRIV: u64 = 1 << miku_abi::cred::CAP_MAY_PRIV;
     // SAFETY: only system calls between fork and exec, with no allocation or
     // locks. Failures do not block starting the program
     unsafe {

@@ -1,5 +1,5 @@
 //! A terminal created like Zed's: `rustix-openpty` calls `libc::openpty`
-//! (`/dev/ptmx`, `/dev/ptsN`, lib/libmiku/c/pty.rs), then `login_tty` in the
+//! (`/dev/ptmx`, `/dev/ptsN`, lib/runtime/libmiku/libc/pty.rs), then `login_tty` in the
 //! child.
 //!
 //! Checks both ends and the slave's name, the initial size, `tcgetattr`

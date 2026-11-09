@@ -1,6 +1,6 @@
 //! C in a MikuOS program
 //!
-//! - `c/stdc.c`, compiled by `build.rs` through `cc` and `lib/c/miku-cc`:
+//! - `c/stdc.c`, compiled by `build.rs` through `cc` and `lib/sdk/c/miku-cc`:
 //!   `snprintf` with stack arguments and floats, `strtod`, pthreads (mutex,
 //!   condvar, keys, recursive, timed wait), the calendar, stdio, wide ctype,
 //!   and header layouts against Rust's `libc`
@@ -53,7 +53,7 @@ fn format(which: i32) -> (i32, String) {
 }
 
 fn main() {
-    println!("stdc: C through lib/c - libc, pthreads, zstd, tree-sitter, SQLite");
+    println!("stdc: C through lib/sdk/c - libc, pthreads, zstd, tree-sitter, SQLite");
     let mut failed = 0;
 
     // The headers' layouts against the Rust libc module's

@@ -273,7 +273,7 @@ Magazines are turned on in `heap::init` once every CPU has its per-CPU base, and
 
 Each finding is a `kerror!` naming the cache, printed after the cache lock is released (a report allocates). The `heap/slabdebug` selftest makes three such reports on purpose.
 
-The old ring-3-derived binned heap (`lib/libmiku/heap_core.rs`) is no longer part of the kernel; it remains ring 3's allocator (see [sdk.md](sdk.md)).
+The old ring-3-derived binned heap (`lib/runtime/libmiku/core/heap_core.rs`) is no longer part of the kernel; it remains ring 3's allocator (see [sdk.md](sdk.md)).
 
 ---
 

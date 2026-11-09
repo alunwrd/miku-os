@@ -17,11 +17,11 @@ const BRK_BASE:   u64 = 0x0000_0060_0000_0000;
 // mm::vmm, next to the page-table guard that enforces it
 use crate::mm::vmm::USER_END;
 
-pub const PROT_READ:  u32 = 1;
-pub const PROT_WRITE: u32 = 2;
-pub const PROT_EXEC:  u32 = 4;
+pub const PROT_READ: u32 = miku_abi::mman::PROT_READ as u32;
+pub const PROT_WRITE: u32 = miku_abi::mman::PROT_WRITE as u32;
+pub const PROT_EXEC: u32 = miku_abi::mman::PROT_EXEC as u32;
 
-const MAP_FIXED: u32 = 0x10;
+const MAP_FIXED: u32 = miku_abi::mman::MAP_FIXED as u32;
 
 // Rejects any combination of prot bits not implemented, so a future flag
 // honoured by accident does not slip through

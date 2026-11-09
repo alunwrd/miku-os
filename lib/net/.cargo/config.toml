@@ -9,7 +9,7 @@
 # one slow first build and is cached after that.
 #
 # Building this crate for MikuOS still works: the programs pass `--target
-# ../miku/x86_64-miku-app.json`, which wins over `build.target`. `target-dir`
+# ../sdk/miku/x86_64-miku-app.json`, which wins over `build.target`. `target-dir`
 # keeps its host artifacts out of the root `target/`, where the from-source
 # `core` and the toolchain's own would land side by side and fail to link
 [build]

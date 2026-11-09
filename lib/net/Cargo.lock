@@ -5,12 +5,34 @@ version = 4
 [[package]]
 name = "miku"
 version = "0.2.10"
+dependencies = [
+ "miku-abi",
+ "miku-buildgen",
+]
+
+[[package]]
+name = "miku-abi"
+version = "1.0.1"
+
+[[package]]
+name = "miku-base"
+version = "1.0.1"
+
+[[package]]
+name = "miku-buildgen"
+version = "1.0.1"
+
+[[package]]
+name = "mikucrypto"
+version = "1.0.1"
 
 [[package]]
 name = "mikunet"
 version = "0.1.0"
 dependencies = [
  "miku",
+ "miku-base",
+ "mikucrypto",
  "spin",
 ]
 

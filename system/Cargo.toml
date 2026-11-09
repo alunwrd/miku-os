@@ -5,7 +5,7 @@
 # manager. A machine without them boots to a kernel prompt.
 #
 # Built for `x86_64-miku-app` with `-Z build-std=core`; the target spec and the
-# linker script live in `lib/miku/`, shared with `apps/`.
+# linker script live in `lib/sdk/miku/`, shared with `apps/`.
 [package]
 name    = "miku-system"
 version = "0.2.10"
@@ -16,18 +16,19 @@ edition = "2021"
 [dependencies]
 # The interface to the shared libraries, and the display protocol, as crates:
 # there is one encoder on the machine
-miku   = { path = "../lib/miku" }
+miku   = { path = "../lib/sdk/miku" }
+miku-abi = { path = "../lib/abi" }
 # `userspace` gives libmay the filesystem it needs to find the config's files:
 # the grammar has none and must not grow one, but the list of files a config is
 # made of is a directory listing
-libmay = { path = "../lib/mayland", features = ["userspace"] }
+libmay = { path = "../lib/gfx/mayland", features = ["userspace"] }
 # The password hash, the account files and the mikudo grammar. Shared between
 # the client and the daemon so there is one parser on the machine; host-tested
-mikuauth = { path = "../lib/mikuauth", features = ["userspace"] }
+mikuauth = { path = "../lib/admin/mikuauth", features = ["userspace"] }
 # The package manager, as a library. `default-features = false` leaves the host
 # backend out (`std::fs` has no meaning here) and `userspace` brings the syscall
 # `Root` and the network, as the network tools do with `mikunet`
-mikupkg = { path = "../lib/mikupkg", default-features = false, features = ["userspace"] }
+mikupkg = { path = "../lib/admin/mikupkg", default-features = false, features = ["userspace"] }
 
 [profile.release]
 opt-level = 1

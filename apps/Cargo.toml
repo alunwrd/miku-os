@@ -12,19 +12,20 @@
 # What the machine needs is in `system/`.
 [package]
 name    = "miku-apps"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 
 [workspace]
 
 [dependencies]
-miku   = { path = "../lib/miku" }
+miku   = { path = "../lib/sdk/miku" }
+miku-abi = { path = "../lib/abi" }
 # The protocols, for the network tools. `userspace` is what brings in the
 # transport; without it the crate is the pure-computation half the tests use
 # `default-features = false` leaves the L2-L4 stack out: these programs sit on
 # top of a socket and never see a frame. netd is the one that asks for it
 mikunet = { path = "../lib/net", default-features = false, features = ["userspace"] }
-libmay = { path = "../lib/mayland" }
+libmay = { path = "../lib/gfx/mayland" }
 
 [profile.release]
 opt-level = 1
@@ -43,8 +44,8 @@ name = "gpudemo"
 path = "src/gpudemo.rs"
 
 [[bin]]
-name = "test_full"
-path = "src/test_full.rs"
+name = "testfull"
+path = "src/testfull.rs"
 
 [[bin]]
 name = "mmaptest"

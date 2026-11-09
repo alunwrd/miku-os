@@ -41,7 +41,7 @@ Every suite collects named cases through one harness, `kernel/kcore/selftest.rs`
 | `mm test` | `run=mm_test` | `kernel/mm/selftest.rs` | Kernel heap (size classes, per-CPU magazines, every CPU at once, memory given back), device memory (one physical run, aligned, below its limit), `vmap`, frame counts, page faults, CPU caches as copy-on-write assumes ([memory.md](memory.md)) | nothing |
 | `ipc test` | `run=ipc_test` | `kernel/syscall/selftest.rs`, `kernel/sched/selftest.rs` | The descriptor contract: `read`, `write` and `poll` agree on readiness (pipe ring, ends counted, no reader, revents, invalid fds, socket range), socketpairs and Unix sockets (readiness, unconnected, names), ICMP and raw-net descriptors; timed sleeps (`time/sleep-1ms`), deadline and keyed waits; and the scheduler's structures: the run-queue heap, the pid bitmap, the job index ([scheduler.md](scheduler.md)) | nothing |
 | `vfs test` | `run=vfs_test` | `kernel/fs/vfs/selftest.rs` | The VFS through its own API, twice: on an ext4 filesystem on a ramdisk and on a `MemFs`, plus cross-filesystem contamination. Every case is a bug that was once live (directories over 256 entries, names over 64 bytes, and so on) ([vfs.md](vfs.md)) | nothing |
-| `ext test` | `run=ext_test` | `kernel/fs/ext/selftest.rs` | What `lib/extfs`'s host tests cannot reach: two ext filesystems mounted at once (routing in the mount table), the real block layer (write, flush, read back), the kernel's own mkfs writing to a device and the driver mounting it ([filesystems.md](filesystems.md)) | nothing (ramdisks) |
+| `ext test` | `run=ext_test` | `kernel/fs/ext/selftest.rs` | What `lib/fs/extfs`'s host tests cannot reach: two ext filesystems mounted at once (routing in the mount table), the real block layer (write, flush, read back), the kernel's own mkfs writing to a device and the driver mounting it ([filesystems.md](filesystems.md)) | nothing (ramdisks) |
 | `btrfs test` | `run=btrfs_test` | `kernel/fs/btrfs/selftest.rs` | The probe registry finding btrfs on a real block device among others, the block layer, the mount table, the graft, and a path through `MikuVFS` | a btrfs volume attached (made with `mkfs.btrfs -r` into `miku-os/btrfs.img`); without one every case skips |
 | `cred test` | `run=cred_test` | `kernel/process/selftest_cred.rs` | The credential model: identities, the capability set, and that exec never raises privilege ([../MikuOS_Security.md](../MikuOS_Security.md)) | nothing; runs in milliseconds |
 | `tty test` | `run=tty_test` | `kernel/io/tty/selftest.rs` | The terminal table with no screen, keyboard or disk: a `TtyId` names one terminal for ever (generations on reuse), the grid, the line discipline, the VT parser ([input-and-terminals.md](input-and-terminals.md)) | nothing |
@@ -98,8 +98,9 @@ From the user's verification notes; compare a run against these before suspectin
 | Suite | Standing result | Note |
 |---|---|---|
 | `mayland_test` | 164/164 since 2026-10-24 | Earlier counts (158, 162) were smaller suites, not failures. The two failures before 2026-10-20 were wrong tests, since fixed |
-| `elf_test` | 35 passed, 1 failed | `elf/relro-outside-image` ("segment data beyond file end"); predates the std work and has not been investigated |
+| `elf_test` | 36/36 | |
 | `nvidia_selftest` | 184/184 on 2026-10-21 | QEMU |
+| `testfull` | 1616/1616 | |
 | `threadtest` | 24/24 | On `-cpu qemu64` the mutex case ("every contender finished", "the guarded count is exact") once timed out within its 5 s window (2026-09-25); rerun before suspecting the mutex |
 | crash count | `crash=4` is expected | when the std programs run: two `stdsignal` children and one `stdthreads --overflow` child (the guard-page check) die of SIGSEGV on purpose, and `stdproc` has a PROT_NONE child that does too |
 
@@ -116,7 +117,7 @@ These are ordinary programs in `/bin`, run by name from a shell or listed in a `
 | `mmaptest` | `apps/src/mmaptest.rs` | File-backed `mmap` and `msync` (`MAP_SHARED` writes reach the file) |
 | `envtest` | `apps/src/envtest.rs` | exec and the ELF loader's argv/envp plumbing; reports through its exit code |
 | `crashtest` | `apps/src/crashtest.rs` | Crashes on purpose so the crash report can be read |
-| `test_full` | `apps/src/test_full.rs` | The libc compatibility layer and libmiku helpers (bit operations, compression, strings, and so on) |
+| `testfull` | `apps/src/testfull.rs` | The libc compatibility layer and libmiku helpers (bit operations, compression, strings, and so on) |
 | `stdhello` | `stdapps/src/stdhello.rs` | The basics of `std`: printing, the allocator, `format!`, args, environment, entropy, exit, panics |
 | `stdthreads` | `stdapps/src/stdthreads.rs` | `std::thread`, `std::sync`, `std::time`; `--overflow` checks the stack guard page |
 | `stdfs` | `stdapps/src/stdfs.rs` | `std::fs` in full |
@@ -129,7 +130,7 @@ These are ordinary programs in `/bin`, run by name from a shell or listed in a `
 | `stdwatch` | `stdapps/src/stdwatch.rs` | inotify through the `inotify` crate and mio |
 | `stdsignal` | `stdapps/src/stdsignal.rs` | CPU faults as signals through libc, the way wasmtime uses them |
 | `stdremote` | `stdapps/src/stdremote.rs` | Zed's `remote_server`, end to end, as a Zed client reaches it |
-| `stdc` | `stdapps/src/stdc.rs` | C in a MikuOS program: `lib/c` and `libc_miku.so` (SQLite, zstd, tree-sitter) |
+| `stdc` | `stdapps/src/stdc.rs` | C in a MikuOS program: `lib/sdk/c` and `libc_miku.so` (SQLite, zstd, tree-sitter) |
 
 How the programs are built is in [building.md](building.md); writing one is in [sdk.md](sdk.md).
 
@@ -139,23 +140,26 @@ Each crate below has its own `.cargo/config.toml` that escapes the repository ro
 
 | Crate | Run with | Tests | What it covers |
 |---|---|---|---|
-| `lib/extfs` | `cd lib/extfs && cargo test` | 234 | The ext2/3/4 driver over an in-memory disk: big directories, big volumes, checksums, crash consistency (power cut mid-transaction), dir hashing, extents, fallocate, flavours, foreign images, fsck, htree, inline data, the journal, limits, images made by `mke2fs`, mount, orphans, ownership, rename, timestamps, truncate. Images it writes are checked with `e2fsck -f -n` |
-| `lib/btrfs` | `cd lib/btrfs && cargo test` | 189 | btrfs: the allocator, the chunk map, commits, extents, files, images made by `mkfs.btrfs`, mount, reads, tree shape, space accounting, transactions, the trees; images checked with `btrfs check` |
-| `lib/net` | `cd lib/net && cargo test` | 152 | The network crate: ARP, DHCP, TCP wire and connection logic, HTTP wire format, packets; SHA-1/2, HMAC, AES vectors; big-number arithmetic including a 2048-bit RSA exponentiation; every root in `etc/ssl/certs/ca-bundle.pem` parsed and self-verified; signatures, chains accepted and refused, hostname rules |
-| `lib/mikuauth` | `cd lib/mikuauth && cargo test` | 103 | Argon2id against RFC 9106's published tag and BLAKE2b against RFC 7693; passwd/group/shadow against a hostile corpus; the `mikudo.conf` grammar; the protocol (truncated messages, lying lengths); the login decision `session::authenticate`; the files that actually ship in `etc/` |
-| `lib/mikupkg` | `cd lib/mikupkg && cargo test` | 163 | The package manager: config, containers, crash recovery, the database, fetch, host, metadata, names, version ranges, resolution, the shipped database, staging, trust, transactions, versions |
-| `lib/fshost` | `cd lib/fshost && cargo test` | 29 | `MemDisk`, the in-memory disk under every filesystem test, and its promises about flushes and crashes; CRC32C |
-| `lib/libmiku/hosttest` | `cd lib/libmiku/hosttest && cargo test` | 14 | libmiku's ring-3 heap (segregated bins, boundary tags), `heap_core` over a frame-shaped source, and the memory functions |
+| `lib/fs/extfs` | `cd lib/fs/extfs && cargo test` | 234 | The ext2/3/4 driver over an in-memory disk: big directories, big volumes, checksums, crash consistency (power cut mid-transaction), dir hashing, extents, fallocate, flavours, foreign images, fsck, htree, inline data, the journal, limits, images made by `mke2fs`, mount, orphans, ownership, rename, timestamps, truncate. Images it writes are checked with `e2fsck -f -n` |
+| `lib/fs/btrfs` | `cd lib/fs/btrfs && cargo test` | 189 | btrfs: the allocator, the chunk map, commits, extents, files, images made by `mkfs.btrfs`, mount, reads, tree shape, space accounting, transactions, the trees; images checked with `btrfs check` |
+| `lib/net` | `cd lib/net && cargo test` | 137 | The network crate: ARP, DHCP, TCP wire and connection logic, HTTP wire format, packets; HMAC, AES vectors; big-number arithmetic including a 2048-bit RSA exponentiation; every root in `etc/ssl/certs/ca-bundle.pem` parsed and self-verified; signatures, chains accepted and refused, hostname rules |
+| `lib/crypto` | `cd lib/crypto && cargo test` | 15 | SHA-1/2, HMAC, AES-GCM and HKDF vectors, the bignum arithmetic. Argon2 and BLAKE2b run under `lib/admin/mikuauth` |
+| `lib/base` | `cd lib/base && cargo test` | 9 | Published check values for CRC-32, FNV-1a, base64; the calendar both ways |
+| `lib/buildgen` | `cd lib/buildgen && cargo test` | 6 | The export scanner, the generated declarations, the check that refuses a wrong declaration |
+| `lib/admin/mikuauth` | `cd lib/admin/mikuauth && cargo test` | 103 | Argon2id against RFC 9106's published tag and BLAKE2b against RFC 7693; passwd/group/shadow against a hostile corpus; the `mikudo.conf` grammar; the protocol (truncated messages, lying lengths); the login decision `session::authenticate`; the files that actually ship in `etc/` |
+| `lib/admin/mikupkg` | `cd lib/admin/mikupkg && cargo test` | 163 | The package manager: config, containers, crash recovery, the database, fetch, host, metadata, names, version ranges, resolution, the shipped database, staging, trust, transactions, versions |
+| `lib/fs/fshost` | `cd lib/fs/fshost && cargo test` | 29 | `MemDisk`, the in-memory disk under every filesystem test, and its promises about flushes and crashes; CRC32C |
+| `lib/runtime/libmiku/hosttest` | `cd lib/runtime/libmiku/hosttest && cargo test` | 14 | libmiku's ring-3 heap (segregated bins, boundary tags), `heap_core` over a frame-shaped source, and the memory functions |
 | `kernel/mm/heap/hosttest` | `cd kernel/mm/heap/hosttest && cargo test` | 11 | The kernel heap's size classes: every size and alignment lands in the smallest class that holds it |
-| `lib/mayland` (libmay) | `cd lib/mayland && cargo test-host` | 16 | Keymaps (every keycode, group and modifier, compiled-in against serialised tables; xkb `ru(winkeys)` spot checks), the window shape, the paint toolkit, the config grammar |
-| `lib/freetype` | `cd lib/freetype && cargo test-host` | 5 | The vendored FreeType 2.14.3 against numbers FreeType gave a C probe on the build host for the font aosh draws with |
+| `lib/gfx/mayland` (libmay) | `cd lib/gfx/mayland && cargo test-host` | 16 | Keymaps (every keycode, group and modifier, compiled-in against serialised tables; xkb `ru(winkeys)` spot checks), the window shape, the paint toolkit, the config grammar |
+| `lib/gfx/freetype` | `cd lib/gfx/freetype && cargo test-host` | 5 | The vendored FreeType 2.14.3 against numbers FreeType gave a C probe on the build host for the font aosh draws with |
 | `aosh` | `cd aosh && cargo test-host` | 187 | The QML engine and shell: the object model, models, animation and easing, input, I/O and processes, IPC, the parser, the scene (layout, damage, painting), text, Canvas, shapes, SVG, effects, icons; renders compared with Qt's ([aosh.md](aosh.md#tests)) |
 | `builder` | `cd builder && cargo test` | 8 | The image builder's packaging rules: the personal package, the image built by installing packages and carrying a database of itself, no working state in the staging tree, every file claimed by a package, modes decided in one place |
 
 Notes:
 
-- **`cargo test-host`** is an alias in that crate's `.cargo/config.toml`. `lib/mayland` is a member of the root workspace, whose profiles say `panic = "abort"`, so its alias builds with `panic_abort` and `-Z panic-abort-tests`; `aosh` and `lib/freetype` use `panic_unwind`. A plain `cargo test` in those directories builds for the kernel target and fails.
-- **Host tools.** `lib/extfs` calls `mke2fs`, `debugfs`, `e2fsck`, `dumpe2fs` and `dd`; `lib/btrfs` calls `mkfs.btrfs` and `btrfs`. Where those are not installed the image cases print `e2fsprogs is not installed; skipping` or `btrfs-progs not available (...) - skipping` and pass.
+- **`cargo test-host`** is an alias in that crate's `.cargo/config.toml`. `lib/gfx/mayland` is a member of the root workspace, whose profiles say `panic = "abort"`, so its alias builds with `panic_abort` and `-Z panic-abort-tests`; `aosh` and `lib/gfx/freetype` use `panic_unwind`. A plain `cargo test` in those directories builds for the kernel target and fails.
+- **Host tools.** `lib/fs/extfs` calls `mke2fs`, `debugfs`, `e2fsck`, `dumpe2fs` and `dd`; `lib/fs/btrfs` calls `mkfs.btrfs` and `btrfs`. Where those are not installed the image cases print `e2fsprogs is not installed; skipping` or `btrfs-progs not available (...) - skipping` and pass.
 - **aosh needs one build first.** Its `Cargo.toml` patches `rquickjs-sys` and `libc` from `target/rust-src-miku/`, which the builder assembles (`cd builder && cargo run --release -- overlay`, or any image build); a host `cargo test-host` needs that to have run once.
 - **aosh's extra modes.** `AOSH_GPU_CHECK=1 cargo test-host` compiles the kernel's `paint.cu` with nvcc, runs it on the build host's NVIDIA card through `libcuda`, and compares every paint of every scene test with the processor's pixel for pixel. The benches are `#[ignore]` tests in `aosh/src/shot.rs` (`notes_flip_cost`, `desktop_drag_cost`, `desktop_session_cost`, `overview_open_cost`, `workspace_switch_cost`, `desktop_select_cost`): `CARGO_PROFILE_DEV_OPT_LEVEL=3 cargo test-host bench:: -- --ignored --nocapture --test-threads 1`; they need the gitignored `personal/` tree. `AOSH_BENCH_GPU=1` times frames as MikuOS draws them on the card. The Qt references the comparison tests read come from `aosh/tests/qtref/make.sh` (Qt 6 and `xvfb-run`); a test whose reference is missing passes over it.
 - **Never set `AOSH_HOST_EXEC`** when running aosh on the host: aosh refuses to start programs or write outside `$HOME` there because a shell config's start-up commands would run on the developer's own session.
@@ -245,26 +249,26 @@ Fork and thread storms found the hardest bugs in this tree (a copy-on-write page
 
 | Changed | Host | Boot |
 |---|---|---|
-| `lib/extfs` | `cd lib/extfs && cargo test` | `run=ext_test;vfs_test` |
-| `lib/btrfs` | `cd lib/btrfs && cargo test` | `run=btrfs_test;vfs_test` with `btrfs.img` attached |
-| `kernel/fs/vfs`, `kernel/fs/*` | `lib/fshost` if the disk model changed | `run=vfs_test;ext_test`; then `stdfs`, `stdwatch`, `stdbench /tmp` |
+| `lib/fs/extfs` | `cd lib/fs/extfs && cargo test` | `run=ext_test;vfs_test` |
+| `lib/fs/btrfs` | `cd lib/fs/btrfs && cargo test` | `run=btrfs_test;vfs_test` with `btrfs.img` attached |
+| `kernel/fs/vfs`, `kernel/fs/*` | `lib/fs/fshost` if the disk model changed | `run=vfs_test;ext_test`; then `stdfs`, `stdwatch`, `stdbench /tmp` |
 | `kernel/drivers/block`, partitions, mkfs | | `run=ext_test` with real disks attached through `disk.sh`; `nvmestress` for NVMe |
 | `kernel/mm`, the kernel heap | `kernel/mm/heap/hosttest` | `run=mm_test`; the storm harness; `stdbench` page-fault and alloc cases |
-| `lib/libmiku` heap or memory functions | `lib/libmiku/hosttest` | `abitest`, `test_full`, `stdthreads` |
+| `lib/runtime/libmiku` heap or memory functions | `lib/runtime/libmiku/hosttest` | `abitest`, `testfull`, `stdthreads` |
 | `kernel/sched`, waits, timers, SMP | | `run=ipc_test` on both CPU models and `-smp 1`/`-smp 4`; `threadtest`, `stdthreads`; the storm harness |
 | `kernel/process`, ELF loading, exec | | `run=elf_test;cred_test`; `envtest`, `stdproc` |
 | signals | | `sigtest`, `stdsignal` (expect the deliberate crashes) |
-| credentials, mikudo, login | `lib/mikuauth` | `run=cred_test`; a login in QEMU |
+| credentials, mikudo, login | `lib/admin/mikuauth` | `run=cred_test`; a login in QEMU |
 | `kernel/syscall`, descriptors, pipes, poll | | `run=ipc_test`; `polltest`, `stdpoll`, `stdasync` |
 | `kernel/io/tty`, the console, keyboard | | `run=tty_test`; `stdpty`; typing in mayterm |
 | `kernel/net`, drivers | `lib/net` | `run=dhcp;net_test`; `stdtokio`, `stddns` with a host server |
 | `lib/net` (TLS, X.509, parsers) | `lib/net` | `curl`/`wget` to an HTTPS host |
 | `kernel/kcore/klog` | | `run=dmesg_selftest` |
-| `kernel/mayland`, `lib/mayland` | `lib/mayland` `cargo test-host` | `run=mayland_test`; a desktop session in QEMU (`desk.sh`); anything touching the effects pass, VRAM copies or borders also goes on the card checklist |
+| `kernel/mayland`, `lib/gfx/mayland` | `lib/gfx/mayland` `cargo test-host` | `run=mayland_test`; a desktop session in QEMU (`desk.sh`); anything touching the effects pass, VRAM copies or borders also goes on the card checklist |
 | `system/src/maywm`, `/etc/mayland` | | `run=mayland_test` (it parses the config grammar), then `maywm` complaints on the console |
 | `aosh/` | `cd aosh && cargo test-host`, and `AOSH_GPU_CHECK=1` for painter changes | a session in QEMU; `aosh check` on the config |
 | `kernel/drivers/gpu/nvidia` | | `run=nvidia_selftest` in QEMU, then the card checklist |
-| `lib/mikupkg`, `builder/` | `lib/mikupkg`, `builder` | a full image build |
+| `lib/admin/mikupkg`, `builder/` | `lib/admin/mikupkg`, `builder` | a full image build |
 
 ## Verification levels
 

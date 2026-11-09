@@ -501,7 +501,7 @@ pub fn read_line(out: &mut [u8], prompt: fn() -> usize) -> i64 {
 
 /// Terminal width, or 80. Asked once per line
 fn term_cols() -> usize {
-    const TIOCGWINSZ: u64 = 0x5413;
+    use miku_abi::ioctl::TIOCGWINSZ;
     let mut ws = [0u16; 4]; // rows, cols, xpixel, ypixel
     let rc = unsafe { miku::miku_ioctl(0, TIOCGWINSZ, ws.as_mut_ptr() as u64) };
     if rc < 0 || ws[1] < 8 { 80 } else { ws[1] as usize }

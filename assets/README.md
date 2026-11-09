@@ -1,6 +1,6 @@
 # Fonts
 
-Rasterised at build time by `lib/mayland/fontgen.rs` — nothing here is read
+Rasterised at build time by `lib/gfx/mayland/fontgen.rs` — nothing here is read
 at run time, and none of it ships in the image except as glyph pixels.
 
 | file | face | where it is used | licence |

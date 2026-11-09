@@ -1,4 +1,4 @@
-# MikuOS ABI v1.0.0
+# MikuOS ABI v1.0.1
 
 The system call interface of the MikuOS kernel: how a ring-3 program enters the
 kernel, what every system call number from 0 to 123 (124 numbers, all
@@ -70,6 +70,11 @@ as a subsystem are in [wiki/processes.md](wiki/processes.md).
 
 ## 1. Overview
 
+Every number and layout in this document is defined once, in
+[`lib/abi`](../lib/abi/src/lib.rs): the kernel, the libraries, `std`, `libc` and
+the C headers all take it from there, so they cannot disagree. A compile-time
+assertion there pins each structure's size.
+
 MikuOS is an x86-64 kernel. Programs run in ring 3 and reach the kernel with
 the `syscall` instruction. The numbers are MikuOS's own, not Linux's: a call
 with Linux's name usually has Linux's semantics, but the number, and often the
@@ -85,7 +90,7 @@ themselves; they call the shared libraries:
 |  libc_miku.so   POSIX names, errno, pthreads  |
 |  core_miku.so  sys_miku.so  fs_miku.so  ...   |
 |  (the miku libraries, miku_* functions)       |
-|  Rust std: lib/rust-std over rust-libc        |
+|  Rust std: lib/sdk/rust-std over rust-libc        |
 +-----------------------------------------------+
 |  ld-miku.so    loads DT_NEEDED, relocates     |
 +-----------------------------------------------+
@@ -132,7 +137,7 @@ Clobbered:    rcx, r11                 (syscall itself overwrites them)
 Preserved:    everything else, including rdi, rsi, rdx, r8, r9, r10
 ```
 
-This is Linux's rule, and the dynamic loader, the vDSO and `lib/miku` are
+This is Linux's rule, and the dynamic loader, the vDSO and `lib/sdk/miku` are
 written to it. The entry stub (`syscall_handler` in `kernel/syscall/mod.rs`)
 saves `rcx`, `r11`, `rbp`, `rbx`, `r12`-`r15`, `r10`, `r9`, `r8`, `rdi`, `rsi`
 and `rdx` on the task's kernel stack and restores them before `sysretq`.
@@ -300,7 +305,7 @@ The calls that read a path word: `open` (11), `stat` (18), `mkdir` (20),
 `inotify_add_watch` (117) and `realpath` (119). There are therefore no
 separate `*at` numbers: `openat`, `fstatat`, `mkdirat`, `unlinkat`, `renameat`,
 `linkat`, `symlinkat`, `readlinkat`, `fchmodat`, `fchownat` and `utimensat` in
-`libc_miku` are the plain calls with a base (`lib/libmiku/c/at.rs`);
+`libc_miku` are the plain calls with a base (`lib/runtime/libmiku/libc/at.rs`);
 `fchdir(fd)` is `chdir` of the empty path from `fd`.
 
 `exec` (46), `execve` (67), the xattr calls and `map_lib` (15) do **not** read
@@ -428,8 +433,8 @@ size and every other resource is `RLIM_INFINITY`.
 
 "pw" means a path word ([§2.4](#24-paths-and-the-path-word)). "-" in the
 wrapper columns means no library wraps the call. libmiku wrappers are in
-`lib/libmiku/` (exported from `core_miku.so` unless noted), libc wrappers in
-`lib/libmiku/libc.rs` and `lib/libmiku/c/` (exported from `libc_miku.so`).
+`lib/runtime/libmiku/` (exported from `core_miku.so` unless noted), libc wrappers in
+`lib/runtime/libmiku/libc/` and `lib/runtime/libmiku/libc/` (exported from `libc_miku.so`).
 
 | Nr | Name | rdi | rsi | rdx | r10 | Success | libmiku | libc | Cap | § |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -539,7 +544,7 @@ wrapper columns means no library wraps the call. libmiku wrappers are in
 | 103 | procinfo | buf | max | | | count | `miku_procinfo` | (`sysinfo`) | | [4.1](#41-process-lifetime) |
 | 104 | kcmd | text | len | | | 0 | `miku_kcmd` | - | per command | [4.17](#417-the-administrative-channel-104) |
 | 105 | proc_path | pid | buf | len | | bytes | `miku_proc_path` | - | | [4.1](#41-process-lifetime) |
-| 106 | thread_create | args* (8 x u64) | | | | tid | `miku_thread_spawn*` (`lib/libmiku/thread.rs`) | `pthread_create` | | [4.12](#412-threads-and-the-futex-106-110) |
+| 106 | thread_create | args* (8 x u64) | | | | tid | `miku_thread_spawn*` (`lib/runtime/libmiku/core/thread.rs`) | `pthread_create` | | [4.12](#412-threads-and-the-futex-106-110) |
 | 107 | thread_exit | code | | | | does not return | `miku_thread_exit` | `pthread_exit` | | [4.12](#412-threads-and-the-futex-106-110) |
 | 108 | gettid | | | | | tid | `miku_gettid` | `pthread_self`* | | [4.12](#412-threads-and-the-futex-106-110) |
 | 109 | sched_yield | | | | | 0 | `miku_sched_yield` | - | | [4.12](#412-threads-and-the-futex-106-110) |
@@ -682,7 +687,7 @@ written is logged and the child is reaped anyway.
 
 The wait sleeps on the death queue with a 100 ms backstop. libmiku:
 `miku_wait4`, `miku_waitpid` (no options), `miku_try_wait` (`WNOHANG`); libc:
-`waitpid`, `waitid`; `lib/miku`'s `proc::exited`, `signalled`, `stopped`,
+`waitpid`, `waitid`; `lib/sdk/miku`'s `proc::exited`, `signalled`, `stopped`,
 `exit_code`, `term_sig`, `stop_sig` and `wait_status_code` (the `128+sig`
 number a shell prints) decode it.
 
@@ -1973,7 +1978,7 @@ kernel unmaps `[stack_base, stack_base + stack_len)` when the thread dies,
 which is how a detached thread's stack is freed (the thread cannot unmap the
 stack it is standing on). The thread joins its process's group and terminal.
 libmiku: `miku_thread_spawn` and `miku_thread_spawn_owned`
-(`lib/libmiku/thread.rs`, which builds the TLS block and a guard page); libc:
+(`lib/runtime/libmiku/core/thread.rs`, which builds the TLS block and a guard page); libc:
 `pthread_create`; Rust: `std::thread::spawn`.
 
 #### 107 `thread_exit`
@@ -2039,7 +2044,7 @@ and the foreground job gets `SIGHUP`. `/dev/ptsN` (flat, N = the id's slot)
 is the slave; only a process `TTY_ATTACH` would admit may open it, and
 `ioctl(slave, TIOCSCTTY, 0)` makes it the controlling terminal. libc's
 `posix_openpt`, `grantpt`, `unlockpt`, `ptsname`, `openpty` and `login_tty`
-are built from these (`lib/libmiku/c/pty.rs`).
+are built from these (`lib/runtime/libmiku/libc/pty.rs`).
 
 #### 99 `tty`
 
@@ -2322,7 +2327,7 @@ first. There are at most 64 pools on the machine and 16 per process.
 Ownership is by process and is checked here and again in the server, so a
 connection cannot name a pool its process does not own. Pools are destroyed
 when their owner's connection or process goes. libmay: `Pool::new`,
-`Pool::adopt`, `Pool::free` (`lib/mayland/src/conn.rs`).
+`Pool::adopt`, `Pool::free` (`lib/gfx/mayland/src/conn.rs`).
 
 ### 4.16 The GPU (94-98, 121)
 
@@ -2520,7 +2525,7 @@ are little-endian; `sin_port` and the IPv4 address are in network order.
 Structures the kernel reads are read unaligned, so the caller need not align
 them beyond what the table implies.
 
-**`stat`** (18, 19, 112), 64 bytes, `kernel/syscall/abi.rs`:
+**`stat`** (18, 19, 112), 64 bytes, `lib/abi/src/kstat.rs`:
 
 ```
   0  u64  size
@@ -2587,7 +2592,7 @@ termios:
 ```
 
 The kernel copies `size_of::<MikuTermios>()` bytes, which is 14; comments in
-`kernel/syscall/adapters/io.rs` and `lib/libmiku/c/termios.rs` still say
+`kernel/syscall/adapters/io.rs` and `lib/runtime/libmiku/libc/termios.rs` still say
 twelve, from before `c_cc` grew to seven slots.
 
 Defaults: `c_cc` = Ctrl-C (0x03), Ctrl-\\ (0x1c), DEL (0x7f, with 0x08
@@ -2637,7 +2642,7 @@ the handler's `rsp`:
 
 `CSGSFS` holds CS in its low 16 bits and SS in its top 16. `ERR`, `TRAPNO`
 and `CR2` are the fault's error code, vector and faulting address. The layout
-matches `lib/rust-libc/libc/src/unix/miku/mod.rs`, which is what lets crates
+matches `lib/abi/src/ucontext.rs`, which is what lets crates
 that read a machine context (wasmtime, for one) build for MikuOS.
 
 **`inotify_event`** (read of 116's descriptor): `i32 wd` 0, `u32 mask` 4,
@@ -2867,11 +2872,11 @@ still use that number.)
 
 Thread-local data sits below the thread pointer (TLS variant II), so a
 thread-local access is a small negative `%fs:` offset. Words 8-32 are what
-`thread_spawn` copies to build another thread's block. The layout is written
-in three places that must agree: `lib/ld-miku/src/loader.rs` (dynamically
-linked programs), `kernel/process/elf_loader.rs` (programs without an
-interpreter) and `lib/libmiku/thread.rs` (every new thread). A dynamically
-linked program without `PT_TLS` still gets a block, so `errno` has a home; a
+`thread_spawn` copies to build another thread's block. The offsets are in
+`lib/abi/src/tcb.rs`. The block is built in three places:
+`lib/runtime/ld-miku/src/loader.rs` (dynamically linked programs),
+`kernel/process/elf_loader.rs` (programs without an interpreter) and
+`lib/runtime/libmiku/core/thread.rs` (every new thread). A dynamically linked program without `PT_TLS` still gets a block, so `errno` has a home; a
 **statically linked** program without `PT_TLS` starts with `FS_BASE` = 0.
 
 `errno` at `tp + 40` is written only by the C-convention functions of
@@ -2901,8 +2906,7 @@ Each falls back to the system call by itself when the data cannot be used
 (an uncalibrated TSC, `CLOCK_REALTIME` before the wall clock is set, or a
 magic or version it does not recognise), so a caller never has to check.
 
-**The vvar page** (`lib/vdso/src/abi.rs`, included verbatim by the kernel and
-the vDSO so the two cannot drift):
+**The vvar page** (`lib/abi/src/vvar.rs`, used by both the kernel and the vDSO):
 
 ```
   0  u32  magic        0x4D494B55 ("MIKU")
@@ -2920,7 +2924,7 @@ the vDSO so the two cannot drift):
 Protocol: read `seq`; if odd, read again; read the fields; read `seq` again
 and retry if it changed. The code finds the data page by taking its own base
 (PC-relative) and subtracting `VVAR_OFFSET` (0x1000). libmiku's `time` module
-looks the functions up once (`lib/libmiku/auxv.rs`) and `miku_clock_gettime`,
+looks the functions up once (`lib/runtime/libmiku/core/auxv.rs`) and `miku_clock_gettime`,
 `std::time::Instant` and C's `clock_gettime` use them.
 
 ### 7.8 Shared image pages
@@ -3026,6 +3030,24 @@ eviction and hard links).
 
 ---
 
+### The library exports, after v1.0.0
+
+The system calls did not change. `lib/` was reorganised (`lib/README.md`), and
+exports that duplicated others went:
+
+| Removed | Use instead |
+|---|---|
+| `miku_bring_*` | `miku_ring_*`, which gained `miku_ring_find`, `miku_ring_readline`, `miku_ring_capacity` |
+| `miku_sb_*` | `miku_str_*`, which gained `miku_str_push_uint`, `miku_str_push_repeat` |
+| `miku_getopt_*` | `miku_args_*` |
+| `miku_strtod`, an integer parser under that name | `miku_strtol`, or `strtod` from `libc_miku.so` |
+
+`miku_crc32` and `miku_crc32_update` moved from `algo_miku.so` to `codec_miku.so`.
+`MikuSigaction.flags` takes Linux's `SA_*` values, so `libc_miku` no longer
+translates them.
+
+---
+
 ## 9. Programs and libraries
 
 Earlier versions of this file also carried the library API, the minimal Rust
@@ -3038,7 +3060,7 @@ now in [wiki/sdk.md](wiki/sdk.md), which covers:
 - the dynamic linker `ld-miku`, the ten miku libraries (`core_miku`,
   `sys_miku`, `text_miku`, `ds_miku`, `algo_miku`, `codec_miku`, `fs_miku`,
   `net_miku`, `parse_miku`, `libc_miku`, declared in
-  `lib/mikulibs/libs.list`) and their dependency graph;
+  `lib/runtime/libmiku/libs.list`) and their dependency graph;
 - building, getting a binary into `/bin`, and testing it;
 - calling a system call no library wraps.
 
@@ -3115,8 +3137,10 @@ readelf -n app | grep 'Build ID'    # present, for crash reports
 | What | Where |
 |---|---|
 | Entry stub, `sigreturn` path, dispatcher | `kernel/syscall/mod.rs` |
-| errno values, VFS error mapping | `kernel/syscall/errno.rs` |
-| `stat`, dirent, `statfs` layouts | `kernel/syscall/abi.rs` |
+| Syscall numbers, stubs | `lib/abi/src/sys.rs` |
+| errno values | `lib/abi/src/errno.rs` |
+| VFS error mapping | `kernel/syscall/errno.rs` |
+| `stat`, dirent, `statfs` layouts | `lib/abi/src/kstat.rs` |
 | User pointer checks, path word, argv copy-in | `kernel/syscall/usercopy.rs` |
 | Process, identity, time, exec | `kernel/syscall/adapters/process.rs` |
 | Threads, futex | `kernel/syscall/adapters/thread.rs`, `kernel/sched/futex.rs` |
@@ -3134,9 +3158,11 @@ readelf -n app | grep 'Build ID'    # present, for crash reports
 | Credentials, capabilities | `kernel/process/cred.rs` |
 | Sessions | `kernel/process/session.rs` |
 | ELF loader, auxv, stack | `kernel/process/elf_loader.rs`, `kernel/process/exec.rs` |
-| vDSO | `kernel/process/vdso.rs`, `lib/vdso/` |
+| vDSO | `kernel/process/vdso.rs`, `lib/runtime/vdso/` |
 | Crash reports, cores | `kernel/process/crash.rs`, `kernel/process/coredump.rs` |
 | Syscall selftest | `kernel/syscall/selftest.rs` (`ipc test` in the kernel console) |
-| libmiku syscall numbers and stubs | `lib/libmiku/sys.rs` |
-| libc_miku | `lib/libmiku/libc.rs`, `lib/libmiku/c/` |
-| Rust std's view | `lib/rust-libc/libc/src/unix/miku/mod.rs`, `lib/rust-std/` |
+| libc_miku | `lib/runtime/libmiku/libc/`, `lib/runtime/libmiku/libc/` |
+| C's constants and structs, by header | `lib/abi/src/<header>.rs` |
+| Types `miku_*` functions expose | `lib/abi/src/libtypes/` |
+| ELF, the auxiliary vector | `lib/abi/src/elf.rs`, `lib/abi/src/auxv.rs` |
+| Rust std's view | `lib/sdk/rust-std/`, `lib/sdk/rust-libc/` |

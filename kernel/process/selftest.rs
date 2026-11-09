@@ -454,7 +454,7 @@ fn reloc_cases(t: &mut Runner) {
     let mut img = good_exec();
     img.phdrs.push(Ph {
         typ: PT_GNU_RELRO, flags: PF_R,
-        offset: 0, vaddr: 0x0000_7F00_0000_0000, filesz: 0x1000, memsz: 0x1000, align: 1,
+        offset: 0, vaddr: 0x0000_7F00_0000_0000, filesz: 0, memsz: 0x1000, align: 1,
     });
     let bytes = img.build();
     match try_load(&bytes) {

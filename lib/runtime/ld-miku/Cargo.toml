@@ -1,0 +1,16 @@
+[package]
+name    = "ld-miku"
+version = "0.2.10"
+edition = "2021"
+
+# No [profile] here: ld-miku is a workspace member, so cargo ignores a profile
+# in this file and warns on every build. The release profile that applies is the
+# workspace root's (opt-level 2, lto, panic=abort).
+
+[[bin]]
+name = "ld-miku"
+path = "src/main.rs"
+
+[dependencies]
+miku-abi = { path = "../../abi" }
+miku-base = { path = "../../base" }

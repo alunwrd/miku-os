@@ -325,16 +325,16 @@ pub fn sys_pipe2(fds_ptr: u64, flags: u64) -> u64 {
 // `FD_CLOEXEC` on a descriptor already open keeps a pipe end out of a child,
 // and `O_NONBLOCK` at runtime is what every reactor does: it opens a descriptor
 // and then makes it non-blocking. `sys_read` reads the flag.
-pub const F_DUPFD: u64 = 0;
-pub const F_GETFD: u64 = 1;
-pub const F_SETFD: u64 = 2;
-pub const F_GETFL: u64 = 3;
-pub const F_SETFL: u64 = 4;
+pub const F_DUPFD: u64 = miku_abi::fcntl::F_DUPFD as u64;
+pub const F_GETFD: u64 = miku_abi::fcntl::F_GETFD as u64;
+pub const F_SETFD: u64 = miku_abi::fcntl::F_SETFD as u64;
+pub const F_GETFL: u64 = miku_abi::fcntl::F_GETFL as u64;
+pub const F_SETFL: u64 = miku_abi::fcntl::F_SETFL as u64;
 /// Linux's number, which is what `libc` and `std` already send
-pub const F_DUPFD_CLOEXEC: u64 = 1030;
+pub const F_DUPFD_CLOEXEC: u64 = miku_abi::fcntl::F_DUPFD_CLOEXEC as u64;
 
 /// The one bit `F_GETFD`/`F_SETFD` speak in, as every Unix spells it.
-const FD_CLOEXEC: u64 = 1;
+const FD_CLOEXEC: u64 = miku_abi::fcntl::FD_CLOEXEC as u64;
 
 /// Flags a program may change on an open descriptor.
 ///
@@ -405,12 +405,12 @@ pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     }
 }
 
-pub const F_GETLK: u64 = 5;
-pub const F_SETLK: u64 = 6;
-pub const F_SETLKW: u64 = 7;
-const F_RDLCK: i16 = 0;
-const F_WRLCK: i16 = 1;
-const F_UNLCK: i16 = 2;
+pub const F_GETLK: u64 = miku_abi::fcntl::F_GETLK as u64;
+pub const F_SETLK: u64 = miku_abi::fcntl::F_SETLK as u64;
+pub const F_SETLKW: u64 = miku_abi::fcntl::F_SETLKW as u64;
+use miku_abi::fcntl::F_RDLCK;
+use miku_abi::fcntl::F_WRLCK;
+use miku_abi::fcntl::F_UNLCK;
 
 /// Record locks: `fs::vfs::lock` has the semantics. `arg` is a `struct flock`,
 /// 32 bytes:

@@ -9,7 +9,7 @@
 # block layer, `mkfs`, `nvidia`, the selftests. Those have no twin here.
 #
 # Built for `x86_64-miku-app` like `system/` and `apps/`; the target spec and
-# the linker script live in `lib/miku/`, shared with both.
+# the linker script live in `lib/sdk/miku/`, shared with both.
 [package]
 name    = "miku-utils"
 version = "0.2.10"
@@ -18,12 +18,13 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-miku = { path = "../lib/miku" }
+miku = { path = "../lib/sdk/miku" }
+miku-abi = { path = "../lib/abi" }
 # `/etc/passwd` and `/etc/group`, so `ls -l` and `ps` can say `miku` where the
 # filesystem says 1000. Without the `userspace` feature it is the pure-parser
 # half of the crate, the same code `login` and `mikudod` use, host-tested in
 # `cargo test`
-mikuauth = { path = "../lib/mikuauth" }
+mikuauth = { path = "../lib/admin/mikuauth" }
 
 [profile.release]
 opt-level = "z"

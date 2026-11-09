@@ -1,0 +1,18 @@
+# miku-abi: what the kernel, the libraries, and programs must agree on
+#
+# Numbers and layouts only, written once. No dependencies, so ring 0, every
+# library target and the host build it alike. `std` and `libc` cannot take a
+# path dependency under `-Z build-std`, so builder/src/stdport/overlay.rs copies
+# src/ into their trees: nothing here may reach outside `core`, and files refer
+# to each other through `super::`.
+[package]
+name    = "miku-abi"
+version = "1.0.1"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# What the `libc` crate's feature of this name derives on its structs
+extra_traits = []

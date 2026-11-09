@@ -10,7 +10,7 @@
 
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Architecture](https://img.shields.io/badge/arch-x86__64-blue.svg)]()
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)]()
 [![Status](https://img.shields.io/badge/status-beta-yellow.svg)]()
 [![License](https://img.shields.io/badge/license-Apache2.0-red.svg)]()
 
@@ -214,10 +214,10 @@
 
 ## Файловые системы
 
-### ext2 / ext3 / ext4 (`lib/extfs`, монтируется в `kernel/fs/ext/`)
+### ext2 / ext3 / ext4 (`lib/fs/extfs`, монтируется в `kernel/fs/ext/`)
 
 Драйвер - отдельный крейт, который знает формат на диске и ничего не знает об этом ядре: до диска он
-доходит через один трейт (`BlockHost` из `lib/fshost`). Смысл - в цикле тестов: `cd lib/extfs && cargo test`
+доходит через один трейт (`BlockHost` из `lib/fs/fshost`). Смысл - в цикле тестов: `cd lib/fs/extfs && cargo test`
 собирает файловую систему в памяти, намеренно портит её, обрывает питание посреди транзакции и проверяет,
 что делает драйвер, - за секунды, а не за загрузку.
 
@@ -237,7 +237,7 @@
 обходит `debugfs`, а питание обрывается на каждой записи операции, и каждый получившийся образ отдаётся
 `e2fsck`.
 
-### btrfs (`lib/btrfs`)
+### btrfs (`lib/fs/btrfs`)
 
 В ядре только чтение: дерево чанков, деревья файловых систем, экстенты, inline-файлы. В крейте есть и
 транзакции copy-on-write, аллокатор и коммиты - проверены на хосте сборки на образах `mkfs.btrfs`.
@@ -283,7 +283,7 @@ VFS → страничный кеш → файловая система → бл
 
 ## Графика: Mayland, рабочий стол и видеокарта
 
-### Mayland (`kernel/mayland/`, `lib/mayland/`)
+### Mayland (`kernel/mayland/`, `lib/gfx/mayland/`)
 
 Дисплейный сервер и композитор. Его протокол использует формат сообщений Wayland поверх собственного
 семейства сокетов; разделяемая память - это хэндл ядра, раскладка клавиатуры - таблица. Одна копия протокола
@@ -452,7 +452,7 @@ PID 1: поток ядра с фиксированной таблицей на 3
 
 ## Пользовательское пространство
 
-### Rust `std` (`lib/rust-std/`)
+### Rust `std` (`lib/sdk/rust-std/`)
 
 `std` для `target_os = "miku"`: платформенный слой вызывает `libmiku`, а не системные вызовы, поэтому номера
 знает одна библиотека. Работают `fs`, `path`, `env`, `io`, `process`, `net`, `time` (через vDSO), `thread`,
@@ -465,7 +465,7 @@ PID 1: поток ядра с фиксированной таблицей на 3
 **Zed** - редактор - собирается для MikuOS из собственных исходников с несколькими патчами и четвёртым
 бэкендом gpui, который говорит на Mayland. Он лежит пакетом в образе и запускается с рабочего стола.
 
-### libc и C (`lib/libmiku/`, `lib/c/`)
+### libc и C (`lib/runtime/libmiku/`, `lib/sdk/c/`)
 
 **`libc_miku.so`** - библиотека C для MikuOS, написанная на Rust: около 540 экспортируемых функций (около
 1450 во всех десяти библиотеках `miku`). Она покрывает `stdio` (семейства `printf`/`scanf`, `FILE`),
@@ -476,11 +476,11 @@ PID 1: поток ядра с фиксированной таблицей на 3
 ключи, `pthread_atfork`. Чего пока нет: `dlopen`, `posix_spawn`, `epoll`, `eventfd`, `signalfd`, `timerfd`
 и локалей; `getaddrinfo` - только IPv4, а `localtime` - это UTC.
 
-В `lib/c/include/` лежат заголовки C для неё - 47 штук, от `stdio.h` до `sys/socket.h` и
+В `lib/sdk/c/include/` лежат заголовки C для неё - 47 штук, от `stdio.h` до `sys/socket.h` и
 `pthread.h`. Это её C-лицо, а не вторая libc: заголовок объявляет только то, что библиотека определяет,
 поэтому программа на C, которой нужно то, чего в MikuOS нет, не *соберётся*, а раскладка каждой структуры
 закреплена за Rust-оверлеем `libc` через `_Static_assert`, которые проверяются при каждом изменении
-заголовка. `lib/c/miku-cc` оборачивает clang хоста с флагами цели. Так собраны SQLite, zstd, tree-sitter и FreeType, и через ту же обёртку
+заголовка. `lib/sdk/c/miku-cc` оборачивает clang хоста с флагами цели. Так собраны SQLite, zstd, tree-sitter и FreeType, и через ту же обёртку
 собирают C Rust-крейты, которые компилируют его через `cc`.
 
 ### Динамическая компоновка
@@ -526,10 +526,10 @@ uid=0(root) gid=0(root) groups=0(root)
 оконного менеджера отключены. Домашний каталог создаётся из `/etc/skel`, когда впервые запускается графическая сессия.
 
 Программы: `mikudo`, `mikudod`, `login`, `maygreet`, `maysession`, `passwd`, `id`, `su`, `useradd`.
-Хеш и все разборщики - в `lib/mikuauth`: `cargo test` прогоняет около сотни случаев, включая эталонный тег Argon2id
+Хеш и все разборщики - в `lib/admin/mikuauth`: `cargo test` прогоняет около сотни случаев, включая эталонный тег Argon2id
 из RFC 9106.
 
-### Пакеты (`lib/mikupkg`, `/bin/mikupkg`)
+### Пакеты (`lib/admin/mikupkg`, `/bin/mikupkg`)
 
 Формат контейнера, решатель зависимостей и транзакция с журналом, которая откатывается назад и никогда не
 доигрывается вперёд. Единственная связь применителя с миром - трейт `Root`, поэтому сборщик ставит пакеты в
@@ -557,9 +557,9 @@ uid=0(root) gid=0(root) groups=0(root)
   Наборы для памяти, IPC, VFS, ext, btrfs, терминалов, загрузчика ELF, прав, сети, журнала ядра, Mayland
   и драйвера NVIDIA, а также программы `std`. Вывод идёт в последовательный порт. См.
   [docs/wiki/testing.md](wiki/testing.md).
-- **Тесты на хосте**, без загрузки: `lib/extfs`, `lib/btrfs`, `lib/net` (криптография, X.509, все
-  разборщики), `lib/mikuauth`, `lib/mayland` (`cargo test-host`), куча ядра (`kernel/mm/heap/hosttest`),
-  куча libmiku (`lib/libmiku/hosttest`), `lib/mikupkg`, `lib/fshost`, `lib/freetype` и `aosh`
+- **Тесты на хосте**, без загрузки: `lib/fs/extfs`, `lib/fs/btrfs`, `lib/crypto`, `lib/base`, `lib/net` (X.509, все
+  разборщики), `lib/admin/mikuauth`, `lib/gfx/mayland` (`cargo test-host`), куча ядра (`kernel/mm/heap/hosttest`),
+  куча libmiku (`lib/runtime/libmiku/hosttest`), `lib/admin/mikupkg`, `lib/fs/fshost`, `lib/gfx/freetype` и `aosh`
   (`cargo test-host`), `builder`.
 - **`stdbench`** - один и тот же бенчмарк на MikuOS и на Linux. На QEMU/KVM с 4 vCPU против Linux на голой
   машине: запуск процесса и ожидание 0,27 мс (Linux 0,63), `Instant::now` 11 нс (20), обмен через канал
@@ -578,7 +578,7 @@ uid=0(root) gid=0(root) groups=0(root)
 | Инструмент | Зачем |
 |:--|:--|
 | Rust nightly + `rust-src` | `build-std` для голого железа и для пользовательских целей |
-| clang | Библиотеки на C, через `lib/c/miku-cc`; он нужен aosh, а значит, и сборке |
+| clang | Библиотеки на C, через `lib/sdk/c/miku-cc`; он нужен aosh, а значит, и сборке |
 | LLVM (`llvm-ar`) | Архивы для библиотек на C |
 | `nm` (binutils) | Сборщик проверяет, что каждая функция, объявленная в заголовке C, где-то определена |
 | CUDA toolkit (необязательно) | `nvcc` компилирует программы для GPU (`sm_120`); без него ядро собирается и сообщает, что их нет |
@@ -647,17 +647,18 @@ kernel/                 исходники ядра
   setup/                окно установщика
   shell/                оболочка в ядре (аварийная)
   kcore/                состояние загрузки, часы, блокировки, журнал ядра, pstore, трассы, питание, RNG
-lib/                    библиотеки
-  extfs/, btrfs/, fshost/   форматы файловых систем и трейт, через который они доходят до диска
-  libmiku/, mikulibs/   системная библиотека и .so-библиотеки по областям
-  ld-miku/, vdso/       динамический загрузчик, vDSO
-  rust-std/, rust-libc/ порт std и оверлей libc
-  c/, freetype/         заголовки C и обёртка компилятора; FreeType
-  mayland/              libmay: дисплейный протокол, общий для обеих сторон
+lib/                    библиотеки; карта в lib/README.md
+  abi/                  miku-abi: все числа и раскладки, общие для ядра и программ
+  base/, crypto/        чистые алгоритмы; криптография
+  runtime/              ld-miku, vDSO, десять *_miku.so
+  sdk/                  то, с чем собираются программы: крейт miku, заголовки C и обёртка компилятора,
+                        порт std, оверлей libc
+  fs/                   extfs, btrfs: форматы файловых систем; fshost: трейт, через который они доходят до диска
   net/                  mikunet: DNS, TLS, HTTP - протоколы, в ring 3
-  mikuauth/             хеширование паролей и разборщики файлов учётных записей
-  mikupkg/              пакетный менеджер как библиотека
-  miku/, buildgen/      заголовок программ; генераторы времени сборки
+  gfx/                  mayland: libmay, дисплейный протокол, общий для обеих сторон; FreeType
+  admin/                mikuauth: хеширование паролей и файлы учётных записей; mikupkg: пакетный менеджер
+                        как библиотека
+  buildgen/             общий код сборочных скриптов: список библиотек, заглушки, shim, объявления, генераторы
 system/                 msh, mayterm, maywm, maygreet, maysession, mikudo, mikudod, login,
                         passwd, id, su, useradd, mikupkg
 utils/                  повседневные команды: ls, cat, cp, grep, ps, kill, mikuctl, ... (35)

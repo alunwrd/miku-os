@@ -1,7 +1,7 @@
 //! Assembles the patched trees for `std` programs: Rust's `library/` with
-//! `lib/rust-std/library/` over it, and crates.io crates patched by `arms`
+//! `lib/sdk/rust-std/library/` over it, and crates.io crates patched by `arms`
 //!
-//! `lib/rust-std/library/` mirrors upstream paths and holds only MikuOS's
+//! `lib/sdk/rust-std/library/` mirrors upstream paths and holds only MikuOS's
 //! changes. Upstream is the toolchain's `rust-src`, the exact version that will
 //! compile it. `refsrc/miku_programs/rust` is pinned to the same commit.
 //!
@@ -39,17 +39,43 @@ pub fn assemble(root: &Path, out: &Path, lock: Option<&Path>) -> Result<PathBuf,
     let lib = out.join("library");
     // Deleting, so a file removed from the patch stops applying
     io(mirror(&src, &lib, true, &[]), &lib)?;
-    let patch = root.join("lib/rust-std/library");
+    let patch = root.join("lib/sdk/rust-std/library");
     if patch.is_dir() {
         io(mirror(&patch, &lib, false, &[]), &lib)?;
     }
     let _ = fs::remove_file(lib.join("Cargo.lock"));
+    abi_module(root, &lib.join("std/src/sys/pal/miku/defs"), &["kstat"])?;
 
     libc(root, out)?;
     rustix(out)?;
     beside_crates(out, lock)?;
     calloop(out, lock)?;
     Ok(out.to_path_buf())
+}
+
+/// The kernel's own shapes in `lib/abi`, which C's view has no use for
+const KERNEL_SHAPES: &[&str] =
+    &["auxv", "cred", "elf", "futex", "kproc", "ksignal", "kstat", "ktermios", "libtypes", "sys", "tcb", "vvar"];
+
+/// `lib/abi/src` as a module at `dst`, because `-Z build-std` takes no path
+/// dependency: `lib.rs` becomes `mod.rs` without its crate attributes. `keep`
+/// names the kernel-shape files this tree uses
+fn abi_module(root: &Path, dst: &Path, keep: &[&str]) -> Result<(), String> {
+    let src = root.join("lib/abi/src");
+    io(mirror(&src, dst, true, &[]), dst)?;
+    let dropped = |m: &str| KERNEL_SHAPES.contains(&m) && !keep.contains(&m);
+    let text = io(fs::read_to_string(src.join("lib.rs")), &src)?;
+    let module: Vec<&str> = text.lines()
+        .filter(|l| !l.starts_with("//!") && !l.starts_with("#!["))
+        .filter(|l| !l.strip_prefix("pub mod ").and_then(|m| m.strip_suffix(';')).is_some_and(dropped))
+        .collect();
+    let path = dst.join("mod.rs");
+    io(fs::write(&path, module.join("\n") + "\n"), &path)?;
+    let _ = fs::remove_file(dst.join("lib.rs"));
+    for m in KERNEL_SHAPES.iter().filter(|m| dropped(m)) {
+        let _ = fs::remove_file(dst.join(format!("{m}.rs")));
+    }
+    Ok(())
 }
 
 /// The `libc` crate. MikuOS is `target_family = "unix"`, so everything under
@@ -62,17 +88,22 @@ fn libc(root: &Path, out: &Path) -> Result<(), String> {
     let Some((_, src)) = crate_dirs("libc", "0.2.").pop() else { return Ok(()) };
     let dst = out.join("libc-miku");
     io(mirror(&src, &dst, true, &[]), &dst)?;
-    let patch = root.join("lib/rust-libc/libc");
+    let patch = root.join("lib/sdk/rust-libc/libc");
     if patch.is_dir() {
         io(mirror(&patch, &dst, false, &[]), &dst)?;
     }
+    let abi = dst.join("src/unix/miku/abi");
+    abi_module(root, &abi, &[])?;
+    // Upstream owns these, and `libc::msghdr` must hold a `libc::iovec`
+    let posix = abi.join("posix.rs");
+    io(fs::write(&posix, "pub use crate::unix::{\n    group, in6_addr, iovec, pollfd, rlimit, rusage, timespec, timeval, winsize,\n};\n"), &posix)?;
     arms::libc(&dst)?;
     // Adds the patch entry once, here since the path is only known now
     let manifest = out.join("library/Cargo.toml");
     let text = io(fs::read_to_string(&manifest), &manifest)?;
     if !text.lines().any(|l| l.starts_with("libc = ")) {
         let mut t = text;
-        t.push_str("\n# MikuOS: see lib/rust-libc/README.md\nlibc = { path = \"../libc-miku\" }\n");
+        t.push_str("\n# MikuOS: see lib/sdk/rust-libc/README.md\nlibc = { path = \"../libc-miku\" }\n");
         io(fs::write(&manifest, t), &manifest)?;
     }
     Ok(())

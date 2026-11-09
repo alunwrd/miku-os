@@ -1,6 +1,6 @@
 // ext2/ext3/ext4 as an implementation of `FileSystem`
 //
-// All the VFS knows about ext. Every method forwards into `lib/extfs`.
+// All the VFS knows about ext. Every method forwards into `lib/fs/extfs`.
 //
 // `impl FileSystem for MikuFS` with no newtype: the trait is ours and the type
 // is foreign, which the orphan rule permits.

@@ -133,40 +133,11 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 /// Base64, skipping bytes outside the alphabet, such as the newlines in a PEM
 /// body
 fn b64_decode(input: &[u8]) -> Option<Vec<u8>> {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut bits = 0u32;
-    let mut padding = 0usize;
-
-    for &c in input {
-        if c == b'=' { padding += 1; continue; }
-        let v = match val(c) {
-            Some(v) => v,
-            // Whitespace between lines is expected; anything else in a body
-            // makes the block invalid
-            None if c.is_ascii_whitespace() => continue,
-            None => return None,
-        };
-        if padding > 0 { return None; }
-        acc = (acc << 6) | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
+    if !miku_base::base64::decode_lines(input, |b| out.push(b)) || out.is_empty() {
+        return None;
     }
-    if out.is_empty() { None } else { Some(out) }
+    Some(out)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

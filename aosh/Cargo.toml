@@ -11,16 +11,17 @@ rquickjs = "0.14"
 # Text as Qt sets it (`scene/text/`): rustybuzz shapes (ligatures and kerning,
 # and the font tables through the ttf-parser it re-exports) and FreeType 2.14.3,
 # Arch's version, loads, hints and renders the glyphs as Qt has it do
-# (`lib/freetype`); its rasteriser also fills a Canvas's paths
+# (`lib/gfx/freetype`); its rasteriser also fills a Canvas's paths
 # (`scene/canvas/`). The crates are the versions Zed's lock pins
 rustybuzz = "0.20.1"
-freetype = { path = "../lib/freetype" }
+freetype = { path = "../lib/gfx/freetype" }
 unicode-linebreak = "0.1.5"
 # The display protocol and the shared-memory pools (`dev/aosh-architecture.md`,
 # "Decisions")
-libmay = { path = "../lib/mayland" }
+libmay = { path = "../lib/gfx/mayland" }
+miku-abi = { path = "../lib/abi" }
 # `poll(2)`, for the loop: the display socket with a timeout until the next
-# timer. MikuOS's `libc` (`lib/rust-libc/README.md`), patched below
+# timer. MikuOS's `libc` (`lib/sdk/rust-libc/README.md`), patched below
 libc = "0.2"
 # Pictures as their files hold them (PNG, JPEG, WebP), decoded at run time
 # (`scene/picture.rs`; `dev/aosh-negi.md`, "What changes in aosh's decisions").

@@ -1,5 +1,5 @@
 //! Name resolution through `std`, tokio, and `libc`'s `getaddrinfo`, all
-//! `libc_miku.so`'s (`lib/libmiku/c/netdb.rs`)
+//! `libc_miku.so`'s (`lib/runtime/libmiku/libc/netdb.rs`)
 //!
 //! Order: literal, `localhost`, `/etc/hosts`, DNS to the lease's resolver
 //! (`10.0.2.3` in QEMU). Also `AI_NUMERICHOST`, `AF_INET6`, a named service,

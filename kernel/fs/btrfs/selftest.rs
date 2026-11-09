@@ -1,6 +1,6 @@
 // btrfs on the machine
 //
-// `lib/btrfs`'s host tests cover the format: superblocks, the chunk map, the
+// `lib/fs/btrfs`'s host tests cover the format: superblocks, the chunk map, the
 // trees, reading a file back byte for byte against what `mkfs.btrfs` put there.
 // Here is what they cannot reach:
 //
@@ -89,7 +89,7 @@ pub fn run() -> Report {
     };
     r.check("graft it into the tree", true, format!("vnode {}", mount_id));
 
-    // Every check below goes through MikuVFS, not lib/btrfs: the trait is under
+    // Every check below goes through MikuVFS, not lib/fs/btrfs: the trait is under
     // test
     listing(&mut r, mount_id);
     contents(&mut r);

@@ -31,35 +31,35 @@ use super::tcp_listener::TcpListener;
 use mikunet::stack::conn::Keepalive;
 
 // Userspace address-family / socket-type constants (match Linux ABI)
-pub const AF_INET:     u16 = 2;
+pub const AF_INET: u16 = miku_abi::socket::AF_INET as u16;
 /// The display protocol's transport. Not a network family: a connection to the
 /// compositor is an fd to write requests to and read events from, with a
 /// lifetime tied to the process, so it shares the fd range, the ownership check
 /// and the exit cleanup
-pub const AF_MAYLAND:  u16 = 42;
+pub const AF_MAYLAND: u16 = miku_abi::socket::AF_MAYLAND as u16;
 /// Local sockets: two processes on this machine, no network involved.
 ///
 /// Here for the same reason as AF_MAYLAND: a descriptor with an owner, a
 /// lifetime tied to the process and a place in the fd range
-pub const AF_UNIX:     u16 = 1;
-pub const SOCK_STREAM: u32 = 1;
-pub const SOCK_DGRAM:  u32 = 2;
+pub const AF_UNIX: u16 = miku_abi::socket::AF_UNIX as u16;
+pub const SOCK_STREAM: u32 = miku_abi::socket::SOCK_STREAM as u32;
+pub const SOCK_DGRAM: u32 = miku_abi::socket::SOCK_DGRAM as u32;
 /// A socket carrying whole IP packets rather than a stream or a payload. Only
 /// ICMP, for `ping` and `traceroute`
-pub const SOCK_RAW:    u32 = 3;
+pub const SOCK_RAW: u32 = miku_abi::socket::SOCK_RAW as u32;
 pub const IPPROTO_ICMP: u32 = 1;
 pub const IPPROTO_TCP: u32 = 6;
 pub const IPPROTO_UDP: u32 = 17;
 
 /// setsockopt levels and names, the Linux numbers
 pub const SOL_IP: u32 = 0;
-pub const IP_TTL: u32 = 2;
-pub const SOL_SOCKET: u32 = 1;
-pub const SO_KEEPALIVE: u32 = 9;
+pub const IP_TTL: u32 = miku_abi::inet::IP_TTL as u32;
+pub const SOL_SOCKET: u32 = miku_abi::socket::SOL_SOCKET as u32;
+pub const SO_KEEPALIVE: u32 = miku_abi::socket::SO_KEEPALIVE as u32;
 /// The `IPPROTO_TCP` level's three keepalive numbers, in seconds and probes
-pub const TCP_KEEPIDLE: u32 = 4;
-pub const TCP_KEEPINTVL: u32 = 5;
-pub const TCP_KEEPCNT: u32 = 6;
+pub const TCP_KEEPIDLE: u32 = miku_abi::inet::TCP_KEEPIDLE as u32;
+pub const TCP_KEEPINTVL: u32 = miku_abi::inet::TCP_KEEPINTVL as u32;
+pub const TCP_KEEPCNT: u32 = miku_abi::inet::TCP_KEEPCNT as u32;
 /// What an IP packet leaves with when nothing said otherwise
 pub const DEFAULT_TTL: u8 = 64;
 
@@ -2132,9 +2132,9 @@ pub fn getsockopt(fd: u64, pid: u64, level: u32, name: u32) -> Result<u64, SockE
     let mut tbl = SOCKETS.lock();
     let slot = &mut tbl.slots[idx];
     if !slot.active || slot.owner_pid != pid { return Err(SockError::BadFd); }
-    const SO_TYPE: u32 = 3;
-    const SO_ERROR: u32 = 4;
-    const SO_ACCEPTCONN: u32 = 30;
+    const SO_TYPE: u32 = miku_abi::socket::SO_TYPE as u32;
+    const SO_ERROR: u32 = miku_abi::socket::SO_ERROR as u32;
+    const SO_ACCEPTCONN: u32 = miku_abi::socket::SO_ACCEPTCONN as u32;
     match (level, name) {
         (SOL_SOCKET, SO_ERROR) => {
             // Asked while still connecting: take a step first, so a caller

@@ -1,0 +1,61 @@
+# mikupkg: what a package is, and what installing one means
+#
+# The package format, the repository index, the installed database, the
+# dependency resolver, the transaction journal and the applier, as a library,
+# with one thing left outside it: where the files go.
+#
+# That is `apply::Root`. The same applier writes the build's staging tree on the
+# host, the live filesystem on the machine, and an in-memory tree that can be
+# told to fail at step n, so `builder` and `/bin/mikupkg` cannot drift apart,
+# and ordering, conflicts and rollback are covered by `cargo test`.
+#
+# Three ways to build it, as `mikunet`, `mikuauth` and `libmay` do:
+#   default    pure computation. No I/O: formats, versions, the solver,
+#              the transaction state machine over a Root somebody else provides
+#   host       adds std::fs, the container writer and the signer. What the
+#              builder links, and what makes an image out of packages
+#   userspace  adds the MikuOS syscall backend and the network. What /bin
+#              links
+[package]
+name    = "mikupkg"
+version = "0.1.0"
+edition = "2021"
+
+# Its own workspace, and `exclude`d by the repository root, as
+# `lib/net/Cargo.toml` explains: as a member the crate would share the root's
+# resolution, `core` would be built both from the sysroot and from source, and
+# the link would fail on a duplicate `sized` lang item
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The syscalls, for the ring-3 backend. Optional: the host build and the tests
+# must not see them
+miku = { path = "../../sdk/miku", optional = true }
+miku-abi = { path = "../../abi" }
+miku-base = { path = "../../base" }
+# SHA-256 and the signature check, and under `userspace` the HTTPS that fetches
+# a package. Not optional: a container's integrity is per-file SHA-256, so the
+# pure build needs it too, and this crate owns the machine's cryptography (one
+# SHA-256 and one ECDSA on MikuOS).
+#
+# `default-features = false` leaves the L2-L4 stack out: this crate sits on top
+# of a socket and never sees a frame
+mikunet = { path = "../../net", default-features = false, features = ["crypto"] }
+mikucrypto = { path = "../../crypto" }
+
+# `host` is in the default set, as `mikunet` has `stack` and `crypto`: `cargo
+# test` with no flags has to reach every line, and the `std::fs` backend is half
+# of what this crate claims, that the builder and the machine run one applier.
+#
+# `/bin/mikupkg` turns it off and asks for `userspace` instead, as the network
+# tools do with `mikunet`
+[features]
+default   = ["host"]
+host      = []
+userspace = ["dep:miku", "mikunet/userspace"]
+
+[profile.release]
+opt-level = 2

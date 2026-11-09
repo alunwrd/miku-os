@@ -5,7 +5,7 @@
 // go into every process at exec:
 //
 //   vvar  read-only, no-execute   the numbers (`VdsoData`)
-//   vdso  read + execute          the code that reads them (lib/vdso)
+//   vdso  read + execute          the code that reads them (lib/runtime/vdso)
 //
 // Both are the same physical frames in every process, refcounted as `solib`
 // shares library text. The code page is filled once at boot from the image
@@ -22,13 +22,13 @@ use x86_64::structures::paging::PageTableFlags;
 
 use crate::mm::{pmm, vmm::AddressSpace};
 
-// The layout of the data page, shared verbatim with `lib/vdso`. Included rather
+// The layout of the data page, shared verbatim with `lib/runtime/vdso`. Included rather
 // than re-declared: a mismatch would produce a plausible wrong time
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/lib/vdso/src/abi.rs"));
+use miku_abi::vvar::*;
 
 /// The built vDSO image, embedded the same way ld-miku is
 static VDSO_ELF: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/lib/vdso/vdso.bin"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/lib/runtime/vdso/vdso.bin"));
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -60,7 +60,7 @@ pub fn init() {
     };
 
     // Copies the image into the code frame through the HHDM. It is one PT_LOAD
-    // at vaddr 0 by construction (see lib/vdso/vdso.ld), so the image and the
+    // at vaddr 0 by construction (see lib/runtime/vdso/vdso.ld), so the image and the
     // page are the same span
     let hhdm = crate::arch::x86_64::grub::hhdm();
     unsafe {
@@ -108,7 +108,7 @@ fn features() -> u32 {
 ///
 /// Called at init and each time the wall clock is re-anchored: the RTC at boot,
 /// NTP once the network is up. The seqlock protocol is the writer's half of
-/// what `lib/vdso` reads: make `seq` odd, write, make it even again, with a
+/// what `lib/runtime/vdso` reads: make `seq` odd, write, make it even again, with a
 /// fence on each side so a reader cannot see the fields change before the flag.
 ///
 /// One writer, so no lock between writers; this protects against a reader on

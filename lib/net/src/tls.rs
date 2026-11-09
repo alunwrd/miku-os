@@ -6,7 +6,8 @@ use crate::crypto::{
     cbc_encrypt, cbc_decrypt, tls_pad, tls_unpad,
     Sha256State, hmac_sha1, hmac_sha256, prf_sha256,
 };
-use crate::rsa::{parse_rsa_public_key, rsa_pkcs1_encrypt};
+use crate::rsa::rsa_pkcs1_encrypt;
+use crate::x509::parse_rsa_public_key;
 use crate::x509::{Cert, Hash, SigAlg};
 use crate::verify;
 use crate::ec::{ecdh_keypair, ecdh_shared};
@@ -1000,7 +1001,7 @@ impl TlsStream {
             }
             self.derive_keys(&premaster);
             let mut enc_pm = [0u8; 256];
-            let enc_len    = rsa_pkcs1_encrypt(&rsa_key, &premaster, &mut enc_pm);
+            let enc_len    = rsa_pkcs1_encrypt(&rsa_key, &premaster, &mut enc_pm, crate::plat::random);
             if enc_len == 0 { return None; }
             let mut cke_body = [0u8; 260];
             cke_body[0..2].copy_from_slice(&(enc_len as u16).to_be_bytes());

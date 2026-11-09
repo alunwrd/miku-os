@@ -206,7 +206,7 @@ pub fn precise() -> bool {
 
 /// Nanoseconds since the TSC was calibrated: the clock of every deadline in the
 /// kernel (`sched::timer`) and of the vDSO's `CLOCK_MONOTONIC`, by the same
-/// arithmetic, so the syscall and the vDSO agree (`lib/vdso`, `cycles_to_time`)
+/// arithmetic, so the syscall and the vDSO agree (`lib/runtime/vdso`, `cycles_to_time`)
 pub fn now_ns() -> u64 {
     let khz = TSC_KHZ.load(Ordering::Relaxed);
     let t0 = BOOT_TSC.load(Ordering::Relaxed);

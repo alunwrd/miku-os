@@ -1,0 +1,12 @@
+# What build scripts and the builder share about the miku libraries
+#
+# The kernel's build script also includes imagegen.rs, qoigen.rs, and
+# shadergen.rs from this directory by path: they need `image`, which nothing
+# linking a stub should pull in. cubin.rs is the kernel's too (no_std).
+[package]
+name    = "miku-buildgen"
+version = "1.0.1"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"

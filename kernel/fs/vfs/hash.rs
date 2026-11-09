@@ -1,12 +1,4 @@
-#[inline]
-pub fn fnv32(data: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c9dc5;
-    for &b in data {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x01000193);
-    }
-    h
-}
+pub use miku_base::fnv::fnv1a_32 as fnv32;
 
 #[inline]
 pub fn name_hash(name: &str) -> u32 {

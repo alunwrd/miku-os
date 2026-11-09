@@ -18,7 +18,7 @@
 //
 // Linux's shape so a crate reading a machine context (wasmtime first) needs
 // `target_os = "miku"` added to a cfg rather than a new arm. The reader's side
-// is `lib/rust-libc/libc/src/unix/miku/mod.rs`, and the two have to agree byte
+// is `lib/abi/src/`, and the two have to agree byte
 // for byte. See dev/signal-architecture.md.
 
 use crate::arch::x86_64::trap::TrapFrame;

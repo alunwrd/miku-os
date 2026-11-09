@@ -48,11 +48,11 @@ const MAX_JOBS: usize = 8;
 const MAX_DUPS: usize = 4;
 
 // Open flags, as `kernel/fs/vfs/types.rs` spells them
-const O_READ: u32 = 0x0001;
-const O_WRITE: u32 = 0x0002;
-const O_APPEND: u32 = 0x0004;
-const O_CREATE: u32 = 0x0008;
-const O_TRUNC: u32 = 0x0020;
+const O_READ: u32 = miku_abi::fcntl::O_RDONLY as u32;
+const O_WRITE: u32 = miku_abi::fcntl::O_WRONLY as u32;
+const O_APPEND: u32 = miku_abi::fcntl::O_APPEND as u32;
+const O_CREATE: u32 = miku_abi::fcntl::O_CREAT as u32;
+const O_TRUNC: u32 = miku_abi::fcntl::O_TRUNC as u32;
 
 #[no_mangle]
 pub extern "C" fn _start_main(argc: i32, argv: *const *const u8) -> ! {

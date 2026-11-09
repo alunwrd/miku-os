@@ -28,33 +28,33 @@ use spin::Mutex;
 use super::core::MikuVFS;
 
 // The event bits, Linux's values
-pub const IN_ACCESS: u32 = 0x0000_0001;
-pub const IN_MODIFY: u32 = 0x0000_0002;
-pub const IN_ATTRIB: u32 = 0x0000_0004;
-pub const IN_CLOSE_WRITE: u32 = 0x0000_0008;
-pub const IN_CLOSE_NOWRITE: u32 = 0x0000_0010;
-pub const IN_OPEN: u32 = 0x0000_0020;
-pub const IN_MOVED_FROM: u32 = 0x0000_0040;
-pub const IN_MOVED_TO: u32 = 0x0000_0080;
-pub const IN_CREATE: u32 = 0x0000_0100;
-pub const IN_DELETE: u32 = 0x0000_0200;
-pub const IN_DELETE_SELF: u32 = 0x0000_0400;
-pub const IN_MOVE_SELF: u32 = 0x0000_0800;
+pub use miku_abi::inotify::IN_ACCESS;
+pub use miku_abi::inotify::IN_MODIFY;
+pub use miku_abi::inotify::IN_ATTRIB;
+pub use miku_abi::inotify::IN_CLOSE_WRITE;
+pub use miku_abi::inotify::IN_CLOSE_NOWRITE;
+pub use miku_abi::inotify::IN_OPEN;
+pub use miku_abi::inotify::IN_MOVED_FROM;
+pub use miku_abi::inotify::IN_MOVED_TO;
+pub use miku_abi::inotify::IN_CREATE;
+pub use miku_abi::inotify::IN_DELETE;
+pub use miku_abi::inotify::IN_DELETE_SELF;
+pub use miku_abi::inotify::IN_MOVE_SELF;
 /// Every event a watch can ask for
-pub const IN_ALL_EVENTS: u32 = 0x0000_0fff;
+pub use miku_abi::inotify::IN_ALL_EVENTS;
 // Raised whatever the watch asked for
-pub const IN_UNMOUNT: u32 = 0x0000_2000;
-pub const IN_Q_OVERFLOW: u32 = 0x0000_4000;
-pub const IN_IGNORED: u32 = 0x0000_8000;
+pub use miku_abi::inotify::IN_UNMOUNT;
+pub use miku_abi::inotify::IN_Q_OVERFLOW;
+pub use miku_abi::inotify::IN_IGNORED;
 // `inotify_add_watch` flags
-pub const IN_ONLYDIR: u32 = 0x0100_0000;
-pub const IN_DONT_FOLLOW: u32 = 0x0200_0000;
-pub const IN_EXCL_UNLINK: u32 = 0x0400_0000;
-pub const IN_MASK_CREATE: u32 = 0x1000_0000;
-pub const IN_MASK_ADD: u32 = 0x2000_0000;
+pub use miku_abi::inotify::IN_ONLYDIR;
+pub use miku_abi::inotify::IN_DONT_FOLLOW;
+pub use miku_abi::inotify::IN_EXCL_UNLINK;
+pub use miku_abi::inotify::IN_MASK_CREATE;
+pub use miku_abi::inotify::IN_MASK_ADD;
 /// In an event: the subject is a directory
-pub const IN_ISDIR: u32 = 0x4000_0000;
-pub const IN_ONESHOT: u32 = 0x8000_0000;
+pub use miku_abi::inotify::IN_ISDIR;
+pub use miku_abi::inotify::IN_ONESHOT;
 
 /// Instances on the machine, Linux's per-user default
 pub const MAX_INSTANCES: usize = 128;

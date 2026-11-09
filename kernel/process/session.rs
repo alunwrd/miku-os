@@ -43,7 +43,7 @@ use crate::process::cred::{CapSet, Cred, CAP_MAY_PRIV, CAP_SYS_BOOT};
 pub const MAX_SESSIONS: usize = 8;
 
 /// The only seat this machine has
-pub const SEAT0: u8 = 0;
+pub use miku_abi::kproc::SEAT0;
 
 /// What a session is for
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]

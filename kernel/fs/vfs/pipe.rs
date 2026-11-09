@@ -29,7 +29,7 @@ pub const CAPACITY: usize = 64 * 1024;
 
 /// A write this size or smaller goes in whole or not at all (POSIX
 /// `PIPE_BUF`): two writers' records never interleave
-pub const ATOMIC_WRITE: usize = 4096;
+pub const ATOMIC_WRITE: usize = miku_abi::limits::PIPE_BUF;
 
 struct Ring {
     /// Allocated by the first write: most pipes carry a line or two

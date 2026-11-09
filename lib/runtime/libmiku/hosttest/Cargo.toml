@@ -1,0 +1,28 @@
+# libmiku's files, tested on the build host
+#
+# `libmiku` is not a crate: its files are compiled into the shared libraries by
+# `lib/runtime/libmiku`, for MikuOS only. Some need nothing of the machine but memory,
+# the heap above all, so this crate compiles those files as they are, with the
+# little under them that is the kernel's (mapping memory, waiting on a futex)
+# standing in (`src/lib.rs`).
+#
+#     cd lib/runtime/libmiku/hosttest && cargo test
+[package]
+name    = "libmiku-hosttest"
+version = "0.1.0"
+edition = "2021"
+
+# Its own workspace, and `exclude`d by the repository root, as
+# `lib/net/Cargo.toml` explains: as a member it would share the root's
+# resolution, `core` would be built both from the sysroot and from source, and
+# the link would fail on a duplicate `sized` lang item
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[profile.test]
+opt-level = 2
+
+[dependencies]
+miku-abi = { path = "../../../abi" }

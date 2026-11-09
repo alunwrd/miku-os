@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# The C compiler for MikuOS: the host's clang, told what MikuOS is.
+#
+#   lib/sdk/c/miku-cc [clang args...]
+#
+# See `dev/c-architecture.md`. MikuOS's C headers are `lib/sdk/c/include` (the C
+# face of `libc_miku.so`) plus the constants generated from the Rust `libc`
+# module. The host's `/usr/include` must never be seen: a Linux header that
+# compiles is a Linux layout in a MikuOS program.
+#
+# This only compiles. C reaches a MikuOS program as a static archive that
+# rustc links with `rust-lld`, like everything else; there is no second
+# linker path. Asked to link, it refuses rather than guessing.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../../.." && pwd)"
+GEN="$ROOT/target/miku-c/include"
+
+# The generated constants are the builder's (builder/src/stdport/cheaders.rs),
+# written before any C compiles; without them every header that includes
+# <bits/...> would fail, so say that rather than letting clang say it
+if [ ! -d "$GEN/bits" ]; then
+    echo "miku-cc: $GEN/bits is missing - build through the builder (cd builder && cargo run --release -- std <crate>)" >&2
+    exit 1
+fi
+
+# The layouts, pinned to the Rust side (check/layout.c), whenever a header
+# or a generated constant has changed since the last time they were checked
+STAMP="$ROOT/target/miku-c/layout.stamp"
+SUM="$(cat "$HERE"/include/*.h "$HERE"/include/sys/*.h "$GEN"/bits/*.h "$HERE/check/layout.c" | sha256sum | cut -d' ' -f1)"
+if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP")" != "$SUM" ]; then
+    clang --target=x86_64-unknown-none-elf -nostdlibinc -isystem "$HERE/include" -isystem "$GEN" \
+        -fsyntax-only "$HERE/check/layout.c" || { echo "miku-cc: lib/sdk/c/check/layout.c failed" >&2; exit 1; }
+    printf '%s\n' "$SUM" > "$STAMP"
+fi
+
+# `cc` passes a --target derived from the Rust triple, and clang has never
+# heard of `miku`; whatever came in is replaced. -c is required: see above
+args=()
+compiling=0
+skip=0
+for a in "$@"; do
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$a" in
+        --target=*) continue ;;
+        -target) skip=1; continue ;;
+        -c|-S|-E|-M|-MM) compiling=1 ;;
+    esac
+    args+=("$a")
+done
+if [ "$compiling" = 0 ]; then
+    for a in "$@"; do
+        case "$a" in --version|-v|-dumpversion|-dumpmachine|--print*|-print*) compiling=1 ;; esac
+    done
+fi
+if [ "$compiling" = 0 ]; then
+    echo "miku-cc: compiles only; MikuOS programs are linked by rustc" >&2
+    exit 1
+fi
+
+# The code model is lib/sdk/rust-std/x86_64-unknown-miku.json's: PIC, no red
+# zone. `__miku__` is how a C source asks where it is; `__unix__` is true in
+# the same sense `target_family = "unix"` is. `HAVE_*` are the configure-style
+# facts portable C checks for when it does not know the platform by name,
+# each one true of lib/sdk/c/include
+exec clang \
+    --target=x86_64-unknown-none-elf \
+    -fPIC -mno-red-zone \
+    -nostdlibinc \
+    -isystem "$HERE/include" \
+    -isystem "$GEN" \
+    -D__miku__=1 -D__unix__=1 -D__unix=1 \
+    -DHAVE_ENDIAN_H=1 \
+    -fno-stack-protector \
+    "${args[@]}"

@@ -1,4 +1,4 @@
-//! Compiles `c/stdc.c` through `cc`, which finds `lib/c/miku-cc` via
+//! Compiles `c/stdc.c` through `cc`, which finds `lib/sdk/c/miku-cc` via
 //! `CC_x86_64_unknown_miku`
 
 fn main() {

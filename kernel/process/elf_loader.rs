@@ -45,9 +45,9 @@ const TLS_GAP_BELOW_STACK: u64 = 16 * 1024 * 1024;
 ///
 /// The thread control block at the thread pointer: one ABI-mandated word and
 /// the template a thread copies to make another thread's block. The layout is
-/// in `lib/ld-miku/src/loader.rs`, and this is the other implementation of it,
+/// in `lib/runtime/ld-miku/src/loader.rs`, and this is the other implementation of it,
 /// since a statically-linked program never meets the loader
-const TCB_SIZE: usize = 64;
+use miku_abi::tcb::{TCB_SIZE, TCB_TLS_ALIGN, TCB_TLS_FILESZ, TCB_TLS_IMAGE, TCB_TLS_SIZE};
 const TLS_MAX_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Highest address a loaded image may reach.
@@ -997,7 +997,7 @@ fn setup_tls<S: ElfSource + ?Sized>(
     // The TCB, which is 64 bytes. The x86-64 ABI fixes only the first word (the
     // thread pointer's own value); MikuOS puts there the four numbers a thread
     // needs to build another thread's block. `ld-miku` builds the same
-    // sixty-four for a dynamic program, and `lib/libmiku/thread.rs` reads them
+    // sixty-four for a dynamic program, and `lib/runtime/libmiku/core/thread.rs` reads them
     // in both cases
     let block_size = lead.checked_add(TCB_SIZE).ok_or(LoadError::MapFailed)?;
     let num_pages = block_size.checked_add(4095).ok_or(LoadError::MapFailed)? / 4096;
@@ -1045,10 +1045,10 @@ fn setup_tls<S: ElfSource + ?Sized>(
         // The image pointer is the program's own `.tdata` in its mapping,
         // read-only in effect: threads copy out of it, never back
         tcb.write(tcb_user_va);
-        tcb.add(1).write(tcb_off as u64);
-        tcb.add(2).write(align as u64);
-        tcb.add(3).write(load_bias.wrapping_add(ph.p_vaddr));
-        tcb.add(4).write(filesz as u64);
+        tcb.byte_add(TCB_TLS_SIZE).write(tcb_off as u64);
+        tcb.byte_add(TCB_TLS_ALIGN).write(align as u64);
+        tcb.byte_add(TCB_TLS_IMAGE).write(load_bias.wrapping_add(ph.p_vaddr));
+        tcb.byte_add(TCB_TLS_FILESZ).write(filesz as u64);
     }
 
     let tls_base = tls_virt + lead as u64;

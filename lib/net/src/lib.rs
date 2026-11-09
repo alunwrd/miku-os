@@ -19,7 +19,7 @@ pub mod plat;
 // Encoding and certificates, with no I/O. Behind `crypto`, on by default: the
 // kernel links this crate for `stack` and does not speak TLS
 #[cfg(feature = "crypto")]
-pub mod der;
+pub use mikucrypto::der;
 pub mod icmp;
 pub mod ipv4;
 
@@ -33,15 +33,7 @@ pub mod x509;
 
 // The arithmetic and the primitives the handshake is built out of
 #[cfg(feature = "crypto")]
-pub mod bignum;
-#[cfg(feature = "crypto")]
-pub mod crypto;
-#[cfg(feature = "crypto")]
-pub mod ec;
-#[cfg(feature = "crypto")]
-pub mod gcm;
-#[cfg(feature = "crypto")]
-pub mod rsa;
+pub use mikucrypto::{bignum, ec, gcm, primitives as crypto, rsa};
 
 // Trust: chain, anchors, dates, and name
 #[cfg(feature = "crypto")]

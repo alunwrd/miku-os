@@ -229,7 +229,7 @@ for a terminal goes to the kernel log through `klog` (75); read it with
 
 ## Users and groups
 
-Three files, parsed by `lib/mikuauth/src/db.rs` (lines up to 4096 bytes,
+Three files, parsed by `lib/admin/mikuauth/src/db.rs` (lines up to 4096 bytes,
 fields up to 256, ids up to `0xFFFE`):
 
 | File | Mode | Format |
@@ -286,7 +286,7 @@ boot `/etc` is the read-only boot copy: changes need a writable root
 
 ### mikuauth
 
-`lib/mikuauth` is the one implementation of "who is this": the hash, the three
+`lib/admin/mikuauth` is the one implementation of "who is this": the hash, the three
 account files, the `/etc/mikudo.conf` grammar, and the socket protocol between
 the clients and `mikudod`. It runs in ring 3 (`mikudod`, `login`, `passwd`,
 `maygreet`) and on the build host.
@@ -301,7 +301,7 @@ the clients and `mikudod`. It runs in ring 3 (`mikudod`, `login`, `passwd`,
   nothing ships and `useradd` never writes, and which only the console accepts.
 - **Password rules** (`mikudod`): at least 8 characters, within the protocol's
   maximum, and no colon, newline or NUL.
-- **Tests**: `cd lib/mikuauth && cargo test`, about a hundred cases: RFC 9106
+- **Tests**: `cd lib/admin/mikuauth && cargo test`, about a hundred cases: RFC 9106
   §5.3's published Argon2id tag, RFC 7693's BLAKE2b digests, hostile
   `passwd`/`group`/`shadow` corpora, every `doas.conf(5)` example, protocol
   truncation, and the files that actually ship (`tests/shipped.rs`).
@@ -431,7 +431,7 @@ command]` is a front end that execs `mikudo`.
 
 ### /etc/mikudo.conf
 
-The grammar is doas.conf's (`lib/mikuauth/src/conf.rs`):
+The grammar is doas.conf's (`lib/admin/mikuauth/src/conf.rs`):
 
 ```text
 rule    = ("permit" | "deny") option* ident ["as" target] ["cmd" path ["args" arg...]]
@@ -512,7 +512,7 @@ set; grant it with a unit's `Capabilities=gpu` or run the program through
 
 ## mikupkg
 
-The package manager (`lib/mikupkg`, `/bin/mikupkg`, `/bin/mikupkg-apply`);
+The package manager (`lib/admin/mikupkg`, `/bin/mikupkg`, `/bin/mikupkg-apply`);
 the design is [dev/package-architecture.md](../../dev/package-architecture.md).
 
 **What a package is.** A `.mpk` container (magic `MIKUPKG\0`) laid out so the
@@ -739,7 +739,7 @@ The boot sequence itself (GRUB, the kernel's boot steps and timings) is in
 | Credentials and capabilities | `kernel/process/cred.rs` |
 | The broker | `system/src/mikudod.rs` |
 | Clients | `system/src/{mikudo,login,passwd,su,useradd,id,maygreet,maysession}.rs` |
-| Hashes, account files, policy grammar, protocol | `lib/mikuauth/src/` |
-| Package manager | `lib/mikupkg/`, `system/src/mikupkg/`, `system/src/mikupkg-apply.rs`, `builder/src/pkg.rs` |
+| Hashes, account files, policy grammar, protocol | `lib/admin/mikuauth/src/` |
+| Package manager | `lib/admin/mikupkg/`, `system/src/mikupkg/`, `system/src/mikupkg-apply.rs`, `builder/src/pkg.rs` |
 | Writable root, `root=`, `rootrw` | `kernel/kcore/firmware/load.rs`, `kernel/fs/ext/mount.rs` |
 | `/etc` | `etc/` in the repository |

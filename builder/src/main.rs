@@ -155,7 +155,7 @@ fn build_userspace(root: &Path, low_ram: bool) -> Vec<(String, PathBuf)> {
 
 /// Builds a crate against Rust's `std`: target `x86_64-unknown-miku`,
 /// `-Z build-std=std,panic_abort`, and a patched `library/` from
-/// `lib/rust-std/` (`stdport`). Missing tools are fatal only for a `required`
+/// `lib/sdk/rust-std/` (`stdport`). Missing tools are fatal only for a `required`
 /// crate
 fn build_std_crate(root: &Path, dir: &str, bins: &[(&str, &str)], required: bool, low_ram: bool,
                    overlay: &Path)
@@ -225,7 +225,7 @@ fn build_program_crate(root: &Path, dir: &str, bins: &[(&str, &str)], what: &str
         .arg("+nightly")
         .arg("build")
         .arg("--release")
-        .arg("--target").arg("../lib/miku/x86_64-miku-app.json")
+        .arg("--target").arg("../lib/sdk/miku/x86_64-miku-app.json")
         .arg("-Z").arg("json-target-spec")
         // `alloc` as well as `core`: the `miku` crate declares a global
         // allocator over core_miku's heap
@@ -305,7 +305,7 @@ const EXTERNAL_BINS: &[(&str, &str, &str)] = &[
 ];
 
 /// Crate directory of the `std` programs. One level below the root, since the
-/// target spec passes `-T../lib/miku/linker.ld`
+/// target spec passes `-T../lib/sdk/miku/linker.ld`
 const STD_CRATE: &str = "stdapps";
 
 /// Every `std` crate and its programs, and whether the image requires it
@@ -341,19 +341,20 @@ const APP_BINS: &[(&str, &str)] = &[
     // Demos and ABI smoke tests
     ("hello", "miku-demos"), ("maydemo", "miku-demos"), ("gpudemo", "miku-demos"),
     ("polltest", "miku-demos"), ("abitest", "miku-demos"), ("crashtest", "miku-demos"),
-    ("threadtest", "miku-demos"),
+    ("threadtest", "miku-demos"), ("testfull", "miku-demos"), ("mmaptest", "miku-demos"),
+    ("envtest", "miku-demos"), ("sigtest", "miku-demos"),
     // Network tools
     ("wget", "miku-net"), ("curl", "miku-net"), ("host", "miku-net"),
     ("ntpdate", "miku-net"), ("ping", "miku-net"), ("traceroute", "miku-net"),
 ];
 
 fn build_ldmiku(root: &Path, low_ram: bool) {
-    let ldmiku_dir = root.join("lib/ld-miku");
+    let ldmiku_dir = root.join("lib/runtime/ld-miku");
     if !ldmiku_dir.exists() {
-        panic!("[!] lib/ld-miku/ not found at {} - run builder from miku-os/builder/", ldmiku_dir.display());
+        panic!("[!] lib/runtime/ld-miku/ not found at {} - run builder from miku-os/builder/", ldmiku_dir.display());
     }
 
-    println!("\nBuilding ld-miku.so  (lib/ld-miku/)...");
+    println!("\nBuilding ld-miku.so  (lib/runtime/ld-miku/)...");
 
     let ld_script = ldmiku_dir.join("ld_link.ld");
 
@@ -389,27 +390,27 @@ fn build_ldmiku(root: &Path, low_ram: bool) {
     println!("[ok] ld-miku.so built");
 
     let bin_src = root.join("target/x86_64-miku-ldso/release/ld-miku");
-    let bin_dst = root.join("lib/ld-miku/ld-miku.bin");
+    let bin_dst = root.join("lib/runtime/ld-miku/ld-miku.bin");
     if !bin_src.exists() {
         panic!("ld-miku binary not found at {}", bin_src.display());
     }
     fs::copy(&bin_src, &bin_dst)
         .unwrap_or_else(|e| panic!("Cannot copy ld-miku.bin: {}", e));
-    println!("[ok] ld-miku.bin → lib/ld-miku/ld-miku.bin ({} KB)",
+    println!("[ok] ld-miku.bin → lib/runtime/ld-miku/ld-miku.bin ({} KB)",
         fs::metadata(&bin_dst).unwrap().len() / 1024);
 }
 
-/// vDSO (lib/vdso/): one page of code mapped into every process for
+/// vDSO (lib/runtime/vdso/): one page of code mapped into every process for
 /// `clock_gettime`. Built like ld-miku and embedded with `include_bytes!`,
 /// except `-shared` instead of `-pie` and `--hash-style=sysv`, since DT_HASH's
 /// chain count gives the symbol count
 fn build_vdso(root: &Path, low_ram: bool) {
-    let vdso_dir = root.join("lib/vdso");
+    let vdso_dir = root.join("lib/runtime/vdso");
     if !vdso_dir.exists() {
-        panic!("[!] lib/vdso/ not found at {} - run builder from miku-os/builder/", vdso_dir.display());
+        panic!("[!] lib/runtime/vdso/ not found at {} - run builder from miku-os/builder/", vdso_dir.display());
     }
 
-    println!("\nBuilding vdso  (lib/vdso/)...");
+    println!("\nBuilding vdso  (lib/runtime/vdso/)...");
 
     let ld_script = vdso_dir.join("vdso.ld");
 
@@ -442,36 +443,28 @@ fn build_vdso(root: &Path, low_ram: bool) {
     }
 
     let bin_src = root.join("target/x86_64-miku-vdso/release/vdso");
-    let bin_dst = root.join("lib/vdso/vdso.bin");
+    let bin_dst = root.join("lib/runtime/vdso/vdso.bin");
     if !bin_src.exists() {
         panic!("vdso binary not found at {}", bin_src.display());
     }
     fs::copy(&bin_src, &bin_dst)
         .unwrap_or_else(|e| panic!("Cannot copy vdso.bin: {}", e));
-    println!("[ok] vdso.bin → lib/vdso/vdso.bin ({} bytes)",
+    println!("[ok] vdso.bin → lib/runtime/vdso/vdso.bin ({} bytes)",
         fs::metadata(&bin_dst).unwrap().len());
 }
 
-/// Library names from lib/mikulibs/libs.list, also read by
-/// lib/mikulibs/build.rs, lib/miku/build.rs, and the root build.rs
+/// Library names from lib/runtime/libmiku/libs.list
 fn miku_libs(root: &Path) -> Vec<String> {
-    let list = root.join("lib/mikulibs/libs.list");
-    let src = fs::read_to_string(&list)
-        .unwrap_or_else(|e| panic!("cannot read {}: {}", list.display(), e));
-    src.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.split(':').next().unwrap().trim().to_string())
-        .collect()
+    miku_buildgen::libs::read(&root.join("lib/runtime/libmiku")).into_iter().map(|l| l.name).collect()
 }
 
-fn build_mikulibs(root: &Path, low_ram: bool) {
-    let mikulibs_dir = root.join("lib/mikulibs");
-    if !mikulibs_dir.exists() {
-        panic!("[!] lib/mikulibs/ not found at {} - run builder from miku-os/builder/", mikulibs_dir.display());
+fn build_libmiku(root: &Path, low_ram: bool) {
+    let libmiku_dir = root.join("lib/runtime/libmiku");
+    if !libmiku_dir.exists() {
+        panic!("[!] lib/runtime/libmiku/ not found at {} - run builder from miku-os/builder/", libmiku_dir.display());
     }
 
-    println!("\nBuilding miku libraries  (lib/mikulibs/)...");
+    println!("\nBuilding miku libraries  (lib/runtime/libmiku/)...");
 
     let rustflags = [
         "-C relocation-model=pic",
@@ -487,7 +480,7 @@ fn build_mikulibs(root: &Path, low_ram: bool) {
     ].join(" ");
 
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(&mikulibs_dir)
+    cmd.current_dir(&libmiku_dir)
         .env("RUSTFLAGS", &rustflags)
         .arg("+nightly")
         .arg("build")
@@ -499,23 +492,23 @@ fn build_mikulibs(root: &Path, low_ram: bool) {
 
     if low_ram { cmd.arg("--jobs").arg("1"); }
 
-    if !cmd.status().expect("cargo build mikulibs failed").success() {
-        panic!("mikulibs compilation failed");
+    if !cmd.status().expect("cargo build libmiku failed").success() {
+        panic!("libmiku compilation failed");
     }
     println!("[ok] miku libraries built");
 
-    let libs_dir = root.join("lib/mikulibs/libs");
+    let libs_dir = root.join("lib/runtime/libmiku/libs");
     fs::create_dir_all(&libs_dir)
         .unwrap_or_else(|e| panic!("Cannot create {}: {}", libs_dir.display(), e));
     for lib in miku_libs(root) {
-        let bin_src = mikulibs_dir.join(format!("target/x86_64-miku-lib/release/{}", lib));
+        let bin_src = libmiku_dir.join(format!("target/x86_64-miku-lib/release/{}", lib));
         let bin_dst = libs_dir.join(format!("{}.so", lib));
         if !bin_src.exists() {
             panic!("{} binary not found at {}", lib, bin_src.display());
         }
         fs::copy(&bin_src, &bin_dst)
             .unwrap_or_else(|e| panic!("Cannot copy {}.so: {}", lib, e));
-        println!("[ok] {}.so → lib/mikulibs/libs/{}.so ({} KB)",
+        println!("[ok] {}.so → lib/runtime/libmiku/libs/{}.so ({} KB)",
             lib, lib, fs::metadata(&bin_dst).unwrap().len() / 1024);
     }
 }
@@ -1018,9 +1011,9 @@ fn provision_root_disk(root: &Path, disk_path: &Path, size_mb: u32) {
 
         // ext4 with a journal, since a running machine writes to this image,
         // unlike the read-only module. `^resize_inode` stays because
-        // `lib/extfs` has no resize. Otherwise e2fsprogs defaults (extents,
+        // `lib/fs/extfs` has no resize. Otherwise e2fsprogs defaults (extents,
         // dir_index, metadata_csum), covered by
-        // `lib/extfs/tests/mke2fs_image.rs`
+        // `lib/fs/extfs/tests/mke2fs_image.rs`
         let ok = Command::new("mke2fs")
             .args([
                 "-q", "-F",
@@ -1253,7 +1246,7 @@ fn main() {
     check_grub_mkrescue();
     build_ldmiku(&root, low_ram);
     build_vdso(&root, low_ram);
-    build_mikulibs(&root, low_ram);
+    build_libmiku(&root, low_ram);
     build_userspace(&root, low_ram);
     build_kernel(&root, low_ram);
     create_iso(&root);

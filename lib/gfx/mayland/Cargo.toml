@@ -1,0 +1,30 @@
+# libmay: the display protocol, as a library
+#
+# Everything a program needs to talk to the compositor, and the half of it the
+# compositor needs to be talked to. One crate, compiled for whichever target
+# asks: `x86_64-unknown-none` for the kernel and `x86_64-miku-app` for the
+# programs.
+[package]
+name    = "libmay"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+# The ring-3 syscall surface, for the one thing in here that needs a filesystem:
+# `manifest`, which has to list a directory to find the config's drop-in files.
+# Optional because the kernel links this crate too and has no `miku` under it:
+# the kernel takes the trait and gives it its own answers, which is also how the
+# selftest exercises the layering with no disk
+[dependencies]
+miku = { path = "../../sdk/miku", optional = true }
+miku-abi = { path = "../../abi" }
+
+[features]
+userspace = ["dep:miku"]
+
+# The font is rasterised here rather than in each consumer's build script, so
+# the console and a client drawing its own text share one set of glyph tables
+[build-dependencies]
+fontdue = "0.9"

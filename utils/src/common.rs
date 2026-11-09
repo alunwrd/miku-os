@@ -17,14 +17,14 @@ use miku::MikuStat;
 
 /// File kinds, as in `MikuStat::kind` and `MikuDirent::kind` (kernel's
 /// `VNodeKind`)
-pub const KIND_REGULAR: u8 = 0;
+pub use miku_abi::kstat::KIND_REGULAR;
 pub const KIND_DIR:     u8 = 1;
-pub const KIND_SYMLINK: u8 = 2;
+pub use miku_abi::kstat::KIND_SYMLINK;
 pub const KIND_CHAR:    u8 = 3;
 pub const KIND_BLOCK:   u8 = 4;
-pub const KIND_PIPE:    u8 = 5;
-pub const KIND_SOCKET:  u8 = 6;
-pub const KIND_FIFO:    u8 = 7;
+pub use miku_abi::kstat::KIND_PIPE;
+pub use miku_abi::kstat::KIND_SOCKET;
+pub use miku_abi::kstat::KIND_FIFO;
 
 /// Longest path buffer for a syscall
 const PATH_MAX: usize = 256;
@@ -260,11 +260,11 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, i64> {
 }
 
 // Open flags (`kernel/fs/vfs/types.rs`)
-pub const O_READ:   u32 = 0x0001;
-pub const O_WRITE:  u32 = 0x0002;
-pub const O_APPEND: u32 = 0x0004;
-pub const O_CREATE: u32 = 0x0008;
-pub const O_TRUNC:  u32 = 0x0020;
+pub const O_READ: u32 = miku_abi::fcntl::O_RDONLY as u32;
+pub const O_WRITE: u32 = miku_abi::fcntl::O_WRONLY as u32;
+pub const O_APPEND: u32 = miku_abi::fcntl::O_APPEND as u32;
+pub const O_CREATE: u32 = miku_abi::fcntl::O_CREAT as u32;
+pub const O_TRUNC: u32 = miku_abi::fcntl::O_TRUNC as u32;
 
 pub fn open(path: &str, flags: u32, mode: u32) -> Result<i64, i64> {
     let c = match cpath(path) { Some(c) => c, None => return Err(-36) };

@@ -174,7 +174,7 @@ in `do_exec` matters:
 ### What programs use
 
 Ring-3 programs use **`fork` + `execve`**. Rust's
-`std::process::Command` (`lib/rust-std/library/std/src/sys/process/miku.rs`)
+`std::process::Command` (`lib/sdk/rust-std/library/std/src/sys/process/miku.rs`)
 builds argv, envp and every path before the `fork` (the child is
 single-threaded and must not allocate), and reports an `execve` failure to the
 parent over a close-on-exec pipe. `msh`, `mikudod`, `mayterm` and `mikupkg`
@@ -273,7 +273,7 @@ The status is written as a **64-bit** POSIX word: `code << 8` for an exit,
 the signal number for a death by signal, `0x7f | sig << 8` for a stop. This
 replaced, on 2026-09-17, the old practice of reporting the raw code and
 spelling a signal death as `128 + sig`, which could not tell `exit(137)` from
-`SIGKILL`. `lib/miku`'s `proc::exited`, `signalled`, `stopped`,
+`SIGKILL`. `lib/sdk/miku`'s `proc::exited`, `signalled`, `stopped`,
 `exit_code`, `term_sig`, `stop_sig` decode it, and `wait_status_code` gives
 back the `128 + sig` number a shell prints.
 
@@ -296,12 +296,12 @@ zero. The new task:
 cannot unmap the stack it stands on, and a detached thread has nobody to do it
 later, so this is how `std::thread` frees a dropped thread's stack.
 
-**libmiku** (`lib/libmiku/thread.rs`): `miku_thread_spawn` and
+**libmiku** (`lib/runtime/libmiku/core/thread.rs`): `miku_thread_spawn` and
 `miku_thread_spawn_owned` map a stack with a 4096-byte guard page below it
 (at least 8 KiB usable), build the new thread's TLS block by copying the
 template the caller's own block describes (`tp + 8 .. tp + 32`), and start the
 thread in a trampoline that calls `thread_exit` when the function returns.
-`libc_miku`'s pthreads (`lib/libmiku/c/pthread.rs`) and Rust's `std::thread`
+`libc_miku`'s pthreads (`lib/runtime/libmiku/libc/pthread.rs`) and Rust's `std::thread`
 sit on top; see [sdk.md](sdk.md).
 
 Rules that follow from the model:
@@ -396,8 +396,7 @@ a relocation pointing at kernel memory, a `DT_RELASZ` large enough to hang the
 machine, an entry point that would fault `sysret` in ring 0, RELRO outside the
 image, and more. Placement cases load into a throwaway address space that is
 freed after each case. Run it with `elf test` in the kernel console or
-`run=elf_test` on the boot line ([testing.md](testing.md)). One RELRO case is
-a known failure that predates the current work.
+`run=elf_test` on the boot line ([testing.md](testing.md)).
 
 ---
 
@@ -461,7 +460,7 @@ The design, decisions and history are in
 
 ### Who keeps what
 
-| Kernel (`kernel/process/signal/`) | `sys_miku.so` (`lib/libmiku/signal.rs`) |
+| Kernel (`kernel/process/signal/`) | `sys_miku.so` (`lib/runtime/libmiku/sys/signal.rs`) |
 |---|---|
 | disposition per signal, 2 bits each in one `u64` (`sig_disp`): default, ignore, catch | the handler table (`miku_signal`, `miku_sigaction`) |
 | `SA_ONSTACK` per signal (`sig_onstack`) | `sa_mask`, `SA_NODEFER`, `SA_RESETHAND`, `SA_SIGINFO` |
@@ -518,7 +517,7 @@ zone, or on the alternate stack:
 The full offsets are in [ABI §5](../MikuOS_ABI.md#5-structures). The shape is
 Linux's so that crates reading a machine context (wasmtime is the motivating
 one) need only `target_os = "miku"` in a `cfg`; the reader's side is
-`lib/rust-libc/libc/src/unix/miku/mod.rs`.
+`lib/abi/src/`.
 
 The kernel owns the general registers; the stub owns the FPU: it `fxsave`s
 into the frame, calls `handler(sig, siginfo_t *, ucontext_t *)`, `fxrstor`s,
@@ -598,7 +597,7 @@ are in [input-and-terminals.md](input-and-terminals.md).
 ## The vDSO
 
 Two pages mapped into every process at a random address, the same physical
-frames everywhere (`kernel/process/vdso.rs`, `lib/vdso/`):
+frames everywhere (`kernel/process/vdso.rs`, `lib/runtime/vdso/`):
 
 - **vvar** (one page below the code, read-only, no-execute) holds the time
   data: magic `MIKU`, version 2, a seqlock word, the TSC frequency, a
@@ -610,13 +609,13 @@ frames everywhere (`kernel/process/vdso.rs`, `lib/vdso/`):
 The code finds its data by subtracting one page from its own base, so nothing
 else needs to tell it where the page is. Readers take the seqlock: read `seq`,
 retry while odd, read the fields, retry if `seq` changed. The layout is one
-file, `lib/vdso/src/abi.rs`, included verbatim by both the kernel writer and
+file, `lib/abi/src/vvar.rs`, included verbatim by both the kernel writer and
 the vDSO reader. Each function falls back to the system call when the data is
 unusable (TSC uncalibrated, wall clock not set, magic or version wrong), and
 `__vdso_getcpu` uses `RDTSCP` only when the feature bit says the CPU has it
 (QEMU's default `qemu64` CPU does not, and executing it there was a `SIGILL`).
 The program finds the vDSO through `AT_SYSINFO_EHDR`; libmiku looks the symbols
-up once (`lib/libmiku/auxv.rs`). The table of fields is in
+up once (`lib/runtime/libmiku/core/auxv.rs`). The table of fields is in
 [ABI §7.7](../MikuOS_ABI.md#77-the-vdso).
 
 ---
@@ -843,11 +842,11 @@ Every other bit of `flags`, and a non-zero `reserved`, is `EINVAL`.
 | Signal frame layout | `kernel/process/signal/frame.rs` |
 | Exception entry from ring 3, `cld` | `kernel/arch/x86_64/trap.rs`, `interrupts.rs` |
 | FPU state | `kernel/arch/x86_64/fpu.rs` |
-| vDSO | `kernel/process/vdso.rs`, `lib/vdso/src/abi.rs`, `lib/vdso/src/main.rs` |
+| vDSO | `kernel/process/vdso.rs`, `lib/abi/src/vvar.rs`, `lib/runtime/vdso/src/main.rs` |
 | Credentials, capabilities | `kernel/process/cred.rs` |
 | Sessions | `kernel/process/session.rs` |
 | Crash reports and cores | `kernel/process/crash.rs`, `kernel/process/coredump.rs`, `kernel/process/symbols.rs` |
 | Syscall entry and dispatch | `kernel/syscall/mod.rs` |
-| libmiku threads and futex wrappers | `lib/libmiku/thread.rs` |
-| libmiku signals (handler table, mask) | `lib/libmiku/signal.rs` |
-| Rust std's process spawning | `lib/rust-std/library/std/src/sys/process/miku.rs` |
+| libmiku threads and futex wrappers | `lib/runtime/libmiku/core/thread.rs` |
+| libmiku signals (handler table, mask) | `lib/runtime/libmiku/sys/signal.rs` |
+| Rust std's process spawning | `lib/sdk/rust-std/library/std/src/sys/process/miku.rs` |

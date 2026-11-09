@@ -70,7 +70,7 @@ The early phase of `kernel_main`, in order:
 
 | Step | What happens |
 |---|---|
-| `earlycon::init`, stack guard | `[kern] MikuOS starting (Release v1.0.0)` |
+| `earlycon::init`, stack guard | `[kern] MikuOS starting (Release v1.0.1)` |
 | `gdt` | The kernel's GDT and TSS |
 | `sse` | CR0.EM off, CR0.MP, CR4.OSFXSR and OSXMMEXCPT on |
 | `cpu guards` | CR0.WP, SMEP and SMAP on where the CPU has them (`nosmep`/`nosmap` turn them off); `[cpu] CR0.WP=on SMEP=on SMAP=on` and a `[cpu] CET:` line (CET is detected, never enabled) |

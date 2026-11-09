@@ -6,20 +6,20 @@ use crate::syscall::errno::{err, EACCES, EAGAIN, ECHILD, EFAULT, EINTR, EINVAL, 
 use crate::syscall::usercopy::{current_cr3, current_pid, read_user_argv, read_user_path, user_ptr_writable};
 use crate::mm::vmm::AddressSpace;
 
-const WNOHANG: u64 = 1;
+const WNOHANG: u64 = miku_abi::wait::WNOHANG as u64;
 /// Reports a child that stopped, as well as one that exited
-const WUNTRACED: u64 = 2;
+const WUNTRACED: u64 = miku_abi::wait::WUNTRACED as u64;
 
 // What a status word says
 //
-// POSIX's layout, which `WIFEXITED` and its neighbours in `lib/miku` take
+// POSIX's layout, which `WIFEXITED` and its neighbours in `lib/sdk/miku` take
 // apart:
 //
 //   exited     code << 8
 //   signalled  sig                (the low seven bits)
 //   stopped    0x7f | (sig << 8)
 //
-// Shared with `docs/MikuOS_ABI.md`, `lib/libmiku`, `lib/miku`, msh, mikudod and
+// Shared with `docs/MikuOS_ABI.md`, `lib/runtime/libmiku`, `lib/sdk/miku`, msh, mikudod and
 // mikuD's restart rule
 
 /// The exit code a process recorded, as a status word
@@ -378,44 +378,18 @@ pub fn sys_capset(permitted: u64, effective: u64, bounding: u64) -> u64 {
 // in. LIST and CURRENT require nothing: they are `who`.
 
 /// Open a session. `arg` is the leader pid (0 for a console session)
-pub const SESSION_OPEN: u64 = 0;
+pub use miku_abi::kproc::SESSION_OPEN;
 /// End one. `arg` is the id, or 0 for the caller's own
-pub const SESSION_CLOSE: u64 = 1;
+pub use miku_abi::kproc::SESSION_CLOSE;
 /// Copy out the open sessions. `ptr`/`len` are an array of `SessionInfo`
-pub const SESSION_LIST: u64 = 2;
+pub use miku_abi::kproc::SESSION_LIST;
 /// The session a process is in. `arg` is a pid, or 0 for the caller. 0 back
 /// means "in no session"
-pub const SESSION_CURRENT: u64 = 3;
+pub use miku_abi::kproc::SESSION_CURRENT;
 
-/// What ring 3 passes for SESSION_OPEN
-///
-/// A struct: six numbers and a group list, which callers would pass in the
-/// wrong order positionally
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SessionRequest {
-    pub uid: u16,
-    pub gid: u16,
-    pub kind: u8,
-    pub seat: u8,
-    pub ngroups: u8,
-    pub _pad: u8,
-    pub groups: [u16; MAX_GROUPS],
-}
+pub use miku_abi::kproc::SessionRequest;
 
-/// What SESSION_LIST copies back
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct SessionInfo {
-    pub id: u32,
-    pub uid: u16,
-    pub gid: u16,
-    pub kind: u8,
-    pub seat: u8,
-    pub _pad: [u8; 2],
-    pub leader: u64,
-    pub opened_tick: u64,
-}
+pub use miku_abi::kproc::SessionInfo;
 
 /// Stops the machine. `action` is 0 for off, 1 for reboot
 ///
@@ -701,8 +675,8 @@ pub fn sys_uptime() -> u64 {
 // CLOCK_MONOTONIC is the TSC to the nanosecond, the reading and arithmetic of
 // the vDSO. CLOCK_REALTIME is anchored to a tick (4 ms at 250 Hz); tv_nsec is
 // filled from the tick remainder, and the vDSO's realtime is the precise one
-pub const CLOCK_REALTIME:  u64 = 0;
-pub const CLOCK_MONOTONIC: u64 = 1;
+pub const CLOCK_REALTIME: u64 = miku_abi::time::CLOCK_REALTIME as u64;
+pub const CLOCK_MONOTONIC: u64 = miku_abi::time::CLOCK_MONOTONIC as u64;
 
 pub fn sys_clock_gettime(clock_id: u64, ts_ptr: u64) -> u64 {
     let cr3 = current_cr3();
@@ -1461,7 +1435,7 @@ fn do_exec(
 // Everybody may call it: process names and pids are what `ps` shows on every
 // Unix. Nothing about a process's memory is here: no addresses, no brk, no
 // stack pointer
-pub const PROCINFO_SIZE: u64 = 72;
+pub const PROCINFO_SIZE: u64 = core::mem::size_of::<miku_abi::kproc::ProcInfo>() as u64;
 
 // 105  proc_path(pid, buf, len) -> bytes written | -errno
 //
@@ -1518,25 +1492,26 @@ pub fn sys_procinfo(buf_ptr: u64, max: u64) -> u64 {
         let ppid = crate::sched::get_ppid(s.pid);
         // One letter, as `ps` has always spelled a state: R S B D Z
         let state = s.state.as_bytes().first().copied().unwrap_or(b'?');
-        unsafe {
-            let p = (buf_ptr + n * PROCINFO_SIZE) as *mut u8;
-            core::ptr::write_bytes(p, 0, PROCINFO_SIZE as usize);
-            (p as *mut u64).write_unaligned(s.pid);
-            (p.add(8)  as *mut u64).write_unaligned(ppid);
-            (p.add(16) as *mut u64).write_unaligned(pgid);
-            (p.add(24) as *mut u64).write_unaligned(s.cpu_time);
-            (p.add(32) as *mut u16).write_unaligned(uid);
-            *p.add(34) = state;
-            *p.add(35) = s.priority;
-            (p.add(36) as *mut u32).write_unaligned(s.cpu_pct_x10);
+        let mut rec = miku_abi::kproc::ProcInfo {
+            pid: s.pid,
+            ppid,
+            pgid,
+            cpu_time: s.cpu_time,
+            uid,
+            state,
+            priority: s.priority,
+            cpu_pct_x10: s.cpu_pct_x10,
             // Which terminal it is at, so `ps` can answer the question its TTY
             // column has always answered. A raw `TtyId`; 0 is "no terminal",
             // which is what a daemon has
-            (p.add(40) as *mut u32).write_unaligned(crate::sched::ctty_of(s.pid));
-            let name = s.name.as_bytes();
-            let len = name.len().min(23);
-            core::ptr::copy_nonoverlapping(name.as_ptr(), p.add(44), len);
-        }
+            tty: crate::sched::ctty_of(s.pid),
+            name: [0; 24],
+            _pad: [0; 4],
+        };
+        let name = s.name.as_bytes();
+        let len = name.len().min(rec.name.len() - 1);
+        rec.name[..len].copy_from_slice(&name[..len]);
+        unsafe { (buf_ptr as *mut miku_abi::kproc::ProcInfo).add(n as usize).write_unaligned(rec) };
         n += 1;
     }
     n

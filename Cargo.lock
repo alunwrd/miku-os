@@ -117,6 +117,9 @@ dependencies = [
 [[package]]
 name = "fshost"
 version = "0.1.0"
+dependencies = [
+ "miku-base",
+]
 
 [[package]]
 name = "hashbrown"
@@ -156,6 +159,10 @@ dependencies = [
 [[package]]
 name = "ld-miku"
 version = "0.2.10"
+dependencies = [
+ "miku-abi",
+ "miku-base",
+]
 
 [[package]]
 name = "libmay"
@@ -163,6 +170,7 @@ version = "0.1.0"
 dependencies = [
  "fontdue",
  "miku",
+ "miku-abi",
 ]
 
 [[package]]
@@ -183,10 +191,26 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 [[package]]
 name = "miku"
 version = "0.2.10"
+dependencies = [
+ "miku-abi",
+ "miku-buildgen",
+]
+
+[[package]]
+name = "miku-abi"
+version = "1.0.1"
+
+[[package]]
+name = "miku-base"
+version = "1.0.1"
+
+[[package]]
+name = "miku-buildgen"
+version = "1.0.1"
 
 [[package]]
 name = "miku-os-release"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "btrfs",
  "extfs",
@@ -195,6 +219,9 @@ dependencies = [
  "lazy_static",
  "libmay",
  "log",
+ "miku-abi",
+ "miku-base",
+ "miku-buildgen",
  "mikunet",
  "noto-sans-mono-bitmap",
  "pc-keyboard",
@@ -208,6 +235,7 @@ dependencies = [
 name = "mikunet"
 version = "0.1.0"
 dependencies = [
+ "miku-base",
  "spin",
 ]
 
@@ -316,6 +344,9 @@ checksum = "2c591d83f69777866b9126b24c6dd9a18351f177e49d625920d19f989fd31cf8"
 [[package]]
 name = "vdso"
 version = "0.2.10"
+dependencies = [
+ "miku-abi",
+]
 
 [[package]]
 name = "volatile"

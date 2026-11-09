@@ -78,7 +78,7 @@ Design notes: [`dev/fs-architecture.md`](../../dev/fs-architecture.md) (layers, 
   kernel/fs/vfs     MikuVFS: vnodes, names, descriptors, page caches
   ----------------------------------------------------------- trait FileSystem
   kernel/fs/ext     fsimpl.rs  |  kernel/fs/btrfs  |  kernel/fs/memfs.rs
-  lib/extfs         the format |  lib/btrfs        |
+  lib/fs/extfs         the format |  lib/fs/btrfs        |
   ----------------------------------------------------------- trait ExtHost / BlockHost
   kernel/io/block   block cache, blk-mq, bdflush
   ----------------------------------------------------------- trait BlockDriver

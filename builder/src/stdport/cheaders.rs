@@ -1,12 +1,14 @@
 //! Generated C header constants and declaration checks
 //!
-//! `generate`: reads `pub const NAME: type = value;` from
-//! `lib/rust-libc/libc/src/unix/miku/mod.rs`, what `libc_miku.so` uses, and
-//! writes them to `target/miku-c/include/bits/<group>.h`, since MikuOS's values
+//! `generate`: reads `pub const NAME: type = value;` from `lib/abi/src/<file>.rs`
+//! and writes them to `target/miku-c/include/bits/<file>.h`, since MikuOS's values
 //! differ from Linux's.
 //!
 //! `check_declarations`: every function a header declares must be defined by a
-//! MikuOS library, checked against `lib/miku`'s link stubs.
+//! MikuOS library, checked against `lib/sdk/miku`'s link stubs.
+//!
+//! `check_signatures`: `std` and `libc` declare their own functions, and those
+//! must agree with the definitions.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,75 +17,24 @@ use std::process::Command;
 
 use super::fsx::write_if_changed;
 
-/// Generated headers directory, on `lib/c/miku-cc`'s include path
+/// Generated headers directory, on `lib/sdk/c/miku-cc`'s include path
 pub fn generated_dir(root: &Path) -> PathBuf {
     root.join("target/miku-c/include")
 }
 
-/// How a constant's name says which header it belongs in
-enum Pat {
-    /// Starts with this
-    Prefix(&'static str),
-    /// Is one of these
-    Exact(&'static [&'static str]),
-    /// This, then one or more of `[A-Z0-9]` (`digits_only`: `[0-9]`)
-    Run(&'static str, bool),
-}
-
-const TERMIOS_NAMES: &[&str] = &[
-    "NCCS", "VINTR", "VQUIT", "VERASE", "VKILL", "VEOF", "VTIME", "VMIN", "VSWTC", "VSTART",
-    "VSTOP", "VSUSP", "VEOL", "VREPRINT", "VDISCARD", "VWERASE", "VLNEXT", "VEOL2", "IGNBRK",
-    "BRKINT", "IGNPAR", "PARMRK", "INPCK", "ISTRIP", "INLCR", "IGNCR", "ICRNL", "IUCLC", "IXON",
-    "IXANY", "IXOFF", "IMAXBEL", "IUTF8", "OPOST", "OLCUC", "ONLCR", "OCRNL", "ONOCR", "ONLRET",
-    "OFILL", "OFDEL", "NLDLY", "NL0", "NL1", "CRDLY", "CR0", "CR1", "CR2", "CR3", "TABDLY",
-    "TAB0", "TAB1", "TAB2", "TAB3", "XTABS", "BSDLY", "BS0", "BS1", "VTDLY", "VT0", "VT1",
-    "FFDLY", "FF0", "FF1", "CBAUD", "CSIZE", "CS5", "CS6", "CS7", "CS8", "CSTOPB", "CREAD",
-    "PARENB", "PARODD", "HUPCL", "CLOCAL", "CBAUDEX", "CMSPAR", "CRTSCTS", "ISIG", "ICANON",
-    "XCASE", "ECHO", "ECHOE", "ECHOK", "ECHONL", "NOFLSH", "TOSTOP", "ECHOCTL", "ECHOPRT",
-    "ECHOKE", "FLUSHO", "PENDIN", "IEXTEN", "EXTPROC", "TCSANOW", "TCSADRAIN", "TCSAFLUSH",
-    "TCIFLUSH", "TCOFLUSH", "TCIOFLUSH", "TCOOFF", "TCOON", "TCIOFF", "TCION",
+/// The `lib/abi/src` files with a generated header
+const HEADERS: &[&str] = &[
+    "auxv", "errno", "fcntl", "inet", "ioctl", "limits", "mman", "netdb", "poll", "random",
+    "resource", "signal", "socket", "stat", "stdlib", "termios", "time", "unistd", "wait",
 ];
 
-use Pat::*;
+/// In a file, what follows this line stays out of C
+const RUST_ONLY: &str = "// Below: for Rust only";
 
-/// In order: the first matching group is a name's header
-const GROUPS: &[(&str, &[Pat])] = &[
-    ("termios", &[Exact(TERMIOS_NAMES), Run("B", true)]),
-    ("errno", &[Run("E", false)]),
-    ("fcntl", &[Prefix("O_"),
-        Exact(&["F_DUPFD", "F_GETFD", "F_SETFD", "F_GETFL", "F_SETFL", "F_GETLK", "F_SETLK",
-                "F_SETLKW", "F_RDLCK", "F_WRLCK", "F_UNLCK", "F_DUPFD_CLOEXEC", "F_GETPATH"]),
-        Exact(&["FD_CLOEXEC"]), Prefix("AT_"), Prefix("LOCK_")]),
-    ("stat", &[Prefix("S_I"), Prefix("UTIME_")]),
-    ("unistd", &[Prefix("SEEK_"), Exact(&["R_OK", "W_OK", "X_OK", "F_OK"]), Prefix("_SC_"),
-        Exact(&["STDIN_FILENO", "STDOUT_FILENO", "STDERR_FILENO"])]),
-    ("mman", &[Prefix("PROT_"),
-        Exact(&["MAP_SHARED", "MAP_PRIVATE", "MAP_FIXED", "MAP_ANONYMOUS", "MAP_ANON"]),
-        Prefix("MADV_"), Prefix("POSIX_MADV_"), Exact(&["MS_ASYNC", "MS_SYNC", "MS_INVALIDATE"])]),
-    ("socket", &[Prefix("AF_"), Prefix("PF_"), Prefix("SOCK_"), Prefix("SOL_"), Prefix("SO_"),
-        Prefix("MSG_"), Prefix("SHUT_"), Prefix("SCM_"), Exact(&["SOMAXCONN"])]),
-    ("in", &[Prefix("IPPROTO_"), Prefix("IP_"), Prefix("IPV6_"), Prefix("TCP_"), Prefix("INADDR_")]),
-    ("netdb", &[Prefix("EAI_"), Prefix("AI_")]),
-    ("random", &[Prefix("GRND_")]),
-    ("time", &[Prefix("CLOCK_")]),
-    ("signal", &[Run("SIG", false), Prefix("SA_"), Exact(&["SIG_BLOCK", "SIG_UNBLOCK", "SIG_SETMASK"])]),
-    ("resource", &[Prefix("RLIMIT_")]),
-    ("poll", &[Prefix("POLL")]),
-    ("ioctl", &[Prefix("FIO"), Prefix("TIOC")]),
-    ("stdlib", &[Exact(&["EXIT_SUCCESS", "EXIT_FAILURE"])]),
-];
-
-fn matches(p: &Pat, name: &str) -> bool {
-    match p {
-        Prefix(x) => name.starts_with(x),
-        Exact(xs) => xs.contains(&name),
-        Run(x, digits) => name.strip_prefix(x).is_some_and(|r| !r.is_empty() && r.chars().all(|c|
-            c.is_ascii_digit() || (!digits && c.is_ascii_uppercase()))),
-    }
-}
-
-fn group_of(name: &str) -> Option<&'static str> {
-    GROUPS.iter().find(|(_, pats)| pats.iter().any(|p| matches(p, name))).map(|(g, _)| *g)
+/// `NAME = value;`, a line of the errno table
+fn parse_table_row(line: &str) -> Option<(&str, &str)> {
+    let (name, value) = line.trim().strip_suffix(';')?.split_once(" = ")?;
+    name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()).then_some((name, value))
 }
 
 /// `pub const NAME: type = value;` -> `(NAME, value)`
@@ -135,31 +86,25 @@ fn c_value(expr: &str) -> Option<String> {
     (ok && !out.is_empty()).then_some(out)
 }
 
-/// Writes `bits/<group>.h` for each group, only when changed
+/// Writes `bits/<file>.h` for each of `HEADERS`, only when changed
 pub fn generate(root: &Path) -> Result<(), String> {
-    let src = root.join("lib/rust-libc/libc/src/unix/miku/mod.rs");
-    let text = fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?;
-    let mut found: BTreeMap<&str, Vec<(String, String)>> = GROUPS.iter().map(|(g, _)| (*g, Vec::new())).collect();
-    for line in text.lines() {
-        let Some((name, expr)) = parse_const(line) else { continue };
-        let Some(g) = group_of(name) else { continue };
-        if let Some(v) = c_value(expr) {
-            found.get_mut(g).unwrap().push((name.to_string(), v));
-        }
-    }
     let bits = generated_dir(root).join("bits");
-    for (g, _) in GROUPS {
-        let guard = format!("_MIKU_BITS_{}_H", g.to_uppercase());
+    for &h in HEADERS {
+        let src = root.join(format!("lib/abi/src/{h}.rs"));
+        let text = fs::read_to_string(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+        let guard = format!("_MIKU_BITS_{}_H", h.to_uppercase());
         let mut t = vec![
-            "/* generated by the builder (builder/src/stdport/cheaders.rs) from".to_string(),
-            "   lib/rust-libc/libc/src/unix/miku/mod.rs - do not edit */".to_string(),
+            format!("/* generated by the builder from lib/abi/src/{h}.rs - do not edit */"),
             format!("#ifndef {guard}"), format!("#define {guard}"), String::new(),
         ];
-        for (name, v) in &found[g] {
-            t.push(format!("#define {name} ({v})"));
+        for line in text.lines().take_while(|l| !l.starts_with(RUST_ONLY)) {
+            let row = parse_const(line).or_else(|| if h == "errno" { parse_table_row(line) } else { None });
+            if let Some(v) = row.and_then(|(_, expr)| c_value(expr)) {
+                t.push(format!("#define {} ({v})", row.unwrap().0));
+            }
         }
         t.extend(["".to_string(), "#endif".to_string(), String::new()]);
-        let path = bits.join(format!("{g}.h"));
+        let path = bits.join(format!("{h}.h"));
         write_if_changed(&path, &t.join("\n")).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(())
@@ -203,8 +148,8 @@ fn strip_block_comments(s: &str) -> String {
 /// Checks every header function against the library definitions; missing ones
 /// are errors, one per line
 pub fn check_declarations(root: &Path) -> Result<(), String> {
-    let include = root.join("lib/c/include");
-    let stubs = root.join("lib/miku/stubs");
+    let include = root.join("lib/sdk/c/include");
+    let stubs = root.join("lib/sdk/miku/stubs");
     let mut have = std::collections::HashSet::new();
     for e in fs::read_dir(&stubs).map_err(|e| format!("{}: {e}", stubs.display()))?.flatten() {
         if e.path().extension().is_some_and(|x| x == "so") {
@@ -234,7 +179,17 @@ pub fn check_declarations(root: &Path) -> Result<(), String> {
     }
     let missing: Vec<String> = declared.iter()
         .filter(|(n, _)| !have.contains(*n))
-        .map(|(n, h)| format!("lib/c/include/{h}: declares {n}, which no MikuOS library defines"))
+        .map(|(n, h)| format!("lib/sdk/c/include/{h}: declares {n}, which no MikuOS library defines"))
         .collect();
     if missing.is_empty() { Ok(()) } else { Err(missing.join("\n")) }
+}
+
+/// Checks `std`'s and `libc`'s declarations against the definitions
+pub fn check_signatures(root: &Path) -> Result<(), String> {
+    let files = [
+        root.join("lib/sdk/rust-std/library/std/src/sys/pal/miku/abi.rs"),
+        root.join("lib/sdk/rust-libc/libc/src/unix/miku/mod.rs"),
+    ];
+    let refs: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+    miku_buildgen::check::declarations(&root.join("lib/runtime/libmiku"), &refs)
 }

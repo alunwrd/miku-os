@@ -26,56 +26,56 @@ pub use deliver::{
 
 use core::sync::atomic::Ordering;
 
-pub const SIGHUP:  u32 = 1;
-pub const SIGINT:  u32 = 2;
-pub const SIGQUIT: u32 = 3;
+pub const SIGHUP: u32 = miku_abi::signal::SIGHUP as u32;
+pub const SIGINT: u32 = miku_abi::signal::SIGINT as u32;
+pub const SIGQUIT: u32 = miku_abi::signal::SIGQUIT as u32;
 /// `ud2`, or anything else the CPU would not decode
-pub const SIGILL:  u32 = 4;
+pub const SIGILL: u32 = miku_abi::signal::SIGILL as u32;
 /// Integer division by zero
-pub const SIGFPE:  u32 = 8;
-pub const SIGKILL: u32 = 9;
+pub const SIGFPE: u32 = miku_abi::signal::SIGFPE as u32;
+pub const SIGKILL: u32 = miku_abi::signal::SIGKILL as u32;
 /// A page the program may not touch, or a `#GP`
-pub const SIGSEGV: u32 = 11;
+pub const SIGSEGV: u32 = miku_abi::signal::SIGSEGV as u32;
 /// A write to a pipe nobody is reading
 ///
 /// Fatal by default: a program in a pipeline whose reader has gone should stop,
 /// and `yes | head` ends because of this. A shell that arranged to survive it
 /// gets `EPIPE` from the write
-pub const SIGPIPE: u32 = 13;
-pub const SIGTERM: u32 = 15;
-pub const SIGCHLD: u32 = 17;
-pub const SIGCONT: u32 = 18;
-pub const SIGSTOP: u32 = 19;
-pub const SIGTSTP: u32 = 20;
+pub const SIGPIPE: u32 = miku_abi::signal::SIGPIPE as u32;
+pub const SIGTERM: u32 = miku_abi::signal::SIGTERM as u32;
+pub const SIGCHLD: u32 = miku_abi::signal::SIGCHLD as u32;
+pub const SIGCONT: u32 = miku_abi::signal::SIGCONT as u32;
+pub const SIGSTOP: u32 = miku_abi::signal::SIGSTOP as u32;
+pub const SIGTSTP: u32 = miku_abi::signal::SIGTSTP as u32;
 /// A background job tried to read its terminal
-pub const SIGTTIN: u32 = 21;
+pub const SIGTTIN: u32 = miku_abi::signal::SIGTTIN as u32;
 /// ...or to write to it, or to change its settings
-pub const SIGTTOU: u32 = 22;
+pub const SIGTTOU: u32 = miku_abi::signal::SIGTTOU as u32;
 /// The terminal changed shape
 ///
 /// Ignored by default: every signal this table does not name is fatal, and a
 /// window being dragged must not kill what runs in it. A program that wants to
 /// re-lay itself out catches it and asks `TIOCGWINSZ`
-pub const SIGWINCH: u32 = 28;
+pub const SIGWINCH: u32 = miku_abi::signal::SIGWINCH as u32;
 
 // `si_code` for the signals the CPU raises, Linux's numbers. A handler reads
 // them to tell a fault from a `kill`, which has `si_code` 0
 
 /// `SIGFPE`: integer divide by zero
-pub const FPE_INTDIV:  i32 = 1;
+pub use miku_abi::signal::FPE_INTDIV;
 /// `SIGILL`: an illegal opcode
-pub const ILL_ILLOPN:  i32 = 2;
+pub use miku_abi::signal::ILL_ILLOPN;
 /// `SIGSEGV`: no mapping at the address
-pub const SEGV_MAPERR: i32 = 1;
+pub use miku_abi::signal::SEGV_MAPERR;
 /// `SIGSEGV`: a mapping that does not allow this access
-pub const SEGV_ACCERR: i32 = 2;
+pub use miku_abi::signal::SEGV_ACCERR;
 /// `SIGSEGV` from a `#GP`, which has no address to report
-pub const SI_KERNEL:   i32 = 0x80;
+pub use miku_abi::signal::SI_KERNEL;
 
 /// The most signals this kernel knows about. A `pending_sig` is a `u32` of bits
 /// and a disposition table is two bits each in a `u64`, so this is what both
 /// can hold
-pub const NSIG: u32 = 32;
+pub const NSIG: u32 = miku_abi::signal::NSIG as u32;
 
 // What a process wants done about a signal
 //
@@ -87,19 +87,19 @@ pub const NSIG: u32 = 32;
 // disposition the process never asked for.
 
 /// Do whatever the kernel does for this signal when nobody says otherwise
-pub const DISP_DEFAULT: u64 = 0;
+pub use miku_abi::ksignal::SIG_DISP_DEFAULT as DISP_DEFAULT;
 /// Throw it away
-pub const DISP_IGNORE:  u64 = 1;
+pub use miku_abi::ksignal::SIG_DISP_IGNORE as DISP_IGNORE;
 /// Queue it for the userspace dispatcher
-pub const DISP_CATCH:   u64 = 2;
+pub use miku_abi::ksignal::SIG_DISP_CATCH as DISP_CATCH;
 /// Not a disposition: `sigdisp` with this changes nothing and answers with the
 /// one set
-pub const DISP_QUERY:   u64 = 3;
+pub use miku_abi::ksignal::SIG_DISP_QUERY as DISP_QUERY;
 /// Not a disposition either: a bit beside `DISP_CATCH` saying the handler runs
 /// on the task's alternate stack (`SA_ONSTACK`). Kept in a mask word of its own
 /// (`sig_onstack`) so the table stays two bits, and a query answers with it set
 /// when it is
-pub const DISP_ONSTACK: u64 = 4;
+pub use miku_abi::ksignal::SIG_DISP_ONSTACK as DISP_ONSTACK;
 
 /// Signals that cannot be caught, ignored or redirected
 ///

@@ -1,0 +1,17 @@
+# The split miku libraries
+#
+# Format:  <library>: <dependency> <dependency> ...
+# Read through lib/buildgen by this directory's build.rs, lib/sdk/miku, the
+# builder, and the kernel's build.rs. The graph must stay acyclic; build.rs fails
+# on cycles, missing directories, or directories missing from this list.
+
+core_miku:
+sys_miku:   core_miku
+text_miku:  core_miku
+ds_miku:    core_miku
+algo_miku:  core_miku
+codec_miku: core_miku algo_miku
+fs_miku:    core_miku
+net_miku:
+parse_miku: core_miku text_miku
+libc_miku:  core_miku fs_miku sys_miku algo_miku text_miku

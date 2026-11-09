@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2021"
 
 # Its own workspace, and `exclude`d by the repository root, for the reason
-# `lib/libmiku/hosttest/Cargo.toml` gives
+# `lib/runtime/libmiku/hosttest/Cargo.toml` gives
 [workspace]
 
 [lib]

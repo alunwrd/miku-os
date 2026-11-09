@@ -62,7 +62,7 @@ __device__ inline float rounded_box(float px, float py, float hw, float hh, floa
 
 // The window's outline, as Hyprland draws it
 //
-// `libmay::shape` (`lib/mayland/src/shape.rs`) is the definition, from
+// `libmay::shape` (`lib/gfx/mayland/src/shape.rs`) is the definition, from
 // Hyprland's `rounding.glsl` and `border.glsl`; these are the same lines, so
 // the card and the processor cut one corner (`dev/mayland-window-shape.md`).
 // Coordinates are a pixel's centre from the box's top-left. `__powf` is the

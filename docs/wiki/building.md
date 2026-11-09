@@ -21,7 +21,7 @@ MikuOS is built by one host program, `builder/`, which compiles the dynamic load
 | Tool | Used for | Without it |
 |---|---|---|
 | Rust nightly with `rust-src` (through rustup) | Everything: `-Z build-std` for every MikuOS target, `-Z json-target-spec` for the custom targets | Nothing builds. The `std` overlay stops with `rust-src is not installed: rustup component add rust-src --toolchain nightly` |
-| clang | C code in `std` programs (QuickJS in aosh, SQLite, zstd, tree-sitter in Zed) through `lib/c/miku-cc`; the CUDA host check | aosh does not build, so the build fails (aosh is required) |
+| clang | C code in `std` programs (QuickJS in aosh, SQLite, zstd, tree-sitter in Zed) through `lib/sdk/c/miku-cc`; the CUDA host check | aosh does not build, so the build fails (aosh is required) |
 | `llvm-ar` (LLVM) | Archiving that C code (`AR_x86_64_unknown_miku=llvm-ar`, set by `builder/src/stdport/compile.rs`) | as above |
 | `nm` (binutils) | The check that every function a C header declares is defined by a MikuOS library (`builder/src/stdport/cheaders.rs`) | `std` programs do not build |
 | Network access, sometimes | Crate sources the `std` overlay patches (`tokio`, `mio`, `inotify`, `libc`...) that cargo's automatic cache clean has deleted and its cache no longer has; the builder runs `cargo fetch` for them, offline first | aosh does not build, so the build fails; `stdapps` is left out |
@@ -37,7 +37,7 @@ MikuOS is built by one host program, `builder/`, which compiles the dynamic load
 
 **Packages.** On Arch: `rustup clang llvm grub xorriso mtools e2fsprogs qemu-full`, plus `cuda` for the GPU programs. On Debian or Ubuntu: `clang llvm grub-pc-bin grub-common xorriso mtools e2fsprogs qemu-system-x86`, rustup from rustup.rs, and NVIDIA's CUDA packages (the distribution's `nvidia-cuda-toolkit` is usually too old for `sm_120`). The release workflow in `.github/workflows/release.yml` runs on a `v*` tag: it installs `clang llvm xorriso mtools grub-pc-bin grub-common e2fsprogs` on Ubuntu, runs the builder and publishes `miku-os/miku-os.iso`. That image has no NVIDIA firmware and no GPU programs.
 
-**The Rust toolchain.** There is no `rust-toolchain` file. Every script and the builder call `cargo +nightly`, so the installed `nightly` is what builds. The `std` port is written against a reference clone of `library/` pinned to the toolchain's own commit; the tree is built with the nightly whose `rustc +nightly --version` reports `1.98.0-nightly (cb46fbb8c 2026-06-08)`, which is rustup's `nightly-2026-06-09`. The release workflow installs that one and renames its directory to `nightly`, the name the builder calls. A different nightly can compile `std` from different sources than the patch was written against ([../../lib/rust-std/README.md](../../lib/rust-std/README.md)). Install `rust-src` for it: `rustup component add rust-src --toolchain nightly`.
+**The Rust toolchain.** There is no `rust-toolchain` file. Every script and the builder call `cargo +nightly`, so the installed `nightly` is what builds. The `std` port is written against a reference clone of `library/` pinned to the toolchain's own commit; the tree is built with the nightly whose `rustc +nightly --version` reports `1.98.0-nightly (cb46fbb8c 2026-06-08)`, which is rustup's `nightly-2026-06-09`. The release workflow installs that one and renames its directory to `nightly`, the name the builder calls. A different nightly can compile `std` from different sources than the patch was written against ([../../lib/sdk/rust-std/README.md](../../lib/sdk/rust-std/README.md)). Install `rust-src` for it: `rustup component add rust-src --toolchain nightly`.
 
 ## Repository layout
 
@@ -58,20 +58,22 @@ MikuOS is built by one host program, `builder/`, which compiles the dynamic load
 | `kernel/kcore/` | Boot state, clock, locks, kernel log, pstore, backtraces, power, RNG, the firmware store (`kcore/firmware/`) |
 | `kernel/shell/` | The in-kernel emergency shell and its commands; `run=` goes through it |
 | `kernel/setup/` | The installer window |
-| `lib/ld-miku/` | The dynamic loader, embedded in the kernel as `ld-miku.bin` |
-| `lib/vdso/` | The vDSO page, embedded as `vdso.bin` |
-| `lib/mikulibs/` | The ten shared libraries (`core_miku` ... `libc_miku`), listed in `libs.list`, embedded in the kernel and preloaded at boot |
-| `lib/libmiku/` | The ring-3 system library the shared libraries are built from; `hosttest/` |
-| `lib/miku/` | The crate every core-only program links; `x86_64-miku-app.json`, `linker.ld`, and the generated link stubs in `stubs/` (git-ignored) |
-| `lib/rust-std/` | The `std` port: the `x86_64-unknown-miku` target, the `library/` patch, and Zed's patches and files. How they are assembled and built is `builder/src/stdport/` |
-| `lib/rust-libc/`, `lib/rust-rustix/` | Overlays of the `libc` and `rustix` crates for the MikuOS target |
-| `lib/c/` | `miku-cc` (clang for MikuOS), the C headers in `include/`, layout checks in `check/` |
-| `lib/freetype/` | FreeType 2.14.3 for aosh |
-| `lib/mayland/` | `libmay`, the display protocol library linked by the kernel and by clients |
+| `lib/runtime/ld-miku/` | The dynamic loader, embedded in the kernel as `ld-miku.bin` |
+| `lib/runtime/vdso/` | The vDSO page, embedded as `vdso.bin` |
+| `lib/abi/` | The numbers and layouts everything agrees on: syscalls, errno, structures, flags, ELF. No dependencies |
+| `lib/base/`, `lib/crypto/` | Pure algorithms, and the cryptography, shared by whichever layer needs them |
+| `lib/buildgen/` | What build scripts and the builder share: the library list, the export scanner, stubs, shims, declarations |
+| `lib/runtime/libmiku/` | The ten shared libraries (`core_miku` ... `libc_miku`), listed in `libs.list`, embedded in the kernel and preloaded at boot |
+| `lib/sdk/miku/` | The crate every core-only program links; `x86_64-miku-app.json`, `linker.ld`, and the generated link stubs in `stubs/` (git-ignored) |
+| `lib/sdk/rust-std/` | The `std` port: the `x86_64-unknown-miku` target, the `library/` patch, and Zed's patches and files. How they are assembled and built is `builder/src/stdport/` |
+| `lib/sdk/rust-libc/`, `lib/rust-rustix/` | Overlays of the `libc` and `rustix` crates for the MikuOS target |
+| `lib/sdk/c/` | `miku-cc` (clang for MikuOS), the C headers in `include/`, layout checks in `check/` |
+| `lib/gfx/freetype/` | FreeType 2.14.3 for aosh |
+| `lib/gfx/mayland/` | `libmay`, the display protocol library linked by the kernel and by clients |
 | `lib/net/` | `mikunet`: DNS, TLS, HTTP for ring 3, and the protocol code the kernel stack shares |
-| `lib/extfs/`, `lib/btrfs/`, `lib/fshost/` | Filesystem formats and the trait they reach a disk through; host-testable |
-| `lib/mikuauth/` | Password hashing and the account file parsers |
-| `lib/mikupkg/` | The package manager as a library; the builder installs the image with it |
+| `lib/fs/extfs/`, `lib/fs/btrfs/`, `lib/fs/fshost/` | Filesystem formats and the trait they reach a disk through; host-testable |
+| `lib/admin/mikuauth/` | Password hashing and the account file parsers |
+| `lib/admin/mikupkg/` | The package manager as a library; the builder installs the image with it |
 | `lib/buildgen/` | Code the kernel's `build.rs` includes: `imagegen.rs` (pictures compiled in), `qoigen.rs` (wallpapers, icons, the greeter portrait as files), `shadergen.rs` (GPU programs through `nvcc`), `cubin.rs` (the cubin parser the kernel also uses) |
 | `system/` | `msh`, `mayterm`, `maywm`, `maygreet`, `maysession`, `mikudo`, `mikudod`, `login`, `passwd`, `id`, `su`, `useradd`, `mikupkg`, `mikupkg-apply` |
 | `utils/` | The commands: `ls`, `cat`, `cp`, `grep`, `ps`, `mikuctl` and the rest ([commands.md](commands.md)) |
@@ -119,9 +121,9 @@ When both disk images exist, the disk questions are skipped and their current si
 | Step | Function | What it does | Output |
 |---|---|---|---|
 | 1 | `check_grub_mkrescue` | Checks `grub-mkrescue --version` | — |
-| 2 | `build_ldmiku` | `lib/ld-miku`, target `x86_64-miku-ldso.json`, `-Z build-std=core` | `lib/ld-miku/ld-miku.bin` |
-| 3 | `build_vdso` | `lib/vdso`, target `x86_64-miku-vdso.json`, `-shared`, `--hash-style=sysv` | `lib/vdso/vdso.bin` |
-| 4 | `build_mikulibs` | `lib/mikulibs`, target `x86_64-miku-lib.json`, one `.so` per line of `libs.list` | `lib/mikulibs/libs/*.so` |
+| 2 | `build_ldmiku` | `lib/runtime/ld-miku`, target `x86_64-miku-ldso.json`, `-Z build-std=core` | `lib/runtime/ld-miku/ld-miku.bin` |
+| 3 | `build_vdso` | `lib/runtime/vdso`, target `x86_64-miku-vdso.json`, `-shared`, `--hash-style=sysv` | `lib/runtime/vdso/vdso.bin` |
+| 4 | `build_libmiku` | `lib/runtime/libmiku`, target `x86_64-miku-lib.json`, one `.so` per line of `libs.list` | `lib/runtime/libmiku/libs/*.so` |
 | 5 | `build_userspace` | `system/`, `utils/`, `apps/` (core programs), then `stdapps/` and `aosh/` (`std` programs) | `<crate>/target/x86_64-miku-app/release/*`, `<crate>/target/x86_64-unknown-miku/release/*` |
 | 6 | `build_kernel` | `cargo build --release -p miku-os-release --target x86_64-unknown-none -Z build-std=core,compiler_builtins,alloc`; the kernel's `build.rs` also renders wallpapers, icons and the greeter portrait and compiles the GPU programs | `target/x86_64-unknown-none/release/miku-os-release`, `target/{wallpapers,icons,art,gpu}/` |
 | 7 | `create_iso` | Stages the root tree (below), makes `boot/firmware.img`, copies the kernel to `boot/kernel.elf`, copies `grub.cfg` and adds `module2 /boot/firmware.img firmware` after every `multiboot2` line, runs `grub-mkrescue`, removes `iso_root/` | `miku-os/miku-os.iso` |
@@ -169,17 +171,17 @@ A `conf.d` directory under `etc/` ships empty even when the source tree has file
 | Target | Spec | Used by | Built with |
 |---|---|---|---|
 | `x86_64-unknown-none` | built into rustc | The kernel | Root `.cargo/config.toml`: `build-std = core, compiler_builtins, alloc`, `compiler-builtins-mem`; rustflags `-Tlinker.ld --no-dynamic-linker -C relocation-model=static -C force-frame-pointers=yes` |
-| `x86_64-miku-app` | `lib/miku/x86_64-miku-app.json` | Core-only programs (`system`, `utils`, `apps`) | `-Z build-std=core,alloc`; PIE (`-C relocation-model=pic -C link-arg=-pie`), `-z noexecstack`, no red zone, frame pointers, `--build-id=sha1` |
-| `x86_64-unknown-miku` | `lib/rust-std/x86_64-unknown-miku.json` | `std` programs (`stdapps`, `aosh`, Zed) | `builder/src/stdport/`: `-Z build-std=std,panic_abort` from the patched `library/` |
-| `x86_64-miku-ldso` | `lib/ld-miku/x86_64-miku-ldso.json` | The dynamic loader | `-Z build-std=core`, linked with `lib/ld-miku/ld_link.ld` |
-| `x86_64-miku-vdso` | `lib/vdso/x86_64-miku-vdso.json` | The vDSO | `-Z build-std=core`, `-shared`, `lib/vdso/vdso.ld` |
-| `x86_64-miku-lib` | `lib/mikulibs/x86_64-miku-lib.json` | The shared libraries | `-Z build-std=core` |
+| `x86_64-miku-app` | `lib/sdk/miku/x86_64-miku-app.json` | Core-only programs (`system`, `utils`, `apps`) | `-Z build-std=core,alloc`; PIE (`-C relocation-model=pic -C link-arg=-pie`), `-z noexecstack`, no red zone, frame pointers, `--build-id=sha1` |
+| `x86_64-unknown-miku` | `lib/sdk/rust-std/x86_64-unknown-miku.json` | `std` programs (`stdapps`, `aosh`, Zed) | `builder/src/stdport/`: `-Z build-std=std,panic_abort` from the patched `library/` |
+| `x86_64-miku-ldso` | `lib/runtime/ld-miku/x86_64-miku-ldso.json` | The dynamic loader | `-Z build-std=core`, linked with `lib/runtime/ld-miku/ld_link.ld` |
+| `x86_64-miku-vdso` | `lib/runtime/vdso/x86_64-miku-vdso.json` | The vDSO | `-Z build-std=core`, `-shared`, `lib/runtime/vdso/vdso.ld` |
+| `x86_64-miku-lib` | `lib/runtime/libmiku/x86_64-miku-lib.json` | The shared libraries | `-Z build-std=core` |
 
-**The workspace.** The root `Cargo.toml` is the kernel package (`miku-os-release`, version 1.0.0, release profile `opt-level = 2`, `lto = true`, `panic = "abort"`) and a workspace whose members are `lib/ld-miku`, `lib/mayland`, `lib/miku` and `lib/vdso`. Crates that are tested on the host (`lib/net`, `lib/extfs`, `lib/fshost`, `lib/btrfs`, `lib/mikuauth`, `lib/mikupkg`, `lib/libmiku/hosttest`, `kernel/mm/heap/hosttest`) and `builder` are excluded and have their own configs. Program crates (`system`, `utils`, `apps`, `stdapps`, `aosh`) are separate workspaces with their own `target/`.
+**The workspace.** The root `Cargo.toml` is the kernel package (`miku-os-release`, version 1.0.1, release profile `opt-level = 2`, `lto = true`, `panic = "abort"`) and a workspace whose members are `lib/runtime/ld-miku`, `lib/gfx/mayland`, `lib/sdk/miku` and `lib/runtime/vdso`. Crates that are tested on the host (`lib/net`, `lib/fs/extfs`, `lib/fs/fshost`, `lib/fs/btrfs`, `lib/admin/mikuauth`, `lib/admin/mikupkg`, `lib/runtime/libmiku/hosttest`, `kernel/mm/heap/hosttest`) and `builder` are excluded and have their own configs. Program crates (`system`, `utils`, `apps`, `stdapps`, `aosh`) are separate workspaces with their own `target/`.
 
-**The kernel's `build.rs`** generates the preload table of shared libraries from `lib/mikulibs/libs.list` (so the kernel and the builder agree on the set), compiles the mascot picture into the kernel, writes wallpapers and icons as QOI files to `target/wallpapers` and `target/icons`, cuts the greeter portrait to a circle in `target/art`, and runs `shadergen::generate` over `kernel/drivers/gpu/nvidia/shaders/` for `sm_120`, printing one `cargo:warning` line per GPU program with its size, registers, shared memory and constant bank. A `.cu` file can ask for compiler flags on its first line (`// nvcc: --fmad=false`, which `paint.cu` uses). See [../Nvidia_gb206.md](../Nvidia_gb206.md) for the programs.
+**The kernel's `build.rs`** generates the preload table of shared libraries from `lib/runtime/libmiku/libs.list` (so the kernel and the builder agree on the set), compiles the mascot picture into the kernel, writes wallpapers and icons as QOI files to `target/wallpapers` and `target/icons`, cuts the greeter portrait to a circle in `target/art`, and runs `shadergen::generate` over `kernel/drivers/gpu/nvidia/shaders/` for `sm_120`, printing one `cargo:warning` line per GPU program with its size, registers, shared memory and constant bank. A `.cu` file can ask for compiler flags on its first line (`// nvcc: --fmad=false`, which `paint.cu` uses). See [../Nvidia_gb206.md](../Nvidia_gb206.md) for the programs.
 
-**What the kernel embeds.** `lib/ld-miku/ld-miku.bin`, `lib/vdso/vdso.bin` and every `lib/mikulibs/libs/<name>.so` are compiled into the kernel with `include_bytes!`. They have to exist before the kernel builds, which is why the builder builds them first.
+**What the kernel embeds.** `lib/runtime/ld-miku/ld-miku.bin`, `lib/runtime/vdso/vdso.bin` and every `lib/runtime/libmiku/libs/<name>.so` are compiled into the kernel with `include_bytes!`. They have to exist before the kernel builds, which is why the builder builds them first.
 
 ## How each program set is built
 
@@ -189,7 +191,7 @@ A `conf.d` directory under `etc/` ships empty even when the source tree has file
 cd system        # or utils, apps
 RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-z -C link-arg=noexecstack \
   -C no-redzone=y -C force-frame-pointers=yes -C link-arg=--build-id=sha1" \
-cargo +nightly build --release --target ../lib/miku/x86_64-miku-app.json \
+cargo +nightly build --release --target ../lib/sdk/miku/x86_64-miku-app.json \
   -Z json-target-spec -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem \
   --bin msh
 ```
@@ -206,20 +208,20 @@ cargo run --release -- std stdapps --bin stdfs   # anything after the crate (and
 cargo run --release -- overlay                # only assemble target/rust-src-miku
 ```
 
-This is the code the image build runs, `builder/src/stdport/` (it used to be `lib/rust-std/build-std.sh`, `overlay.sh` and five Python scripts). In order:
+This is the code the image build runs, `builder/src/stdport/` (it used to be `lib/sdk/rust-std/build-std.sh`, `overlay.sh` and five Python scripts). In order:
 
 1. **Sources** (`sources.rs`). Cargo deletes an extracted crate source it has not used for a month, and a downloaded `.crate` after three. The overlay's crates are only ever built from their patched copies, so cargo never counts them as used. For every crate the overlay patches, at the version the consumer's `Cargo.lock` pins, a source that is gone is brought back with `cargo fetch` on a throwaway manifest: offline first, which unpacks what the cache still has, then over the network. Cargo records the use, so the next clean leaves them alone.
-2. **Overlay** (`overlay.rs`, `arms.rs`). The toolchain's own `rust-src` `library/` is copied to `target/rust-src-miku/library` and `lib/rust-std/library/` is laid over it. `libc` (newest 0.2 on the machine, plus `lib/rust-libc/libc/`) and `rustix` (newest 1.x) get their arms. Every crate in the `arms` table gets MikuOS beside its neighbour, at every semver line on the machine. Copies keep modification times and skip unchanged files, so cargo does not rebuild what did not change.
-3. **Link stubs.** `lib/miku` is built once so its build script refreshes `lib/miku/stubs/`.
+2. **Overlay** (`overlay.rs`, `arms.rs`). The toolchain's own `rust-src` `library/` is copied to `target/rust-src-miku/library` and `lib/sdk/rust-std/library/` is laid over it. `libc` (newest 0.2 on the machine, plus `lib/sdk/rust-libc/libc/`) and `rustix` (newest 1.x) get their arms. Every crate in the `arms` table gets MikuOS beside its neighbour, at every semver line on the machine. Copies keep modification times and skip unchanged files, so cargo does not rebuild what did not change.
+3. **Link stubs.** `lib/sdk/miku` is built once so its build script refreshes `lib/sdk/miku/stubs/`.
 4. **Stamp.** The patch tree and the target spec are hashed, and `<crate>/target/x86_64-unknown-miku` is deleted when either changed (cargo's `-Z build-std` fingerprints the sources by path and would relink the old `std`).
-5. **C headers** (`cheaders.rs`). `target/miku-c/include/bits/*.h` is generated from `lib/rust-libc/libc/src/unix/miku/mod.rs`, and every function a header declares is checked against the stubs with `nm`.
-6. **cargo.** `CC`/`AR`/`CFLAGS` for the target are set to `lib/c/miku-cc` and `llvm-ar`. Then `cargo +nightly build --release --target lib/rust-std/x86_64-unknown-miku.json -Z build-std=std,panic_abort` runs, with the linker script and stubs passed by absolute path.
+5. **C headers** (`cheaders.rs`). `target/miku-c/include/bits/<file>.h` is generated from `lib/abi/src/<file>.rs`, every function a header declares is checked against the stubs with `nm`, and `std`'s and `libc`'s own declarations are checked against the definitions (`lib/buildgen/src/check.rs`).
+6. **cargo.** `CC`/`AR`/`CFLAGS` for the target are set to `lib/sdk/c/miku-cc` and `llvm-ar`. Then `cargo +nightly build --release --target lib/sdk/rust-std/x86_64-unknown-miku.json -Z build-std=std,panic_abort` runs, with the linker script and stubs passed by absolute path.
 
 Output: `<crate>/target/x86_64-unknown-miku/release/`. See [sdk.md](sdk.md) for writing such programs.
 
 **Zed:** `cargo run --release -- zed build -p zed` (or `zed check -p <crate>`, `zed tree ...`) does the following:
 - copies `refsrc/miku_programs/zed` to `target/zed-miku/src`;
-- applies `lib/rust-std/zed-patches/` with `patch` and copies in `lib/rust-std/zed-files/`;
+- applies `lib/sdk/rust-std/zed-patches/` with `patch` and copies in `lib/sdk/rust-std/zed-files/`;
 - puts MikuOS into Zed's own target lists;
 - assembles its own overlay in `target/zed-miku/rust-src` from the versions Zed's lock pins, and moves the lock onto them;
 - builds into `target/zed-miku/target` with a profile a 16 GB machine can build (`ZED_JOBS`, `ZED_FULL_PROFILE=1` for upstream's).
@@ -343,8 +345,8 @@ Check the device name with `lsblk` first: `dd` overwrites whatever `/dev/sdX` is
 | `no NVIDIA firmware in .../firmware - image will boot without GPU firmware` | Normal on a fresh clone. To add it, see [../Nvidia_gb206.md](../Nvidia_gb206.md#firmware) |
 | `<crate>/ failed to build - the image would ship without those programs` | A program crate failed; the error above it is cargo's |
 | A `cargo build` inside `system/` or `apps/` produces a small static file in `target/x86_64-unknown-none/` | The root config's kernel target was inherited. Build with the command above, or run the builder |
-| A change to `lib/rust-std/library/` is not in the binary | The `std` step should notice through its hash stamp (`std patch changed - rebuilding it`); if a build was interrupted, delete `<crate>/target/x86_64-unknown-miku` |
-| A new `libmiku` function links but is missing at run time | The stubs in `lib/miku/stubs/` were stale. The `std` step rebuilds `lib/miku` first for this reason; for core programs, build `lib/miku` before them |
+| A change to `lib/sdk/rust-std/library/` is not in the binary | The `std` step should notice through its hash stamp (`std patch changed - rebuilding it`); if a build was interrupted, delete `<crate>/target/x86_64-unknown-miku` |
+| A new `libmiku` function links but is missing at run time | The stubs in `lib/sdk/miku/stubs/` were stale. The `std` step rebuilds `lib/sdk/miku` first for this reason; for core programs, build `lib/sdk/miku` before them |
 | `failed to read .../target/rust-src-miku/<crate>-miku/Cargo.toml` | The overlay found no source of that crate. The builder says `still no source for: ...` above it: cargo's cache no longer has the version the lock pins and the download failed. Run again with network access |
 | `<crate> <file>: no ... found - the crate has changed shape` | A crate the overlay patches has a new release whose file no longer has the anchor a row of `builder/src/stdport/arms.rs` looks for. Update that row |
 | The ISO appears to run old code | QEMU booted an attached disk: add `-boot d`. Or `/bin` was replaced on a disk that `root=` does not name, while the boot image still serves `/bin` |

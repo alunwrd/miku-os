@@ -3,7 +3,7 @@
 // The driver is the `extfs` crate. It knows the on-disk format and nothing
 // about this kernel: it reads and writes sectors through the `ExtHost` trait,
 // which `fs::host::KernelHost` implements over the block layer. So
-// `cd lib/extfs && cargo test` builds a filesystem in memory, corrupts it and
+// `cd lib/fs/extfs && cargo test` builds a filesystem in memory, corrupts it and
 // checks the driver, on the code that runs on the machine.
 //
 // Here:

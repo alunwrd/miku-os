@@ -56,9 +56,9 @@ fn infer_filename(url: &str) -> String {
 }
 
 fn write_file(path: &str, data: &[u8]) -> Result<usize, &'static str> {
-    const O_WRITE: u32 = 0x0002;
-    const O_CREATE: u32 = 0x0008;
-    const O_TRUNCATE: u32 = 0x0020;
+    const O_WRITE: u32 = miku_abi::fcntl::O_WRONLY as u32;
+    const O_CREATE: u32 = miku_abi::fcntl::O_CREAT as u32;
+    const O_TRUNCATE: u32 = miku_abi::fcntl::O_TRUNC as u32;
 
     let mut cpath = [0u8; 256];
     let n = path.len().min(cpath.len() - 1);

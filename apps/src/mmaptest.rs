@@ -8,9 +8,9 @@
 pub use miku;
 use miku::*;
 
-const PROT_READ: u64 = 1;
-const PROT_WRITE: u64 = 2;
-const MAP_SHARED: u64 = 1;
+const PROT_READ: u64 = miku_abi::mman::PROT_READ as u64;
+const PROT_WRITE: u64 = miku_abi::mman::PROT_WRITE as u64;
+const MAP_SHARED: u64 = miku_abi::mman::MAP_SHARED as u64;
 
 const PATH: &str = "/mmaptest.dat\0";
 const ORIGINAL: &[u8] = b"ORIGINAL-FILE-CONTENT-1234567890";

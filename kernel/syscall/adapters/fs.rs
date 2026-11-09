@@ -482,17 +482,17 @@ pub fn sys_statfs(path_ptr: u64, path_len: u64, buf_ptr: u64) -> u64 {
         let start = match base.start(vfs) { Ok(v) => v, Err(e) => return e };
         match vfs.statfs(start, &path) {
             Ok(sf) => {
-                unsafe {
-                    let p = buf_ptr as *mut u8;
-                    (p as *mut u32).write(sf.fs_type.magic());
-                    (p.add(4)  as *mut u32).write(sf.block_size);
-                    (p.add(8)  as *mut u64).write(sf.total_blocks);
-                    (p.add(16) as *mut u64).write(sf.free_blocks);
-                    (p.add(24) as *mut u64).write(sf.total_inodes);
-                    (p.add(32) as *mut u64).write(sf.free_inodes);
-                    (p.add(40) as *mut u32).write(sf.max_name_len);
-                    (p.add(44) as *mut u32).write(sf.flags);
-                }
+                let rec = miku_abi::kstat::MikuStatfs {
+                    magic: sf.fs_type.magic(),
+                    block_size: sf.block_size,
+                    total_blocks: sf.total_blocks,
+                    free_blocks: sf.free_blocks,
+                    total_inodes: sf.total_inodes,
+                    free_inodes: sf.free_inodes,
+                    max_name_len: sf.max_name_len,
+                    flags: sf.flags,
+                };
+                unsafe { (buf_ptr as *mut miku_abi::kstat::MikuStatfs).write_unaligned(rec) };
                 0
             }
             Err(e) => vfs_err(e),
@@ -765,9 +765,9 @@ pub fn sys_removexattr(ino: u64, name_ptr: u64, name_len: u64) -> u64 {
 // `tv_nsec` of `UTIME_NOW` or `UTIME_OMIT` means what POSIX says. `flags` takes
 // `AT_SYMLINK_NOFOLLOW`
 pub fn sys_utimensat(path_ptr: u64, path_word: u64, times_ptr: u64, flags: u64) -> u64 {
-    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
-    const UTIME_NOW: i64 = (1 << 30) - 1;
-    const UTIME_OMIT: i64 = (1 << 30) - 2;
+    const AT_SYMLINK_NOFOLLOW: u64 = miku_abi::fcntl::AT_SYMLINK_NOFOLLOW as u64;
+    use miku_abi::stat::UTIME_NOW;
+    use miku_abi::stat::UTIME_OMIT;
     if flags & !AT_SYMLINK_NOFOLLOW != 0 { return err(EINVAL); }
     let (path, base) = match read_user_path_at(path_ptr, path_word) {
         Ok(p)  => p,

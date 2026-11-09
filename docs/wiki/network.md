@@ -61,7 +61,7 @@ MikuOS has an IPv4 network stack. The kernel owns the card, the demultiplexer, A
 | [`kernel/drivers/net/`](../../kernel/drivers/net/) | The NIC drivers |
 | [`lib/net/src/stack/`](../../lib/net/src/stack/) | `conn.rs` (TCP), `tcp.rs`, `udp.rs`, `eth.rs`, `arp.rs`, `dhcp.rs` wire formats |
 | [`lib/net/src/`](../../lib/net/src/) | `ipv4.rs`, `icmp.rs`, `dns.rs`, `dns_wire.rs`, `ntp.rs`, `tls.rs`, `x509.rs`, `der.rs`, `verify.rs`, `crypto.rs`, `gcm.rs`, `rsa.rs`, `ec.rs`, `bignum.rs`, `http/`, `http2.rs`, `sock.rs` |
-| [`lib/libmiku/c/netdb.rs`](../../lib/libmiku/c/netdb.rs) | `getaddrinfo` |
+| [`lib/runtime/libmiku/libc/netdb.rs`](../../lib/runtime/libmiku/libc/netdb.rs) | `getaddrinfo` |
 | [`apps/src/`](../../apps/src/) | `ping`, `traceroute`, `wget`, `curl`, `host`, `ntpdate` |
 | [`etc/ssl/certs/ca-bundle.pem`](../../etc/ssl/certs/ca-bundle.pem) | The trust store |
 

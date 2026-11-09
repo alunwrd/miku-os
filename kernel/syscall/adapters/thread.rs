@@ -31,7 +31,7 @@ const THREAD_ARGS_WORDS: usize = 8;
 /// A thread's stack otherwise has nobody to free it: its last instruction is
 /// the moment it cannot unmap the stack it stands on, and `std::thread`
 /// detaches every thread whose handle is dropped
-pub const THREAD_STACK_OWNED: u64 = 1 << 0;
+pub use miku_abi::futex::THREAD_STACK_OWNED;
 
 // 106  thread_create(args_ptr) -> tid | -errno
 pub fn sys_thread_create(args_ptr: u64) -> u64 {

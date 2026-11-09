@@ -34,10 +34,10 @@ aosh is the MikuOS desktop shell: one program that reads a directory of QML file
 | Language | A subset of QML for the tree; JavaScript (QuickJS, through the `rquickjs` 0.14 crate) for every expression |
 | Model | Quickshell's: `ShellRoot`, `PanelWindow`, `Variants`, `Process`, `IpcHandler`, `qs.*` module imports |
 | Display | Layer surfaces, popups and toplevels over `libmay` |
-| Build | A `std` program, built by the builder's `std` step (by hand: `cd builder && cargo run --release -- std aosh`); QuickJS's C is compiled by `lib/c/miku-cc` |
+| Build | A `std` program, built by the builder's `std` step (by hand: `cd builder && cargo run --release -- std aosh`); QuickJS's C is compiled by `lib/sdk/c/miku-cc` |
 | Size | About 34,000 lines of Rust in `aosh/src` |
 
-**Relation to Quickshell and Qt.** aosh reproduces Qt Quick's observable behaviour: layout rules, text metrics to a 64th of a pixel, how a rectangle's edge or a Canvas path is rasterised, what each effect's shader passes compute. The rule (decided by the user on 2026-10-08) is that the code is aosh's own, written from what Qt is seen to do and measured against `qml6` renders; Qt's LGPL source is read to learn constants and rules but never transliterated. FreeType (FTL licence) is used directly: aosh vendors FreeType 2.14.3, the version on the developer's Arch machine, in `lib/freetype`. The tree is Apache-2.0. The negi desktop config in `etc/aosh/negi/` is a fork of a GPL-3 Quickshell config and keeps its licence inside that directory; aosh interprets those files and does not link them.
+**Relation to Quickshell and Qt.** aosh reproduces Qt Quick's observable behaviour: layout rules, text metrics to a 64th of a pixel, how a rectangle's edge or a Canvas path is rasterised, what each effect's shader passes compute. The rule (decided by the user on 2026-10-08) is that the code is aosh's own, written from what Qt is seen to do and measured against `qml6` renders; Qt's LGPL source is read to learn constants and rules but never transliterated. FreeType (FTL licence) is used directly: aosh vendors FreeType 2.14.3, the version on the developer's Arch machine, in `lib/gfx/freetype`. The tree is Apache-2.0. The negi desktop config in `etc/aosh/negi/` is a fork of a GPL-3 Quickshell config and keeps its licence inside that directory; aosh interprets those files and does not link them.
 
 aosh replaced `mayshell` and `libmay`'s `doc`/`lay`/`view` toolkit on 2026-10-06 (stage A4 of [../../dev/aosh-architecture.md](../../dev/aosh-architecture.md)).
 
@@ -368,7 +368,7 @@ Both passes are incremental since 2026-10-21: every object carries `changed` and
 - **The application font** comes from `kdeglobals` `[General] font`, as Quickshell under `QT_QPA_PLATFORMTHEME=kde` reads it. A Text's own font properties are applied over it.
 - **Shaping** is rustybuzz (`shape.rs`), as Qt's HarfBuzz shapes: default features (ligatures, kerning, contextual forms), direction and script guessed from the text, at the named instance fontconfig would list (Material Symbols ligatures such as `planner_review` become one glyph here).
 - **Advances** are FreeType's unhinted ones at the face's axes, in 64ths, with GPOS kerning applied as HarfBuzz rounds it (`kern.rs`). A line is `ascent + descent` from `hhea`, then OS/2.
-- **Glyph pixels** come from FreeType 2.14.3 (`lib/freetype`, with a C shim making the calls Qt's FreeType engine makes, and `lib/freetype/src/hb.rs` answering the autohinter's HarfBuzz calls) at light hinting.
+- **Glyph pixels** come from FreeType 2.14.3 (`lib/gfx/freetype`, with a C shim making the calls Qt's FreeType engine makes, and `lib/gfx/freetype/src/hb.rs` answering the autohinter's HarfBuzz calls) at light hinting.
 - **Distance-field text.** A Text without `renderType: Text.NativeRendering`, in a shell without `//@ pragma NativeTextRendering`, is drawn from distance fields, Qt Quick's default (`field.rs`, since 2026-10-13): the hinted outline at units-per-em scaled to a 54 px base, a field covering the box plus 5 px, and a smoothstep threshold. The shipped bar uses native rendering.
 - A character the face lacks is drawn from the first face that has it.
 
@@ -553,7 +553,7 @@ At 240 Hz the frame budget is 4.17 ms. Opening the overview's object tree (`sear
 | `aosh/src/ipc/` | `mod.rs`, `socket.rs` |
 | `aosh/src/check.rs`, `shot.rs` | `aosh check`, `aosh shot` and benches |
 | `aosh/tests/qtref/` | Qt reference renders |
-| `lib/freetype/` | FreeType 2.14.3 and its shim |
+| `lib/gfx/freetype/` | FreeType 2.14.3 and its shim |
 | `kernel/drivers/gpu/nvidia/shaders/paint.cu` | The GPU painter |
 | `etc/aosh/` | Default config and `negi/` |
 

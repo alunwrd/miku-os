@@ -36,29 +36,29 @@ use crate::syscall::usercopy::current_pid;
 // 0 is reserved: a pty comes from `open("/dev/ptmx")`, and an old binary
 // calling it gets EINVAL
 /// Join one: the caller's controlling terminal becomes `arg`
-pub const TTY_ATTACH: u64 = 1;
+pub use miku_abi::kproc::TTY_ATTACH;
 // 2 is reserved: closing the master descriptor is the hangup, whether the
 // holder closed it or was killed
 /// Which terminal the caller is on. 0 is the console
-pub const TTY_SELF:   u64 = 3;
+pub use miku_abi::kproc::TTY_SELF;
 /// Hands the terminal's keys to a job: `tcsetpgrp`. `arg` is a process group
 /// id; 0 means the caller's own group, how a shell takes them back
-pub const TTY_SETFG:  u64 = 4;
+pub use miku_abi::kproc::TTY_SETFG;
 /// Which job has them: `tcgetpgrp`. A shell asks to find out whether it is in
 /// the foreground before it prompts
-pub const TTY_GETFG:  u64 = 5;
+pub use miku_abi::kproc::TTY_GETFG;
 /// Blanks the caller's terminal and puts the pen at the top left
 ///
 /// A request and not an escape sequence: a terminal's text is a cell grid the
 /// kernel owns and `may_console` delivers, and a program cannot clear somebody
 /// else's screen by printing at it
-pub const TTY_CLEAR:  u64 = 6;
+pub use miku_abi::kproc::TTY_CLEAR;
 /// Which terminal another process is on. `arg` is its pid
 ///
 /// For a daemon running a command for somebody else, to put it on their
 /// terminal: a pid from `peercred` is the kernel's word, and a terminal id sent
 /// over a socket is the caller's
-pub const TTY_OF_PID: u64 = 7;
+pub use miku_abi::kproc::TTY_OF_PID;
 
 // 99  tty(op, arg) -> id / 0 / -errno
 /// Makes terminal `id` the controlling terminal of `pid`, and `pid` the leader

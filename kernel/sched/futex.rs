@@ -35,9 +35,9 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 /// Block until `wake`, until the word changes, or until the timeout.
-pub const FUTEX_WAIT: u64 = 0;
+pub use miku_abi::futex::FUTEX_WAIT;
 /// Wake up to `val` waiters on this word.
-pub const FUTEX_WAKE: u64 = 1;
+pub use miku_abi::futex::FUTEX_WAKE;
 
 /// How long a waiter sleeps before waking to look at its word again.
 ///

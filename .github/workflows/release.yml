@@ -10,7 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # rustc 1.98.0-nightly (cb46fbb8c 2026-06-08), the commit lib/rust-std is written against
+  # rustc 1.98.0-nightly (cb46fbb8c 2026-06-08), the commit lib/sdk/rust-std is written against
   RUST_NIGHTLY: nightly-2026-06-09
 
 jobs:

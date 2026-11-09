@@ -37,7 +37,7 @@ fn insert_before(what: &str, root: &Path, edits: &[(&str, &str, &str)]) -> R {
 }
 
 /// The three lines in `libc`'s dispatch files selecting `src/unix/miku/` and
-/// `src/new/miku/`. The modules are in `lib/rust-libc/libc/`; these go in
+/// `src/new/miku/`. The modules are in `lib/sdk/rust-libc/libc/`; these go in
 /// `cfg_if!` chains that vary by version
 pub fn libc(root: &Path) -> R {
     insert_before("libc", root, &[
@@ -54,7 +54,7 @@ pub fn libc(root: &Path) -> R {
             "    } else if #[cfg(target_os = \"miku\")] {\n\
              \x20       // Nothing to link. MikuOS has no `libc.so`, no `libm`, no\n\
              \x20       // `librt` and no `libpthread`: its C library is the ten\n\
-             \x20       // `*_miku.so` that `lib/mikulibs/libs.list` names, and the\n\
+             \x20       // `*_miku.so` that `lib/runtime/libmiku/libs.list` names, and the\n\
              \x20       // target spec's pre-link args already put every one of them\n\
              \x20       // on the line. Asking for `-lc` here would ask the linker for\n\
              \x20       // a file that does not exist on this system and never will\n\

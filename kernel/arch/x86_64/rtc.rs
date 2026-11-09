@@ -159,19 +159,9 @@ fn decode(raw: DateTime, century_raw: u8, status_b: u8) -> Option<DateTime> {
     Some(dt)
 }
 
-/// Days from 1970-01-01 to the given civil date. Howard Hinnant's algorithm.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;                                   // [0, 399]
-    let mp = ((m + 9) % 12) as i64;                            // Mar=0
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1;               // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;           // [0, 146096]
-    era * 146097 + doe - 719468
-}
 
 pub fn to_unix(dt: &DateTime) -> u64 {
-    let days = days_from_civil(dt.year as i64, dt.month as u32, dt.day as u32);
+    let days = miku_base::date::days_from_civil(dt.year as i64, dt.month as i64, dt.day as i64);
     let secs = days * 86400
         + dt.hour as i64 * 3600
         + dt.minute as i64 * 60

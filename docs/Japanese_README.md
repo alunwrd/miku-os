@@ -10,7 +10,7 @@
 
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Architecture](https://img.shields.io/badge/arch-x86__64-blue.svg)]()
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)]()
 [![Status](https://img.shields.io/badge/status-beta-yellow.svg)]()
 [![License](https://img.shields.io/badge/license-Apache2.0-red.svg)]()
 
@@ -208,11 +208,11 @@ libmiku、ディスプレイプロトコル、ネットワークプロトコル�
 
 ## ファイルシステム
 
-### ext2 / ext3 / ext4 (`lib/extfs`、`kernel/fs/ext/` でマウント)
+### ext2 / ext3 / ext4 (`lib/fs/extfs`、`kernel/fs/ext/` でマウント)
 
 ドライバは独立したクレートで、ディスク上のフォーマットを知っていても、このカーネルのことは何も知りません。
-ディスクには 1 つのトレイト (`lib/fshost` の `BlockHost`) を通じて到達します。狙いはテストのループです -
-`cd lib/extfs && cargo test` はメモリ上にファイルシステムを作り、わざと壊し、トランザクションの途中で電源を
+ディスクには 1 つのトレイト (`lib/fs/fshost` の `BlockHost`) を通じて到達します。狙いはテストのループです -
+`cd lib/fs/extfs && cargo test` はメモリ上にファイルシステムを作り、わざと壊し、トランザクションの途中で電源を
 切り、ドライバの動作を確認します。ブート 1 回分ではなく数秒で。
 
 | 機能 | 詳細 |
@@ -231,7 +231,7 @@ libmiku、ディスプレイプロトコル、ネットワークプロトコル�
 インデックスへの書き込みと `debugfs` による走査、そして操作のすべての書き込みで電源を切り、得られた
 各イメージを `e2fsck` に渡します。
 
-### btrfs (`lib/btrfs`)
+### btrfs (`lib/fs/btrfs`)
 
 カーネルでは読み取り専用: チャンクツリー、ファイルシステムツリー、エクステント、インラインファイル。
 クレートには copy-on-write トランザクション、アロケータ、コミットもあり、ビルドホストで `mkfs.btrfs` の
@@ -278,7 +278,7 @@ VFS → ページキャッシュ → ファイルシステム → ブロック�
 
 ## グラフィックス: Mayland、デスクトップ、GPU
 
-### Mayland (`kernel/mayland/`、`lib/mayland/`)
+### Mayland (`kernel/mayland/`、`lib/gfx/mayland/`)
 
 ディスプレイサーバ兼コンポジタ。プロトコルは Wayland のワイヤーフォーマットを独自のソケットファミリー上で
 使います。共有メモリはカーネルのハンドル、キーマップはテーブルです。プロトコルとフォントラスタライザの
@@ -443,7 +443,7 @@ PID 1: 32 個のサービスの固定テーブルを持つカーネルスレッ�
 
 ## ユーザー空間
 
-### Rust `std` (`lib/rust-std/`)
+### Rust `std` (`lib/sdk/rust-std/`)
 
 `target_os = "miku"` 向けの `std`: プラットフォーム層はシステムコールではなく `libmiku` を呼ぶので、
 番号を知っているのは 1 つのライブラリだけです。`fs`、`path`、`env`、`io`、`process`、`net`、`time`
@@ -456,7 +456,7 @@ PID 1: 32 個のサービスの固定テーブルを持つカーネルスレッ�
 **Zed** エディタは、いくつかのパッチと Mayland を話す 4 つ目の gpui バックエンドを加えて、自身のソースから
 MikuOS 向けにビルドされます。イメージにパッケージとして含まれ、デスクトップから起動します。
 
-### libc と C (`lib/libmiku/`、`lib/c/`)
+### libc と C (`lib/runtime/libmiku/`、`lib/sdk/c/`)
 
 **`libc_miku.so`** は Rust で書かれた MikuOS の C ライブラリで、約 540 の関数をエクスポートします
 (10 個の `miku` ライブラリ全体では約 1450)。
@@ -467,10 +467,10 @@ MikuOS 向けにビルドされます。イメージにパッケージとして�
 条件変数、rwlock、`pthread_once`、キー、`pthread_atfork` - を扱います。まだないもの: `dlopen`、`posix_spawn`、
 `epoll`、`eventfd`、`signalfd`、`timerfd`、ロケール。`getaddrinfo` は IPv4 のみで、`localtime` は UTC です。
 
-`lib/c/include/` にはそのための C ヘッダが 47 個あり、`stdio.h` から `sys/socket.h`、`pthread.h` まで
+`lib/sdk/c/include/` にはそのための C ヘッダが 47 個あり、`stdio.h` から `sys/socket.h`、`pthread.h` まで
 揃っています。これはライブラリの C の顔であって 2 つ目の libc ではありません: ヘッダはライブラリが定義する
 ものだけを宣言するので、MikuOS にないものを使う C プログラムはコンパイルで失敗し、すべての構造体の
-レイアウトは `_Static_assert` で Rust の `libc` オーバーレイに固定され、ヘッダが変わるたびに検査されます。`lib/c/miku-cc`
+レイアウトは `_Static_assert` で Rust の `libc` オーバーレイに固定され、ヘッダが変わるたびに検査されます。`lib/sdk/c/miku-cc`
 はターゲットのフラグでホストの clang をラップします。SQLite、zstd、tree-sitter、FreeType はこの方法で
 ビルドされ、`cc` で C をコンパイルする Rust クレートも同じラッパーを使います。
 
@@ -518,10 +518,10 @@ uid=0(root) gid=0(root) groups=0(root)
 グラフィカルセッションが初めて始まるときに `/etc/skel` から作られます。
 
 プログラム: `mikudo`、`mikudod`、`login`、`maygreet`、`maysession`、`passwd`、`id`、`su`、`useradd`。
-ハッシュとすべてのパーサは `lib/mikuauth` にあり、`cargo test` は RFC 9106 の Argon2id タグを含む約 100 ケースを
+ハッシュとすべてのパーサは `lib/admin/mikuauth` にあり、`cargo test` は RFC 9106 の Argon2id タグを含む約 100 ケースを
 実行します。
 
-### パッケージ (`lib/mikupkg`、`/bin/mikupkg`)
+### パッケージ (`lib/admin/mikupkg`、`/bin/mikupkg`)
 
 コンテナフォーマット、リゾルバ、そして前に進めるのではなく必ずロールバックするジャーナル付きのトランザクション。
 アプライヤが外界と接するのは `Root` トレイトだけなので、ビルダーは `/bin/mikupkg` がマシン上で使うのと同じ
@@ -547,9 +547,9 @@ uid=0(root) gid=0(root) groups=0(root)
   メモリ、IPC、VFS、ext、btrfs、端末、ELF ローダー、資格情報、ネットワーク、カーネルログ、Mayland、
   NVIDIA ドライバのスイートと、`std` のプログラム。出力はシリアルポートへ。
   [docs/wiki/testing.md](wiki/testing.md) を参照してください。
-- **ホスト上のテスト** (ブート不要): `lib/extfs`、`lib/btrfs`、`lib/net` (暗号、X.509、すべてのパーサ)、
-  `lib/mikuauth`、`lib/mayland` (`cargo test-host`)、カーネルヒープ (`kernel/mm/heap/hosttest`)、
-  libmiku のヒープ (`lib/libmiku/hosttest`)、`lib/mikupkg`、`lib/fshost`、`lib/freetype`、`aosh`
+- **ホスト上のテスト** (ブート不要): `lib/fs/extfs`、`lib/fs/btrfs`、`lib/net` (X.509、すべてのパーサ)、`lib/crypto`、`lib/base`、
+  `lib/admin/mikuauth`、`lib/gfx/mayland` (`cargo test-host`)、カーネルヒープ (`kernel/mm/heap/hosttest`)、
+  libmiku のヒープ (`lib/runtime/libmiku/hosttest`)、`lib/admin/mikupkg`、`lib/fs/fshost`、`lib/gfx/freetype`、`aosh`
   (`cargo test-host`)、`builder`。
 - **`stdbench`** - MikuOS と Linux で同じベンチマーク。4 vCPU の QEMU/KVM と、ベアメタルの Linux の比較:
   プロセスの起動と待機 0.27 ms (Linux 0.63)、`Instant::now` 11 ns (20)、プロセス間のパイプ往復 2.1 µs (6.8)、
@@ -568,7 +568,7 @@ uid=0(root) gid=0(root) groups=0(root)
 | ツール | 用途 |
 |:--|:--|
 | Rust nightly + `rust-src` | ベアメタルとユーザー空間ターゲットのための `build-std` |
-| clang | `lib/c/miku-cc` 経由の C ライブラリ。aosh が必要とするので、ビルドにも必要です |
+| clang | `lib/sdk/c/miku-cc` 経由の C ライブラリ。aosh が必要とするので、ビルドにも必要です |
 | LLVM (`llvm-ar`) | C ライブラリのアーカイブ |
 | `nm` (binutils) | C ヘッダが宣言するすべての関数が定義されているかをビルダーが検査します |
 | CUDA toolkit (任意) | `nvcc` が GPU プログラム (`sm_120`) をコンパイル。なくてもカーネルはビルドされ、プログラムがないことを報告します |
@@ -637,17 +637,18 @@ kernel/                 カーネルのソース
   setup/                インストーラのウィンドウ
   shell/                カーネル内 (緊急用) シェル
   kcore/                ブート状態、時計、ロック、カーネルログ、pstore、バックトレース、電源、RNG
-lib/                    ライブラリ
-  extfs/, btrfs/, fshost/   ファイルシステムのフォーマットと、それがディスクに届くためのトレイト
-  libmiku/, mikulibs/   システムライブラリと分野別の .so ライブラリ
-  ld-miku/, vdso/       動的ローダー、vDSO
-  rust-std/, rust-libc/ std の移植と libc のオーバーレイ
-  c/, freetype/         C ヘッダとコンパイララッパー、FreeType
-  mayland/              libmay: 両側でリンクされるディスプレイプロトコル
+lib/                    ライブラリ。地図は lib/README.md
+  abi/                  miku-abi: カーネルとプログラムが共有するすべての数値とレイアウト
+  base/, crypto/        純粋なアルゴリズム、暗号
+  runtime/              ld-miku、vDSO、10 個の *_miku.so
+  sdk/                  プログラムのビルド対象: miku クレート、C ヘッダとコンパイララッパー、
+                        std の移植、libc のオーバーレイ
+  fs/                   extfs、btrfs: ファイルシステムのフォーマット。fshost: ディスクに届くためのトレイト
   net/                  mikunet: DNS、TLS、HTTP - ring 3 のプロトコル
-  mikuauth/             パスワードハッシュとアカウントファイルのパーサ
-  mikupkg/              ライブラリとしてのパッケージマネージャ
-  miku/, buildgen/      プログラム用ヘッダ、ビルド時のジェネレータ
+  gfx/                  mayland: libmay、両側でリンクされるディスプレイプロトコル。FreeType
+  admin/                mikuauth: パスワードハッシュとアカウントファイル。mikupkg: ライブラリとしての
+                        パッケージマネージャ
+  buildgen/             ビルドスクリプトの共通コード: ライブラリ一覧、スタブ、shim、宣言、ジェネレータ
 system/                 msh、mayterm、maywm、maygreet、maysession、mikudo、mikudod、login、
                         passwd、id、su、useradd、mikupkg
 utils/                  日常のコマンド: ls、cat、cp、grep、ps、kill、mikuctl など (35 個)

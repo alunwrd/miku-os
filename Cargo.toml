@@ -4,14 +4,14 @@
 # `build-std`, so a dependency gets compiled against the sysroot `core` and
 # against the one built from source, and the link fails on a duplicate `sized`
 # lang item. It is invoked as `cd builder && cargo run`
-members  = ["lib/ld-miku", "lib/mayland", "lib/miku", "lib/vdso"]
-exclude  = ["builder", "lib/net", "lib/extfs", "lib/fshost", "lib/btrfs", "lib/mikuauth", "lib/mikupkg", "lib/libmiku/hosttest", "kernel/mm/heap/hosttest"]
+members  = ["lib/runtime/ld-miku", "lib/gfx/mayland", "lib/sdk/miku", "lib/runtime/vdso"]
+exclude  = ["builder", "lib/abi", "lib/base", "lib/buildgen", "lib/crypto", "lib/net", "lib/fs/extfs", "lib/fs/fshost", "lib/fs/btrfs", "lib/admin/mikuauth", "lib/admin/mikupkg", "lib/runtime/libmiku/hosttest", "kernel/mm/heap/hosttest"]
 resolver = "2"
 
 [package]
 name        = "miku-os-release"
 license = "Apache-2.0"
-version     = "1.0.0"
+version     = "1.0.1"
 edition     = "2021"
 authors     = ["alunwrd"]
 description = "Experimental OS in Rust"
@@ -28,7 +28,11 @@ default = []
 # The display protocol, shared with every program that draws. A crate rather
 # than `#[path]` includes, so there is one encoder and the build can tell when
 # it changed
-libmay               = { path = "lib/mayland" }
+libmay               = { path = "lib/gfx/mayland" }
+# The numbers and layouts the kernel shares with everything above it
+miku-abi             = { path = "lib/abi" }
+# Pure algorithms shared with ring 3
+miku-base            = { path = "lib/base" }
 # The network stack, L2-L4. The same crate the host tests run against (`cd
 # lib/net && cargo test`). `stack` is on by default; `userspace` is not, so
 # `miku` is not pulled in
@@ -39,13 +43,13 @@ libmay               = { path = "lib/mayland" }
 mikunet              = { path = "lib/net", default-features = false, features = ["stack"] }
 # The ext2/3/4 on-disk format, as a library rather than kernel modules. Same
 # arrangement as `mikunet`: everything in it is pure format handling over a
-# trait, so `cd lib/extfs && cargo test` reaches the superblock, the extent
+# trait, so `cd lib/fs/extfs && cargo test` reaches the superblock, the extent
 # trees, the allocator and the journal without a boot
-extfs                = { path = "lib/extfs" }
+extfs                = { path = "lib/fs/extfs" }
 # The seam both format crates take: the block host, MemDisk and crc32c
-fshost               = { path = "lib/fshost" }
+fshost               = { path = "lib/fs/fshost" }
 # btrfs, read-only (dev/fs-architecture.md)
-btrfs                = { path = "lib/btrfs" }
+btrfs                = { path = "lib/fs/btrfs" }
 volatile              = "0.2.6"
 spin                  = "0.9.8"
 x86_64                = "0.14.2"
@@ -59,6 +63,8 @@ pic8259               = "0.10.1"
 # Build-time only: artwork goes in as a file and comes out as pixels. The font
 # is `libmay`'s, so `fontdue` is its build-dependency
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# The library list, for the preload table
+miku-buildgen = { path = "lib/buildgen" }
 
 [profile.dev]
 panic     = "abort"

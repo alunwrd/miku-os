@@ -406,46 +406,21 @@ pub fn sys_write_file(fd: u64, ptr: u64, len: u64) -> u64 {
 //
 // Only the tty requests are implemented; the numbers follow Linux so a libc can
 // pass termios straight through.
-pub const TCGETS:     u64 = 0x5401;
-pub const TCSETS:     u64 = 0x5402;
-pub const TIOCGWINSZ: u64 = 0x5413;
+pub use miku_abi::ioctl::TCGETS;
+pub use miku_abi::ioctl::TCSETS;
+pub use miku_abi::ioctl::TIOCGWINSZ;
 /// Makes this terminal the caller's controlling one: `login_tty` on a slave it
 /// has just opened, by the function `tty(ATTACH)` uses
-pub const TIOCSCTTY:  u64 = 0x540E;
-pub const TIOCSWINSZ: u64 = 0x5414;
+pub use miku_abi::ioctl::TIOCSCTTY;
+pub use miku_abi::ioctl::TIOCSWINSZ;
 /// Which terminal a master descriptor is the master of
 ///
 /// Linux's number, with this machine's "pty number": there the integer in
 /// `/dev/pts/N`, here the `TtyId`. A program that has opened `/dev/ptmx` needs
 /// it to say which terminal it is drawing
-pub const TIOCGPTN:   u64 = 0x8004_5430;
+pub use miku_abi::ioctl::TIOCGPTN;
 
-/// Wire layout shared with userspace. Not Linux's 60-byte termios: there are no
-/// baud rates or modem lines to configure
-#[repr(C)]
-struct MikuTermios {
-    icanon: u8,
-    echo:   u8,
-    isig:   u8,
-    /// How few characters a raw-mode read may return with, and how long it
-    /// waits in tenths of a second: see `user_stdin::read_from`
-    vmin:   u8,
-    vtime:  u8,
-    /// Stop a background job that writes here. POSIX's `TOSTOP`
-    tostop: u8,
-    /// Which character does what. Indices are `ldisc`'s `V*` constants, and a
-    /// zero disables that one: a full-screen editor wanting every byte turns
-    /// the interrupt character off rather than `isig`, keeping quit and suspend
-    c_cc:   [u8; crate::io::tty::ldisc::NCCS],
-    /// To a round twelve bytes
-    _pad:   [u8; 1],
-}
-
-#[repr(C)]
-struct WinSize {
-    rows: u16,
-    cols: u16,
-}
+use miku_abi::ktermios::{MikuTermios, MikuWinSize as WinSize};
 
 /// The terminal an `ioctl` is about, if the descriptor names one
 ///
@@ -590,11 +565,11 @@ pub fn sys_ioctl(fd: u64, request: u64, argp: u64) -> u64 {
 
 /// Event bits, following Linux so a libc can hand its own `struct pollfd`
 /// straight through
-pub const POLLIN:   i16 = 0x001;
-pub const POLLOUT:  i16 = 0x004;
-pub const POLLERR:  i16 = 0x008;
-pub const POLLHUP:  i16 = 0x010;
-pub const POLLNVAL: i16 = 0x020;
+pub use miku_abi::poll::POLLIN;
+pub use miku_abi::poll::POLLOUT;
+pub use miku_abi::poll::POLLERR;
+pub use miku_abi::poll::POLLHUP;
+pub use miku_abi::poll::POLLNVAL;
 
 // How many descriptors one call may watch. The arrays below are on the kernel
 // stack, where 256 cost about two kilobytes

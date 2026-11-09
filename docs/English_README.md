@@ -10,7 +10,7 @@
 
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Architecture](https://img.shields.io/badge/arch-x86__64-blue.svg)]()
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)]()
 [![Status](https://img.shields.io/badge/status-beta-yellow.svg)]()
 [![License](https://img.shields.io/badge/license-Apache2.0-red.svg)]()
 
@@ -208,10 +208,10 @@ into the kernel before use.
 
 ## Filesystems
 
-### ext2 / ext3 / ext4 (`lib/extfs`, mounted by `kernel/fs/ext/`)
+### ext2 / ext3 / ext4 (`lib/fs/extfs`, mounted by `kernel/fs/ext/`)
 
 The driver is a separate crate that knows the on-disk format and nothing about this kernel: it reaches the
-disk through one trait (`BlockHost`, from `lib/fshost`). The point is the test loop - `cd lib/extfs &&
+disk through one trait (`BlockHost`, from `lib/fs/fshost`). The point is the test loop - `cd lib/fs/extfs &&
 cargo test` builds a filesystem in memory, corrupts it on purpose, cuts the power mid-transaction and
 checks what the driver does, in seconds rather than a boot.
 
@@ -230,7 +230,7 @@ Checked against e2fsprogs, not against itself: `e2fsck -f -n` on every image the
 reproduced from `mke2fs` images, a directory index `e2fsck -D` built written into and walked by `debugfs`,
 and a power cut at every write of an operation with each resulting image handed to `e2fsck`.
 
-### btrfs (`lib/btrfs`)
+### btrfs (`lib/fs/btrfs`)
 
 Read-only in the kernel: chunk tree, the filesystem trees, extents, inline files. The crate also has
 copy-on-write transactions, an allocator and commits, tested on the build host against `mkfs.btrfs`
@@ -277,7 +277,7 @@ The full reference is [docs/wiki/network.md](wiki/network.md).
 
 ## Graphics: Mayland, the desktop and the GPU
 
-### Mayland (`kernel/mayland/`, `lib/mayland/`)
+### Mayland (`kernel/mayland/`, `lib/gfx/mayland/`)
 
 A display server and compositor. Its protocol uses Wayland's wire format over its own socket family;
 shared memory is a kernel handle, the keymap a table. One copy of the protocol and the font renderer is
@@ -442,7 +442,7 @@ and on the graphical target `compositor` and `greeter`. The full reference is
 
 ## Userspace
 
-### Rust `std` (`lib/rust-std/`)
+### Rust `std` (`lib/sdk/rust-std/`)
 
 A `std` for `target_os = "miku"`: the platform layer calls `libmiku` rather than the syscalls, so one
 library knows the numbers. `fs`, `path`, `env`, `io`, `process`, `net`, `time` (through the vDSO),
@@ -455,7 +455,7 @@ socket timeouts, `shutdown`, `local_addr`/`peer_addr` and binding port 0.
 **Zed** - the editor - builds for MikuOS from its own source with a few patches and a fourth gpui backend
 that speaks Mayland. It ships as a package in the image and starts from the desktop.
 
-### libc and C (`lib/libmiku/`, `lib/c/`)
+### libc and C (`lib/runtime/libmiku/`, `lib/sdk/c/`)
 
 **`libc_miku.so`** is MikuOS's C library, written in Rust: about 540 exported functions (about 1450
 across all ten `miku` libraries). It covers
@@ -466,10 +466,10 @@ heap, `time`/`ctime`, `dirent`, `poll` and `select`, sockets and `getaddrinfo`, 
 variables with a clock, rwlocks, `pthread_once`, keys, `pthread_atfork`. Not there yet: `dlopen`, `posix_spawn`, `epoll`,
 `eventfd`, `signalfd`, `timerfd` and locales; `getaddrinfo` is IPv4 only and `localtime` is UTC.
 
-`lib/c/include/` holds the C headers for it - 47 of them, from `stdio.h` to `sys/socket.h` and
+`lib/sdk/c/include/` holds the C headers for it - 47 of them, from `stdio.h` to `sys/socket.h` and
 `pthread.h`. They are its C face, not a second libc: a header declares only what the library defines, so
 a C program that uses something MikuOS lacks fails to compile, and every struct layout is pinned to the
-Rust `libc` overlay by `_Static_assert`s, checked whenever a header changes. `lib/c/miku-cc` wraps the host clang with the
+Rust `libc` overlay by `_Static_assert`s, checked whenever a header changes. `lib/sdk/c/miku-cc` wraps the host clang with the
 target's flags. SQLite, zstd, tree-sitter and FreeType are built this way, and Rust crates that compile C
 through `cc` use the same wrapper.
 
@@ -516,10 +516,10 @@ away the moment somebody is. While the greeter is up the compositor pins focus t
 manager chord is inert. The home directory is made from `/etc/skel` when a graphical session first starts.
 
 Programs: `mikudo`, `mikudod`, `login`, `maygreet`, `maysession`, `passwd`, `id`, `su`, `useradd`.
-The hash and every parser are in `lib/mikuauth`: `cargo test` runs about a hundred cases, including RFC 9106's
+The hash and every parser are in `lib/admin/mikuauth`: `cargo test` runs about a hundred cases, including RFC 9106's
 Argon2id tag.
 
-### Packages (`lib/mikupkg`, `/bin/mikupkg`)
+### Packages (`lib/admin/mikupkg`, `/bin/mikupkg`)
 
 A container format, a resolver, and a transaction with a journal that rolls back, never forward. The
 applier's only contact with the world is a `Root` trait, so the builder installs packages into the image
@@ -545,9 +545,9 @@ repository to fetch from yet, and a change to the installed system needs a writa
   for memory, IPC, VFS, ext, btrfs, terminals, the ELF loader, credentials, the network, the kernel log,
   Mayland and the NVIDIA driver, and the `std` programs. The output goes to the serial port. See
   [docs/wiki/testing.md](wiki/testing.md).
-- **Host tests**, no boot: `lib/extfs`, `lib/btrfs`, `lib/net` (crypto, X.509, every parser),
-  `lib/mikuauth`, `lib/mayland` (`cargo test-host`), the kernel heap (`kernel/mm/heap/hosttest`),
-  libmiku's heap (`lib/libmiku/hosttest`), `lib/mikupkg`, `lib/fshost`, `lib/freetype` and `aosh`
+- **Host tests**, no boot: `lib/fs/extfs`, `lib/fs/btrfs`, `lib/net` (X.509, every parser), `lib/crypto`, `lib/base`,
+  `lib/admin/mikuauth`, `lib/gfx/mayland` (`cargo test-host`), the kernel heap (`kernel/mm/heap/hosttest`),
+  libmiku's heap (`lib/runtime/libmiku/hosttest`), `lib/admin/mikupkg`, `lib/fs/fshost`, `lib/gfx/freetype` and `aosh`
   (`cargo test-host`), `builder`.
 - **`stdbench`** - the same benchmark on MikuOS and on Linux. On QEMU/KVM with 4 vCPUs against Linux on
   the bare machine: a process spawn and wait 0.27 ms (Linux 0.63), `Instant::now` 11 ns (20), a pipe round
@@ -566,7 +566,7 @@ repository to fetch from yet, and a change to the installed system needs a writa
 | Tool | Purpose |
 |:--|:--|
 | Rust nightly + `rust-src` | `build-std` for the bare-metal and the userspace targets |
-| clang | The C libraries, through `lib/c/miku-cc`; aosh needs it, so the build does too |
+| clang | The C libraries, through `lib/sdk/c/miku-cc`; aosh needs it, so the build does too |
 | LLVM (`llvm-ar`) | Archives for the C libraries |
 | `nm` (binutils) | The builder checks that every function a C header declares is defined |
 | CUDA toolkit (optional) | `nvcc` compiles the GPU programs (`sm_120`); without it the kernel builds and says they are unavailable |
@@ -635,17 +635,18 @@ kernel/                 kernel sources
   setup/                the installer window
   shell/                the in-kernel (emergency) shell
   kcore/                boot state, clock, locks, kernel log, pstore, backtraces, power, RNG
-lib/                    libraries
-  extfs/, btrfs/, fshost/   filesystem formats and the trait they reach a disk through
-  libmiku/, mikulibs/   the system library and the per-domain .so libraries
-  ld-miku/, vdso/       dynamic loader, vDSO
-  rust-std/, rust-libc/ the std port and the libc overlay
-  c/, freetype/         C headers and the compiler wrapper; FreeType
-  mayland/              libmay: the display protocol, linked by both halves
+lib/                    libraries; lib/README.md is the map
+  abi/                  miku-abi: every number and layout the kernel and programs share
+  base/, crypto/        pure algorithms; the cryptography
+  runtime/              ld-miku, the vDSO, the ten *_miku.so
+  sdk/                  what programs build against: the miku crate, C headers and the compiler
+                        wrapper, the std port, the libc overlay
+  fs/                   extfs, btrfs: filesystem formats; fshost: the trait they reach a disk through
   net/                  mikunet: DNS, TLS, HTTP - the protocols, in ring 3
-  mikuauth/             password hashing and the account file parsers
-  mikupkg/              the package manager as a library
-  miku/, buildgen/      the program header; build-time generators
+  gfx/                  mayland: libmay, the display protocol, linked by both halves; FreeType
+  admin/                mikuauth: password hashing and account files; mikupkg: the package manager
+                        as a library
+  buildgen/             code build scripts share: the library list, stubs, shims, declarations, generators
 system/                 msh, mayterm, maywm, maygreet, maysession, mikudo, mikudod, login,
                         passwd, id, su, useradd, mikupkg
 utils/                  the everyday commands: ls, cat, cp, grep, ps, kill, mikuctl, ... (35)

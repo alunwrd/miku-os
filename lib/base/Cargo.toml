@@ -1,0 +1,12 @@
+# miku-base: pure algorithms ring 0, ring 3, and tools all need
+#
+# No OS calls, no allocation, no dependencies.
+#
+#     cd lib/base && cargo test
+[package]
+name    = "miku-base"
+version = "1.0.1"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"

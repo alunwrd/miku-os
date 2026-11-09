@@ -1,6 +1,6 @@
 [package]
 name = "miku-os-builder"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 
 # Its own workspace, and `exclude`d by the repository root (see the note there,
@@ -11,4 +11,6 @@ edition = "2021"
 # The package manager, as a library. The builder neither shells out to it nor
 # reimplements it: it builds containers with `format::writer` and installs them
 # with the same applier the machine runs, over a `std::fs` root
-mikupkg = { path = "../lib/mikupkg" }
+mikupkg = { path = "../lib/admin/mikupkg" }
+# The library list and the declaration check, shared with the build scripts
+miku-buildgen = { path = "../lib/buildgen" }

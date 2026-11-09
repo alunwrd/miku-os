@@ -69,7 +69,7 @@ impl FileSystem for BtrfsVolume {
         FsType::Btrfs
     }
 
-    /// Always. This driver does not call the transaction code in `lib/btrfs`
+    /// Always. This driver does not call the transaction code in `lib/fs/btrfs`
     fn read_only(&self) -> bool {
         true
     }

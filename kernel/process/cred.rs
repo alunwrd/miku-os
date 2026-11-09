@@ -46,43 +46,43 @@ use crate::fs::vfs::types::{MAX_GROUPS, PermWho};
 pub struct CapSet(pub u64);
 
 /// Change identity: setuid/setresuid/seteuid to an arbitrary id
-pub const CAP_SETUID:       u8 = 0;
+pub use miku_abi::cred::CAP_SETUID;
 /// Change group identity, including setgroups
-pub const CAP_SETGID:       u8 = 1;
+pub use miku_abi::cred::CAP_SETGID;
 /// Signal a process you do not own
-pub const CAP_KILL:         u8 = 2;
+pub use miku_abi::cred::CAP_KILL;
 /// Bypass file read/write/execute permission bits
-pub const CAP_DAC_OVERRIDE: u8 = 3;
+pub use miku_abi::cred::CAP_DAC_OVERRIDE;
 /// Bypass permission bits for reading and directory search only
-pub const CAP_DAC_READ:     u8 = 4;
+pub use miku_abi::cred::CAP_DAC_READ;
 /// Act as a file's owner without being it (chmod, utimes, xattr)
-pub const CAP_FOWNER:       u8 = 5;
+pub use miku_abi::cred::CAP_FOWNER;
 /// Give a file away, or take one that is not yours
-pub const CAP_CHOWN:        u8 = 6;
+pub use miku_abi::cred::CAP_CHOWN;
 /// Set the wall clock
-pub const CAP_SYS_TIME:     u8 = 7;
+pub use miku_abi::cred::CAP_SYS_TIME;
 /// Mount, unmount, mkfs, and the machine-level shell commands
-pub const CAP_SYS_ADMIN:    u8 = 8;
+pub use miku_abi::cred::CAP_SYS_ADMIN;
 /// Reboot and power off
-pub const CAP_SYS_BOOT:     u8 = 9;
+pub use miku_abi::cred::CAP_SYS_BOOT;
 /// Open a raw socket
-pub const CAP_NET_RAW:      u8 = 10;
+pub use miku_abi::cred::CAP_NET_RAW;
 /// Bind a port below 1024
-pub const CAP_NET_BIND:     u8 = 11;
+pub use miku_abi::cred::CAP_NET_BIND;
 /// Create a device node
-pub const CAP_MKNOD:        u8 = 12;
+pub use miku_abi::cred::CAP_MKNOD;
 /// Bind the display server's privileged globals (may_wm, may_console,
 /// may_layer)
-pub const CAP_MAY_PRIV:     u8 = 13;
+pub use miku_abi::cred::CAP_MAY_PRIV;
 /// Write to the security journal
-pub const CAP_AUDIT:        u8 = 14;
+pub use miku_abi::cred::CAP_AUDIT;
 /// Submit work to the GPU directly
-pub const CAP_GPU:          u8 = 15;
+pub use miku_abi::cred::CAP_GPU;
 
 /// The highest capability number that exists. Anything above is refused rather
 /// than ignored: a capset() dropping an unknown bit would let a future kernel's
 /// rule be bypassed by an old one's tolerance
-pub const CAP_LAST: u8 = CAP_GPU;
+pub use miku_abi::cred::CAP_LAST;
 
 /// Every capability. What uid 0 holds, and what mikuD hands its own children
 pub const CAP_ALL: CapSet = CapSet((1u64 << (CAP_LAST + 1)) - 1);
@@ -162,7 +162,7 @@ impl CapSet {
 
 /// The largest id that may be used. 0xFFFF is reserved as chown's "leave this
 /// one alone" sentinel (see sys_chown), so it is not available as a user
-pub const ID_MAX: u16 = 0xFFFE;
+pub use miku_abi::cred::ID_MAX;
 
 /// The id a file gets when its on-disk owner does not fit in a u16. An ext4
 /// volume written elsewhere can hold uid 65536, and truncating that to 16 bits

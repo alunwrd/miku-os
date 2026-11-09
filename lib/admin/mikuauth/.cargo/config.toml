@@ -1,0 +1,23 @@
+# The repository root sets `target = "x86_64-unknown-none"` and `build-std` for
+# the kernel, and a cargo config applies to every directory beneath it. This
+# crate wants the build host: its tests need `std`.
+#
+# `build.target` is overridden to the host. `build-std` cannot be turned off,
+# since cargo merges arrays by union, and with it on `core` gets built from
+# source while the toolchain's `std` brings its own (a duplicate `sized` lang
+# item). Adding `std` to the list puts everything in one source tree. It costs
+# one slow first build and is cached after that.
+#
+# Building this crate for MikuOS still works: the programs pass `--target
+# ../../sdk/miku/x86_64-miku-app.json`, which wins over `build.target`. `target-dir`
+# keeps its host artifacts out of the root `target/`, where the from-source
+# `core` and the toolchain's own would land side by side and fail to link
+[build]
+target = "x86_64-unknown-linux-gnu"
+target-dir = "target"
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = []
+
+[unstable]
+build-std = ["std", "panic_unwind", "proc_macro", "test"]

@@ -22,12 +22,7 @@ pub const OID_SHA384_RSA:   &[u8] = &[0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x
 pub const OID_SHA512_RSA:   &[u8] = &[0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x01,0x0D];
 /// 1.2.840.10045.2.1 id-ecPublicKey
 pub const OID_EC_PUBKEY:    &[u8] = &[0x2A,0x86,0x48,0xCE,0x3D,0x02,0x01];
-/// 1.2.840.10045.3.1.7 prime256v1 (NIST P-256)
-pub const OID_P256:         &[u8] = &[0x2A,0x86,0x48,0xCE,0x3D,0x03,0x01,0x07];
-/// 1.3.132.0.34 secp384r1 (NIST P-384)
-pub const OID_P384:         &[u8] = &[0x2B,0x81,0x04,0x00,0x22];
-/// 1.3.132.0.35 secp521r1 (NIST P-521)
-pub const OID_P521:         &[u8] = &[0x2B,0x81,0x04,0x00,0x23];
+pub use crate::ec::{OID_P256, OID_P384, OID_P521};
 /// 1.2.840.10045.4.3.2 ecdsa-with-SHA256
 pub const OID_ECDSA_SHA256: &[u8] = &[0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x02];
 /// 1.2.840.10045.4.3.3 ecdsa-with-SHA384
@@ -54,24 +49,7 @@ pub enum SigAlg {
     Ecdsa(Hash),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Hash { Sha1, Sha256, Sha384, Sha512 }
-
-impl Hash {
-    pub fn len(&self) -> usize {
-        match self { Hash::Sha1 => 20, Hash::Sha256 => 32, Hash::Sha384 => 48, Hash::Sha512 => 64 }
-    }
-    /// Digest into a 64-byte buffer, returning the written slice
-    pub fn digest<'b>(&self, data: &[u8], out: &'b mut [u8; 64]) -> &'b [u8] {
-        use crate::crypto;
-        match self {
-            Hash::Sha1   => { out[..20].copy_from_slice(&crypto::sha1(data));   &out[..20] }
-            Hash::Sha256 => { out[..32].copy_from_slice(&crypto::sha256(data)); &out[..32] }
-            Hash::Sha384 => { out[..48].copy_from_slice(&crypto::sha384(data)); &out[..48] }
-            Hash::Sha512 => { out[..64].copy_from_slice(&crypto::sha512(data)); &out[..64] }
-        }
-    }
-}
+pub use crate::crypto::Hash;
 
 /// The key itself, still in the certificate's bytes
 #[derive(Clone, Copy)]
@@ -153,17 +131,7 @@ fn parse_sig_alg<'a>(alg: &Tlv<'a>) -> Option<(SigAlg, Option<&'a [u8]>)> {
     Some((oid_to_sig_alg(oid)?, None))
 }
 
-/// Days since the Unix epoch for a proleptic Gregorian date, to compare
-/// certificate UTC to a Unix timestamp
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
+use miku_base::date::days_from_civil;
 
 fn dec2(b: &[u8], i: usize) -> Option<i64> {
     let (a, c) = (*b.get(i)?, *b.get(i + 1)?);
@@ -387,4 +355,12 @@ fn name_matches(pattern: &[u8], host: &str) -> bool {
 fn eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// Extracts the RSA key from a certificate by parsing it
+pub fn parse_rsa_public_key(cert: &[u8]) -> Option<crate::rsa::RsaPublicKey> {
+    match Cert::parse(cert)?.key {
+        PublicKey::Rsa { n, e } => crate::rsa::RsaPublicKey::from_parts(n, e),
+        _ => None,
+    }
 }

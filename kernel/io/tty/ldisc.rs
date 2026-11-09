@@ -144,28 +144,28 @@ pub struct Termios {
 ///
 /// The POSIX slots this machine can act on. Each below is read by a line in
 /// `feed`
-pub const NCCS: usize = 7;
+pub use miku_abi::ktermios::NCCS;
 
 /// Interrupt: SIGINT to the foreground job. Ctrl-C
-pub const VINTR: usize = 0;
+pub use miku_abi::ktermios::VINTR;
 /// Quit: SIGQUIT. Ctrl-\
-pub const VQUIT: usize = 1;
+pub use miku_abi::ktermios::VQUIT;
 /// Erase one character. Backspace
-pub const VERASE: usize = 2;
+pub use miku_abi::ktermios::VERASE;
 /// Erase the whole line. Ctrl-U
-pub const VKILL: usize = 3;
+pub use miku_abi::ktermios::VKILL;
 /// End of file on an empty line, flush otherwise. Ctrl-D
-pub const VEOF: usize = 4;
+pub use miku_abi::ktermios::VEOF;
 /// Erase one word. Ctrl-W
-pub const VWERASE: usize = 5;
+pub use miku_abi::ktermios::VWERASE;
 /// Suspend: SIGTSTP to the foreground job. Ctrl-Z
-pub const VSUSP: usize = 6;
+pub use miku_abi::ktermios::VSUSP;
 
 /// A control character being disabled: `_POSIX_VDISABLE`
 ///
 /// A terminal with `c_cc[VINTR] = 0` has no interrupt character, as a
 /// full-screen editor may want
-pub const VDISABLE: u8 = 0;
+pub use miku_abi::ktermios::VDISABLE;
 
 impl Termios {
     pub const fn cooked() -> Self {

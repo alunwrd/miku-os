@@ -195,14 +195,14 @@ fn paint(name: &str, kind: u8) -> String {
 
 /// Whether fd 1 is a terminal
 fn to_terminal() -> bool {
-    const TIOCGWINSZ: u64 = 0x5413;
+    use miku_abi::ioctl::TIOCGWINSZ;
     let mut ws = [0u16; 4];
     unsafe { miku::miku_ioctl(1, TIOCGWINSZ, ws.as_mut_ptr() as u64) >= 0 }
 }
 
 /// Terminal width from `TIOCGWINSZ`, or 80 when redirected
 fn term_width() -> usize {
-    const TIOCGWINSZ: u64 = 0x5413;
+    use miku_abi::ioctl::TIOCGWINSZ;
     let mut ws = [0u16; 4]; // rows, cols, xpixel, ypixel
     let rc = unsafe { miku::miku_ioctl(1, TIOCGWINSZ, ws.as_mut_ptr() as u64) };
     if rc < 0 || ws[1] == 0 { 80 } else { ws[1] as usize }

@@ -493,9 +493,9 @@ pub fn sys_setsockopt(fd: u64, level: u64, optname: u64, value: u64) -> u64 {
 /// The start tick is included because a pid alone is not an identity: a caller
 /// storing a peer's identity and comparing later must compare both
 pub fn sys_peercred(fd: u64, out: u64) -> u64 {
-    const PEERCRED_SIZE: u64 = 40;
+    use miku_abi::cred::MikuPeerCred;
     let cr3 = current_cr3();
-    let _ua = match user_ptr_writable(cr3, out, PEERCRED_SIZE) {
+    let _ua = match user_ptr_writable(cr3, out, core::mem::size_of::<MikuPeerCred>() as u64) {
         Some(g) => g,
         None => return e(EFAULT),
     };
@@ -503,16 +503,16 @@ pub fn sys_peercred(fd: u64, out: u64) -> u64 {
         Some(c) => c,
         None    => return e(ENOTCONN),
     };
-    unsafe {
-        let p = out as *mut u8;
-        (p.add(0)  as *mut u64).write_unaligned(pc.pid);
-        (p.add(8)  as *mut u64).write_unaligned(pc.start_tick);
-        (p.add(16) as *mut u32).write_unaligned(pc.uid  as u32);
-        (p.add(20) as *mut u32).write_unaligned(pc.gid  as u32);
-        (p.add(24) as *mut u32).write_unaligned(pc.euid as u32);
-        (p.add(28) as *mut u32).write_unaligned(pc.egid as u32);
-        (p.add(32) as *mut u64).write_unaligned(0); // reserved
-    }
+    let rec = MikuPeerCred {
+        pid: pc.pid,
+        start_tick: pc.start_tick,
+        uid: pc.uid as u32,
+        gid: pc.gid as u32,
+        euid: pc.euid as u32,
+        egid: pc.egid as u32,
+        _reserved: 0,
+    };
+    unsafe { (out as *mut MikuPeerCred).write_unaligned(rec) };
     0
 }
 

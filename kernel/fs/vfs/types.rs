@@ -274,7 +274,7 @@ impl FsType {
             FsType::DevFS  => 0x1373,
             FsType::ProcFS => 0x9FA0,
             // `_BHRfS_M`, truncated to the 32 bits of this field. The whole
-            // eight bytes are in `lib/btrfs`; this is only what statfs prints
+            // eight bytes are in `lib/fs/btrfs`; this is only what statfs prints
             FsType::Btrfs  => 0x9123_683E,
             // `MEMF`. With no superblock, this is a name for `statfs` to print
             FsType::MemFs  => 0x4D45_4D46,
@@ -428,19 +428,19 @@ pub struct OpenFlags(pub u32);
 
 impl OpenFlags {
     pub const EMPTY: Self = Self(0);
-    pub const READ: u32 = 0x0001;
-    pub const WRITE: u32 = 0x0002;
-    pub const RDWR: u32 = 0x0003;
-    pub const APPEND: u32 = 0x0004;
-    pub const CREATE: u32 = 0x0008;
-    pub const EXCLUSIVE: u32 = 0x0010;
-    pub const TRUNCATE: u32 = 0x0020;
-    pub const DIRECTORY: u32 = 0x0040;
-    pub const NOFOLLOW: u32 = 0x0080;
+    pub const READ: u32 = miku_abi::fcntl::O_RDONLY as u32;
+    pub const WRITE: u32 = miku_abi::fcntl::O_WRONLY as u32;
+    pub const RDWR: u32 = miku_abi::fcntl::O_RDWR as u32;
+    pub const APPEND: u32 = miku_abi::fcntl::O_APPEND as u32;
+    pub const CREATE: u32 = miku_abi::fcntl::O_CREAT as u32;
+    pub const EXCLUSIVE: u32 = miku_abi::fcntl::O_EXCL as u32;
+    pub const TRUNCATE: u32 = miku_abi::fcntl::O_TRUNC as u32;
+    pub const DIRECTORY: u32 = miku_abi::fcntl::O_DIRECTORY as u32;
+    pub const NOFOLLOW: u32 = miku_abi::fcntl::O_NOFOLLOW as u32;
     pub const DIRECT: u32 = 0x0100;
-    pub const SYNC: u32 = 0x0200;
-    pub const NONBLOCK: u32 = 0x0400;
-    pub const CLOEXEC: u32 = 0x0800;
+    pub const SYNC: u32 = miku_abi::fcntl::O_SYNC as u32;
+    pub const NONBLOCK: u32 = miku_abi::fcntl::O_NONBLOCK as u32;
+    pub const CLOEXEC: u32 = miku_abi::fcntl::O_CLOEXEC as u32;
     pub const NOATIME: u32 = 0x1000;
 
     #[inline]

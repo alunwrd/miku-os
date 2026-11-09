@@ -69,25 +69,17 @@ fn main() {
 // Generates the MIKU_LIBS preload table (src/ldso.rs) from the shared library
 // manifest
 fn generate_miku_libs_table() {
-    let list = Path::new("lib/mikulibs/libs.list");
-    let src = std::fs::read_to_string(list)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", list.display()));
-
     let mut output = String::from("pub static MIKU_LIBS: &[MikuLib] = &[\n");
-    for line in src.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let name = line.split(':').next().unwrap().trim();
+    for lib in miku_buildgen::libs::read(Path::new("lib/runtime/libmiku")) {
+        let name = lib.name;
         output.push_str(&format!(
-            "    MikuLib {{ name: \"{name}.so\", bytes: include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/lib/mikulibs/libs/{name}.so\")) }},\n"
+            "    MikuLib {{ name: \"{name}.so\", bytes: include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/lib/runtime/libmiku/libs/{name}.so\")) }},\n"
         ));
     }
     output.push_str("];\n");
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     std::fs::write(Path::new(&out_dir).join("miku_libs.rs"), output).unwrap();
-    println!("cargo:rerun-if-changed=lib/mikulibs/libs.list");
+    println!("cargo:rerun-if-changed=lib/runtime/libmiku/libs.list");
 }
 

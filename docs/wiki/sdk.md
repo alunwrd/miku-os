@@ -34,7 +34,7 @@ kernel subsystem are [processes.md](processes.md).
 | | no_std + libmiku | Rust `std` | C |
 |---|---|---|---|
 | Crates | `system/`, `utils/`, `apps/` | `stdapps/`, `aosh/`, Zed | C files inside a `std` crate (`stdapps/c/`) |
-| Target | `lib/miku/x86_64-miku-app.json` (`os: none`, static relocation, `ET_EXEC`) | `lib/rust-std/x86_64-unknown-miku.json` (`os: miku`, `target_family = "unix"`, PIE) | the same as `std`; compiled by `lib/c/miku-cc` |
+| Target | `lib/sdk/miku/x86_64-miku-app.json` (`os: none`, static relocation, `ET_EXEC`) | `lib/sdk/rust-std/x86_64-unknown-miku.json` (`os: miku`, `target_family = "unix"`, PIE) | the same as `std`; compiled by `lib/sdk/c/miku-cc` |
 | Built with | `cargo +nightly build -Z build-std=core,alloc` | `cd builder && cargo run --release -- std <crate>` | `cc` crate from a `build.rs` |
 | Runtime | `miku` crate: `_start`, allocator, bindings to the ten libraries | `std` (patched upstream) over libmiku and `libc_miku` | `libc_miku.so` |
 | Panics | your `#[panic_handler]` | `panic = "abort"` | - |
@@ -49,7 +49,7 @@ libraries. There is no static libc and no second libc: one `malloc`, one
 
 ## 1. no_std Rust with libmiku
 
-A no_std program depends on the `miku` crate (`lib/miku`), which declares
+A no_std program depends on the `miku` crate (`lib/sdk/miku`), which declares
 every function the ten shared libraries export, provides a `_start` that
 initialises the environment and calls your `_start_main`, sets the global
 allocator to libmiku's heap (so `alloc::Vec`, `String` and `Box` work), and
@@ -105,7 +105,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! { miku::exit(1); }
 ```
 
 `_start_main` may take `()`, `(argc, argv)` or `(argc, argv, envp)`: the
-`_start` in `lib/miku/src/lib.rs` passes all three in `rdi`, `rsi`, `rdx`
+`_start` in `lib/sdk/miku/src/lib.rs` passes all three in `rdi`, `rsi`, `rdx`
 after calling `miku_env_init(envp)`, so `miku_getenv` sees the environment the
 process was given.
 
@@ -120,7 +120,7 @@ edition = "2021"
 [workspace]                       # each program crate is its own workspace
 
 [dependencies]
-miku = { path = "../lib/miku" }
+miku = { path = "../lib/sdk/miku" }
 
 [profile.release]
 opt-level = 1
@@ -132,13 +132,13 @@ path = "src/hello.rs"
 ```
 
 The crate must sit **one level below the repository root**: the target spec
-passes `-T../lib/miku/linker.ld`, which the linker resolves against the crate
+passes `-T../lib/sdk/miku/linker.ld`, which the linker resolves against the crate
 being built. Build it the way the builder does (`build_program_crate` in
 `builder/src/main.rs`):
 
 ```bash
 cd apps
-cargo +nightly build --release --target ../lib/miku/x86_64-miku-app.json \
+cargo +nightly build --release --target ../lib/sdk/miku/x86_64-miku-app.json \
   -Z json-target-spec -Z build-std=core,alloc \
   -Z build-std-features=compiler-builtins-mem --bin hello
 # -> apps/target/x86_64-miku-app/release/hello
@@ -154,7 +154,8 @@ The `miku` crate has three layers:
 
 - **`extern "C"` declarations** of every `miku_*` function (I/O, strings,
   memory, files, processes, threads, time, sockets, data structures, codecs,
-  parsers), linked against `core_miku` and the other libraries;
+  parsers), generated from the definitions, and of `libc_miku`'s in `miku::libc`,
+  linked against `core_miku` and the other libraries;
 - **safe wrappers** at the top level: `print`, `println`, `eprint`,
   `eprintln`, `print_int`, `print_hex`, `exit`, `args`, `getpid`, `gettid`,
   `open`, `close`, `read`, `write`, `read_file`, `seek`, `fsize`, `sleep`,
@@ -178,8 +179,8 @@ The `miku` crate has three layers:
 ## 2. Rust std
 
 Since 2026-09-22 MikuOS has a Rust `std`: the target
-`lib/rust-std/x86_64-unknown-miku.json` (`"os": "miku"`, `target_family =
-"unix"`) and a patch to upstream's `library/` in `lib/rust-std/library/`. A
+`lib/sdk/rust-std/x86_64-unknown-miku.json` (`"os": "miku"`, `target_family =
+"unix"`) and a patch to upstream's `library/` in `lib/sdk/rust-std/library/`. A
 `std` program has an **ordinary `Cargo.toml` with no MikuOS dependency**.
 
 ### A complete program
@@ -236,8 +237,8 @@ puts the patch on the toolchain's own `rust-src`, which
 `refsrc/miku_programs/rust` is pinned to, into `target/rust-src-miku/`, and
 first fetches back any crate source cargo's cache clean removed), passes `-Z
 build-std=std,panic_abort`, the linker script and the link stubs, exports the
-C toolchain (`CC_x86_64_unknown_miku=lib/c/miku-cc`, `llvm-ar`), and hashes
-`lib/rust-std/library` and the target spec so a change to the patch is not
+C toolchain (`CC_x86_64_unknown_miku=lib/sdk/c/miku-cc`, `llvm-ar`), and hashes
+`lib/sdk/rust-std/library` and the target spec so a change to the patch is not
 silently ignored (`-Z build-std` fingerprints the sysroot by path). The crate
 needs:
 
@@ -297,17 +298,17 @@ back to "unsupported".
 
 ```
 your program
-   |  std (lib/rust-std/library/std/src/sys/*/miku.rs, the PAL)
+   |  std (lib/sdk/rust-std/library/std/src/sys/*/miku.rs, the PAL)
    |     calls libmiku through one seam: sys/pal/miku/abi.rs
    |  crates.io code under cfg(unix)
-   |     libc crate      -> lib/rust-libc  (a `miku` module: types, constants,
+   |     libc crate      -> lib/sdk/rust-libc  (a `miku` module: types, constants,
    |                                         ~30 C functions it declares)
    |     rustix          -> two arms, applied by anchor
    |     mio, socket2, tokio, inotify -> MikuOS added beside `hurd` in their
    |                                     target lists
    |     (both: builder/src/stdport/arms.rs)
    v
-libc_miku.so + core_miku.so ... (lib/libmiku)  ->  syscalls
+libc_miku.so + core_miku.so ... (lib/runtime/libmiku)  ->  syscalls
 ```
 
 - **The PAL calls libmiku, not the system calls.** Every `miku_*` symbol it
@@ -321,7 +322,7 @@ libc_miku.so + core_miku.so ... (lib/libmiku)  ->  syscalls
   `sys/` module is checked by what it does on a boot, never by whether it
   compiles.
 - **The `libc` crate is for everything else** that says `cfg(unix)`
-  (`lib/rust-libc/libc/src/unix/miku/mod.rs`, 2100 lines): Linux-shaped
+  (declarations in `lib/sdk/rust-libc`, types and constants in `lib/abi`): Linux-shaped
   `stat`, `termios`, `sigaction`, `ucontext_t`, `pollfd`, `sockaddr_*`, and
   MikuOS's own constant values (its `O_*` differ from Linux's). The C side of
   each function is in `libc_miku.so`, which must speak the **C convention**
@@ -338,7 +339,7 @@ The design and history are in [dev/std-architecture.md](../../dev/std-architectu
 ## 3. C through libc_miku
 
 C reaches a MikuOS program as **static archives inside a Rust program**. There
-is no C-only program and no C linker path: `lib/c/miku-cc` only compiles
+is no C-only program and no C linker path: `lib/sdk/c/miku-cc` only compiles
 (`-c`), and rustc links the objects with `rust-lld` like everything else.
 
 ### A complete example
@@ -389,16 +390,16 @@ builder's `std` step; `cc` finds the compiler through `CC_x86_64_unknown_miku`.
 
 ### miku-cc
 
-`lib/c/miku-cc` runs the host's **clang** with MikuOS's code model
+`lib/sdk/c/miku-cc` runs the host's **clang** with MikuOS's code model
 (`x86_64-unknown-none-elf`, PIC, no red zone), `-nostdlibinc` so the host's
 `/usr/include` is never seen (a Linux header that compiles is a Linux layout in
-a MikuOS program), clang's own freestanding headers, then `lib/c/include` and
+a MikuOS program), clang's own freestanding headers, then `lib/sdk/c/include` and
 the generated `target/miku-c/include`. It defines `__miku__` and `__unix__`
 and the `HAVE_*` facts portable C checks for. A `--target` from the build
 system is replaced, and a link request is refused. The constants it includes
 are generated by the builder before any C compiles (`builder/src/stdport/cheaders.rs`,
 from the Rust `libc` module, so `O_CREAT` and the rest are MikuOS's values);
-when a header changed, it compiles `lib/c/check/layout.c` first.
+when a header changed, it compiles `lib/sdk/c/check/layout.c` first.
 
 ### The rules
 
@@ -407,10 +408,10 @@ when a header changed, it compiles `lib/c/check/layout.c` first.
   to learn it. The builder checks it before every `std` build, against the
   link stubs with `nm` (`builder/src/stdport/cheaders.rs`).
 - **Layouts are pinned** to the Rust `libc` module's definitions by
-  `_Static_assert`s on sizes and offsets in `lib/c/check/layout.c`, compiled on
+  `_Static_assert`s on sizes and offsets in `lib/sdk/c/check/layout.c`, compiled on
   every C build, and checked again at run time by `stdc`. The C structs are
   Linux's shapes where the kernel's are smaller: `struct stat` is 144 bytes in
-  C over the kernel's 64 (`to_c_stat` in `lib/libmiku/libc.rs`), `struct
+  C over the kernel's 64 (`to_c_stat` in `lib/runtime/libmiku/libc/`), `struct
   termios` 60 over the kernel's 14.
 - Data symbols cannot cross the link stubs, so `stdout` is
   `__miku_stdfile(1)` behind a macro.
@@ -423,34 +424,34 @@ Design: [dev/c-architecture.md](../../dev/c-architecture.md).
 
 ## The miku libraries
 
-libmiku's sources (`lib/libmiku/`) are built into ten shared libraries
-(`lib/mikulibs/`), declared with their dependency graph in
-`lib/mikulibs/libs.list`, which drives the library build, the kernel's preload
-table, the builder and the link stubs:
+`lib/runtime/libmiku/` builds ten shared libraries, one directory each, with a
+`main.rs` and its modules beside it. `libs.list` holds the names and the dependency
+graph, and drives the library build, the kernel's preload table, the builder and
+the link stubs, all through `lib/buildgen`:
 
-| Library | Depends on | Modules (from `lib/libmiku/`) |
+| Library | Depends on | Modules |
 |---|---|---|
-| `core_miku.so` | - | sys, errno, sync, panic, mem, heap_core, heap, io, proc, thread, string, ctype, convert, num, stdio, time, auxv |
+| `core_miku.so` | - | errno, sync, panic, mem, heap_core, heap, io, proc, thread, string, ctype, convert, num, stdio, time, auxv |
 | `sys_miku.so` | core | signal, env, event, timer, log, test, datetime |
-| `text_miku.so` | core | utf8, strbuf, format, fmt, glob, regex |
-| `ds_miku.so` | core | vec, list, queue, hashmap, treemap, trie, ringbuf, ringbuf2, bitset, heap_queue, channel, arena, slab, pool |
+| `text_miku.so` | core | utf8, strbuf, fmt, glob, regex |
+| `ds_miku.so` | core | vec, list, queue, hashmap, treemap, trie, ringbuf, bitset, heap_queue, channel, arena, slab, pool |
 | `algo_miku.so` | core | sort, hash, bitops, math, random, endian |
 | `codec_miku.so` | core, algo | base64, hex, checksum, sha256, lz, uuid |
 | `fs_miku.so` | core | file, bufio, dir, path |
 | `net_miku.so` | - | net |
-| `parse_miku.so` | core, text | json, csv, ini, getopt, args |
-| `libc_miku.so` | core, fs, sys, algo, text | libc, cmath, and `c/`: printf, strtod, ctime, pthread, netdb, termios, scanf, pty, accounts, sysinfo, at, setjmp |
+| `parse_miku.so` | core, text | json, csv, ini, args |
+| `libc_miku.so` | core, fs, sys, algo, text | a file per C header (`stdio_h`, `string_h`, `unistd_h`, ...), cmath, printf, strtod, ctime, pthread, netdb, termios, scanf, pty, accounts, sysinfo, at, setjmp |
 
 About **1440 functions** are exported in all (`#[no_mangle]`), about 900 of
 them `miku_*` and about 540 in `libc_miku.so`. Libraries call each other only
 through the C ABI; a module used by another library is reached through a thin
-forwarding shim (`lib/mikulibs/shim/`), so a module's source is the same
-whether its dependency is in its own library or another. A `#[no_mangle]`
-function must have `#[no_mangle]` directly above `fn` (attributes only, no doc
-comment between): the stub generator (`lib/mikulibs/build.rs`) reads it that
-way.
+forwarding shim, generated at build time (`lib/runtime/libmiku/shim/README.md`), so
+a module's source is the same whether its dependency is in its own library or
+another. A `#[no_mangle]` function must have `#[no_mangle]` directly above `fn`
+(attributes only, no doc comment between): `lib/buildgen/src/exports.rs` reads it
+that way.
 
-The libraries are built with the target `lib/mikulibs/x86_64-miku-lib.json`
+The libraries are built with the target `lib/runtime/libmiku/x86_64-miku-lib.json`
 and **embedded in the kernel image** (the kernel's `build.rs` generates the
 table from `libs.list` with `include_bytes!`), as is `ld-miku.so`. At boot they
 appear in `/lib` as read-only vnodes and in the kernel's shared-object cache,
@@ -467,11 +468,11 @@ noted; `libc_miku`'s POSIX functions return `-1` and set `errno`.
 
 | Area | Module (library) | What it provides |
 |---|---|---|
-| system calls | `sys` | the numbers (`SYS_*`) and the inline `sc0`..`sc4` stubs; not exported |
+| system calls | `lib/abi/src/sys.rs` | the numbers (`SYS_*`) and the inline `sc0`..`sc4` stubs |
 | errors | `errno` (core) | the codes, `miku_strerror`, `miku_perror`, the thread's `errno` at `tp + 40` |
 | I/O | `io` (core) | `miku_write`, `miku_read`, `miku_poll`, `miku_ioctl`, `miku_klog` |
 | stdio | `stdio` (core), `fmt` (text) | `miku_print`, `miku_println`, `miku_printf`, `miku_snprintf`, `miku_dprintf`, `miku_getchar`, `miku_readline` |
-| strings | `string`, `ctype`, `convert`, `num` (core), `utf8`, `strbuf`, `format`, `glob`, `regex` (text) | C string functions, classification, `strtol`, number formatting, UTF-8, growable strings, globbing, a small regex |
+| strings | `string`, `ctype`, `convert`, `num` (core), `utf8`, `strbuf`, `glob`, `regex` (text) | C string functions, classification, `strtol`, number formatting, UTF-8, growable strings, globbing, a small regex |
 | memory | `mem` (core) | `miku_memcpy`, `memset`, `memmove`, `memcmp` (word-at-a-time) |
 | heap | `heap`, `heap_core` (core) | `miku_malloc`, `free`, `realloc`, `calloc`, `memalign` (below) |
 | processes | `proc` (core) | `fork`, `exec`, `execve`, `wait4`/`waitpid`/`try_wait`, `kill`/`killpg`, `getpid`, `brk`, `mmap`/`munmap`/`mprotect`/`mmap_file`/`msync`, credentials, sessions, `tty`, `procinfo`, `proc_path`, `kcmd`, `power`, `peercred`, `sendfd`/`recvfd`, `map_lib` |
@@ -480,18 +481,18 @@ noted; `libc_miku`'s POSIX functions return `-1` and set `errno`.
 | time | `time` (core), `timer`, `datetime` (sys) | `miku_sleep` (4 ms ticks), `miku_sleep_ms`, `miku_sleep_ns`, `miku_uptime_ms`, `miku_clock_gettime` (vDSO first), `miku_realtime`, stopwatches, one-shot timers, calendar formatting |
 | auxv | `auxv` (core) | `miku_getauxval`, `miku_set_auxv` (called by ld-miku), the vDSO lookup |
 | signals | `signal` (sys) | `miku_signal`, `miku_sigaction`, the handler table, the blocked mask, the entry stub |
-| environment | `env` (sys) | `miku_env_init`, `miku_getenv`, `miku_setenv`, `miku_unsetenv`, `miku_environ` (a heap table, no size limits) |
+| environment | `env` (sys) | `miku_env_init`, `miku_getenv`, `miku_setenv`, `miku_unsetenv`, `miku_environ` (a heap table, no size limits; a null key or value is refused) |
 | files | `file`, `bufio`, `dir`, `path` (fs) | open/close/seek/stat/lstat/fstat/getdents/mkdir/rename/link/symlink/chmod/chown/utimensat/realpath and the `*at` forms, buffered readers and writers, directory iteration and walks, `miku_mkdir_p`, path manipulation |
 | network | `net` (net) | TCP, UDP, ICMP and AF_UNIX sockets, `miku_set_ttl` |
 | data structures | ds | vectors, lists, queues, hash maps, AVL tree maps, tries, ring buffers, bitsets, priority queues, channels, arenas, slabs, pools |
-| algorithms | algo | sort and search, hashes (FNV, djb2, CRC32, SipHash, Murmur3), bit operations, integer maths, the PRNG (`miku_rand`, seeded from uptime and pid: **not** for secrets; use `miku_getrandom`), endian conversion |
-| codecs | codec | base64, hex, checksums, SHA-256 and HMAC, an LZ compressor, UUIDs |
-| parsing | parse | JSON (reader and writer), CSV, INI, `getopt`, a flag parser |
+| algorithms | algo | sort and search, hashes (FNV, djb2, SipHash, Murmur3), bit operations, integer maths, the PRNG (`miku_rand`, seeded from uptime and pid: **not** for secrets; use `miku_getrandom`), endian conversion |
+| codecs | codec | base64, hex, checksums and CRC32, SHA-256 and HMAC, an LZ compressor, UUIDs |
+| parsing | parse | JSON (reader and writer), CSV, INI, a flag parser |
 | logging, tests, events | `log`, `test`, `event` (sys) | leveled logging, a test framework, callbacks |
 
 ### Heap
 
-`lib/libmiku/heap.rs` is every program's `malloc` (Rust programs import
+`lib/runtime/libmiku/core/heap.rs` is every program's `malloc` (Rust programs import
 `malloc`/`free`/`realloc` from `core_miku.so`). Since 2026-10-20:
 
 - **segregated bins**: one per 16-byte size below 1 KiB, then four per power
@@ -510,13 +511,13 @@ noted; `libc_miku`'s POSIX functions return `-1` and set `errno`.
 
 The allocator itself is `heap_core.rs`, shared with nothing else in ring 3
 (the kernel has its own slab heap since 2026-10-27). Host tests: `cd
-lib/libmiku/hosttest && cargo test` (compiles `heap.rs` by `#[path]` over a
+lib/runtime/libmiku/hosttest && cargo test` (compiles `heap.rs` by `#[path]` over a
 stand-in `mmap`; `heap::check` verifies tiling, tags, bins and bitmap). Not done
 yet: growing `realloc` in place, returning empty slabs.
 
 ### fork safety
 
-`miku_fork` (`lib/libmiku/proc.rs`) holds libmiku's locks across the system
+`miku_fork` (`lib/runtime/libmiku/core/proc.rs`) holds libmiku's locks across the system
 call so the child never inherits one held by a sibling thread: hooks' outer
 locks (the environment), the heap lock, hooks' inner locks, the syscall, then
 the parent and child hooks in reverse, then the heap unlock. The child
@@ -539,11 +540,11 @@ sleep 40 % of what it asked). For real durations use `miku_sleep_ms`,
 ## libc_miku
 
 `libc_miku.so` is the C library: about 540 functions, written in Rust in
-`lib/libmiku/libc.rs`, `lib/libmiku/cmath.rs` and `lib/libmiku/c/`.
+`lib/runtime/libmiku/libc/`, `lib/runtime/libmiku/libc/cmath.rs` and `lib/runtime/libmiku/libc/`.
 
 ### The headers
 
-47 headers in `lib/c/include` (plus the generated `bits/` constants):
+47 headers in `lib/sdk/c/include` (plus the generated `bits/` constants):
 
 | Header | What it declares |
 |---|---|
@@ -578,7 +579,7 @@ sleep 40 % of what it asked). For real durations use `miku_sleep_ms`,
 
 ### Notes by area
 
-- **pthreads** (`c/pthread.rs`): the pthread block lives at TCB `tp + 48`,
+- **pthreads** (`libc/pthread.rs`): the pthread block lives at TCB `tp + 48`,
   made on first use, so threads started by Rust or libmiku also get one.
   Mutexes and condvars are futex-based; process-shared ones work in a tmpfs
   `MAP_SHARED` mapping.
@@ -586,20 +587,20 @@ sleep 40 % of what it asked). For real durations use `miku_sleep_ms`,
   all; `atexit` handlers run at `exit`.
 - **malloc** is libmiku's heap.
 - **termios and pty**: Linux's 60-byte `struct termios` translated to the
-  kernel's 14 bytes (`c/termios.rs`); speeds are stored and have no effect;
+  kernel's 14 bytes (`libc/termios.rs`); speeds are stored and have no effect;
   `openpty` and `login_tty` are `open("/dev/ptmx")`, `TIOCGPTN`,
-  `/dev/ptsN` and `TIOCSCTTY` (`c/pty.rs`).
-- **getaddrinfo** (`c/netdb.rs`): a numeric address, `localhost`,
+  `/dev/ptsN` and `TIOCSCTTY` (`libc/pty.rs`).
+- **getaddrinfo** (`libc/netdb.rs`): a numeric address, `localhost`,
   `/etc/hosts`, then one DNS query to the DHCP lease's resolver; IPv4 only.
   The wire format is shared with `mikunet` (`lib/net/src/dns_wire.rs`).
 - **select** is built on `poll` (MikuOS has no `select` of its own). `fd_set`
   is 1024 bits as everywhere, so **sockets, numbered from 4096, cannot be put in
   one**: use `poll` for anything that waits on a socket. The exception set is
   never marked.
-- **pwd and grp** (`c/accounts.rs`): `getpwnam_r`, `getpwuid`, `getpwuid_r`,
+- **pwd and grp** (`libc/accounts.rs`): `getpwnam_r`, `getpwuid`, `getpwuid_r`,
   `getgrnam_r`, `getgrgid_r`, `getgrouplist`, `initgroups`, `setgroups`,
   `getgroups`, reading `/etc/passwd` and `/etc/group`.
-- **sysinfo** (`c/sysinfo.rs`): `uname`, `sysconf` numbers and CPU tick
+- **sysinfo** (`libc/sysinfo.rs`): `uname`, `sysconf` numbers and CPU tick
   counts for system monitors.
 - **time**: `localtime` is UTC (there is no zone database).
 - **`pread`/`pwrite`** are `seek`, transfer, `seek` back: not atomic against
@@ -620,7 +621,7 @@ sleep 40 % of what it asked). For real durations use `miku_sleep_ms`,
 
 ### The layout static asserts
 
-`lib/c/check/layout.c` holds `_Static_assert`s on `sizeof` and `offsetof`
+`lib/sdk/c/check/layout.c` holds `_Static_assert`s on `sizeof` and `offsetof`
 for every struct the headers define (`stat`, `dirent`, `tm`, `timespec`,
 `timeval`, `pollfd`, `flock`, the pthread types, `sockaddr_*`, `termios` and
 the rest), against the values in the Rust `libc` module. `miku-cc` compiles it
@@ -632,7 +633,7 @@ Rust side (`stdc_sizeof`, `stdc_const` in `stdapps/c/stdc.c`).
 
 ## Dynamic linking
 
-Every MikuOS program has `PT_INTERP` = `/lib/ld-miku.so` (`lib/ld-miku/`). The
+Every MikuOS program has `PT_INTERP` = `/lib/ld-miku.so` (`lib/runtime/ld-miku/`). The
 kernel loads the program and ld-miku, and jumps to ld-miku
 ([processes.md](processes.md#the-elf-loader)), which:
 
@@ -665,8 +666,8 @@ local-exec) exists. A library with a `PT_TLS` of its own, or a program needing
 
 **Building a dynamically linked program** is the default: both targets set
 `--dynamic-linker=/lib/ld-miku.so` and link against the stubs in
-`lib/miku/stubs/` (stub `.so` files with the runtime sonames, generated by
-`lib/miku/build.rs` from `libs.list` and the `#[no_mangle]` functions). The
+`lib/sdk/miku/stubs/` (stub `.so` files with the runtime sonames, generated by
+`lib/sdk/miku/build.rs` from `libs.list` and the `#[no_mangle]` functions). The
 no_std target links only what the program uses; the `std` target names all ten
 libraries. Check a binary:
 
@@ -725,7 +726,7 @@ does **not** override the module's `/bin`.
   staged binary for a string you just added. A stale binary looks exactly like
   a broken program.
 - Test programs in `apps/` (`abitest`, `threadtest`, `polltest`, `sigtest`,
-  `crashtest`, `mmaptest`, `envtest`, `test_full`) and `stdapps/` (`std*`) are
+  `crashtest`, `mmaptest`, `envtest`, `testfull`) and `stdapps/` (`std*`) are
   on the image; many are also run headless with `run=` on the boot line.
 
 ---
@@ -737,18 +738,18 @@ does **not** override the module's `/bin`.
 | SQLite 3.46 | `libsqlite3-sys` with `bundled`, unmodified | `stdc`: in memory and on disk, reopened from another thread, record locks between two processes |
 | zstd | `zstd` / `zstd-sys`, unmodified | `stdc`: round trips |
 | tree-sitter | `tree-sitter` 0.25 + `tree-sitter-json`, unmodified | `stdc`: parses JSON |
-| FreeType 2.14.3 | vendored in `lib/freetype` (for aosh's text) | aosh |
+| FreeType 2.14.3 | vendored in `lib/gfx/freetype` (for aosh's text) | aosh |
 
 Adding one:
 
 1. Add the crate to a `std` crate's dependencies and build with the
    builder's `std` step.
 2. A compile error for a missing function or header: declare it in the right
-   `lib/c/include/*.h` **and** define it in `libc_miku.so`
-   (`lib/libmiku/libc.rs`, or a file under `lib/libmiku/c/` for an area).
-3. A new struct: its Rust definition in `lib/rust-libc/libc/src/unix/miku/`
-   first, then the header, then a line in `lib/c/check/layout.c`.
-4. A compiler flag goes in `lib/c/miku-cc` and nowhere else.
+   `lib/sdk/c/include/*.h` **and** define it in `libc_miku.so`
+   (`lib/runtime/libmiku/libc/`, or a file under `lib/runtime/libmiku/libc/` for an area).
+3. A new struct: its Rust definition in `lib/sdk/rust-libc/libc/src/unix/miku/`
+   first, then the header, then a line in `lib/sdk/c/check/layout.c`.
+4. A compiler flag goes in `lib/sdk/c/miku-cc` and nowhere else.
 5. If the C code needs what MikuOS cannot do, return `ENOSYS`, never success.
 
 Next on this path, per the design note: `aws-lc-sys` and `libmimalloc-sys`.
@@ -763,7 +764,7 @@ in"). `cd builder && cargo run --release -- zed build -p zed` builds it from a c
 upstream clone (`refsrc/miku_programs/zed` copied to `target/zed-miku/src` on
 every run), with the same target and overlays as `stdapps`, the crates that
 name targets patched through `--config` flags, and one patch per concern in
-`lib/rust-std/zed-patches/` (`client`, `crashes`, `fs`, `gpui`, `languages`,
+`lib/sdk/rust-std/zed-patches/` (`client`, `crashes`, `fs`, `gpui`, `languages`,
 `workspace`, `zed`). The builder ships the result as `/bin/zed`
 (`EXTERNAL_BINS`, package `zed`, stripped).
 
@@ -785,7 +786,7 @@ What it took, in the order it was found:
   `libc`/`rustix` overlays, mio/socket2/tokio target arms, C through
   `miku-cc` (SQLite, zstd, tree-sitter).
 - **Pixels**: gpui gets a Mayland client and a CPU renderer
-  (`lib/rust-std/zed-files/`, wired by `zed-patches/gpui.patch`); MikuOS sits
+  (`lib/sdk/rust-std/zed-files/`, wired by `zed-patches/gpui.patch`); MikuOS sits
   beside FreeBSD in `gpui_linux`.
 
 Milestones: `remote_server` ran and served a ping over Unix sockets on
@@ -798,34 +799,18 @@ keys; a real editing session ran on 2026-09-25/26. `Ctrl+W` is bound to
 
 ## Calling a system call directly
 
-From no_std Rust, copy the stub shape of `lib/libmiku/sys.rs`:
+From Rust, take the stubs and numbers from `lib/abi`, whose `sc0`..`sc4` declare
+what the kernel clobbers:
 
 ```rust
-use core::arch::asm;
-
-/// syscall with four arguments; returns the raw value (negative = -errno)
-#[inline(always)]
-unsafe fn sc4(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
-    let r: i64;
-    asm!(
-        "syscall",
-        in("rax") nr, inlateout("rdi") a1 => _, inlateout("rsi") a2 => _,
-        inlateout("rdx") a3 => _, inlateout("r10") a4 => _,
-        lateout("rax") r,
-        out("rcx") _, out("r11") _,
-        lateout("r8") _, lateout("r9") _,
-        options(nostack)
-    );
-    r
-}
+use miku_abi::posix::pollfd;
+use miku_abi::poll::POLLIN;
+use miku_abi::sys::{sc3, SYS_POLL_NS};
 
 // poll_ns (123) has no library wrapper: wait up to 1.5 ms on one descriptor
-#[repr(C)]
-struct PollFd { fd: i32, events: i16, revents: i16 }
-
 fn wait_readable(fd: i32) -> i64 {
-    let mut p = PollFd { fd, events: 0x001, revents: 0 };
-    unsafe { sc4(123, &mut p as *mut PollFd as u64, 1, 1_500_000, 0) }
+    let mut p = pollfd { fd, events: POLLIN, revents: 0 };
+    unsafe { sc3(SYS_POLL_NS, &mut p as *mut pollfd as u64, 1, 1_500_000) }
 }
 ```
 
@@ -869,34 +854,18 @@ order and error codes of every call are in the
 | a handler does not run | signals from another process arrive only at a system call boundary; install with `sigaction`/`miku_signal` (which registers the entry point), not `sigdisp` alone |
 | it hangs | `ps` for its state; `mikudo dmesg -f` while reproducing; a wait that ends after exactly 100 ms is a lost wake; [diagnostics.md](diagnostics.md#how-to-debug-x) |
 | progress logging | `miku_klog("...")` and `mikudo dmesg -m user` (or `-g`) |
-| a std program misbehaves only on MikuOS | a `cfg_select!` arm falling back to `unsupported`; check the PAL in `lib/rust-std/library/std/src/sys/*/miku.rs` |
+| a std program misbehaves only on MikuOS | a `cfg_select!` arm falling back to `unsupported`; check the PAL in `lib/sdk/rust-std/library/std/src/sys/*/miku.rs` |
 | a C library misbehaves | a layout mismatch is caught at build time by `layout.c`; a missing function at compile time by the headers |
 
-Host-side checks that need no boot: `cd lib/libmiku/hosttest && cargo test`
-(the heap), `cd lib/net && cargo test` (`mikunet`), `cd lib/mikuauth && cargo
-test`, `cd lib/mayland && cargo test-host` (libmay); see [testing.md](testing.md).
+Host-side checks that need no boot: `cd lib/runtime/libmiku/hosttest && cargo test`
+(the heap), `cd lib/net && cargo test` (`mikunet`), `cd lib/admin/mikuauth && cargo
+test`, `cd lib/gfx/mayland && cargo test-host` (libmay); see [testing.md](testing.md).
 
 ---
 
 ## The lib/ crate map
 
-| Crate | What it is | Runs in |
-|---|---|---|
-| `lib/libmiku` | the sources of the ten miku libraries: system call stubs, heap, threads, signals, files, strings, data structures, and `libc_miku`; `hosttest/` tests the heap on the build host | ring 3 (host for `hosttest`) |
-| `lib/mikulibs` | the build of the ten `.so` files from libmiku's modules, `libs.list`, the cross-library shims, the library target spec | build; ring 3 |
-| `lib/miku` | the crate no_std programs depend on: declarations, safe wrappers, `_start`, the global allocator, link stubs, the app target spec and linker script | ring 3 |
-| `lib/ld-miku` | the dynamic linker `/lib/ld-miku.so`; also embedded in the kernel | ring 3 |
-| `lib/vdso` | the vDSO image and `abi.rs`, the vvar layout shared with the kernel | ring 3 (the kernel includes `abi.rs`) |
-| `lib/rust-std` | the `x86_64-unknown-miku` target, the `std` patch, Zed's patches and files | build; ring 3 |
-| `lib/rust-libc` | the `libc` crate's `miku` module, applied to a clean clone | build; ring 3 |
-| `lib/c` | C headers, `miku-cc`, the layout check | build |
-| `builder/src/stdport` | how all of the above is assembled and built: crate sources, the overlay, the arms for crates.io crates, the generated C constants and the declaration check, the `std` build, Zed | build |
-| `lib/mayland` | `libmay`, the Mayland display protocol: encoder, client connection, pools, GPU helpers, shapes, keymaps; linked by the kernel's server and by every client | kernel and ring 3 (host tests) |
-| `lib/net` | `mikunet`: DNS, NTP, TLS 1.2/1.3 with X.509, HTTP/1.1 and HTTP/2, and the L2-L4 stack the kernel links | kernel (stack) and ring 3 (protocols); host tests |
-| `lib/extfs` | the ext2/ext3/ext4 on-disk format, journal, mkfs | kernel; host tests |
-| `lib/btrfs` | the btrfs on-disk format, read-only | kernel; host tests |
-| `lib/fshost` | the block-device trait and test double filesystems are written against | kernel; host |
-| `lib/mikuauth` | passwords (Argon2id), `/etc/passwd`, `/etc/group`, `/etc/shadow`, the `/etc/mikudo.conf` grammar; 102 host tests | ring 3 (`mikudod`, `login`, `passwd`); host |
-| `lib/mikupkg` | the package format, trust, the image description, install logic | ring 3 (`mikupkg`); builder; host tests |
-| `lib/freetype` | vendored FreeType 2.14.3 with a shim, for aosh's text | ring 3 (aosh); host |
-| `lib/buildgen` | build-time generators: images, QOI, shaders, the cubin reader shared with the kernel's `gpu_program` | build (the kernel's `build.rs`) |
+`lib/README.md` is the map, and says where the next thing goes. `builder/src/stdport`
+assembles and builds what is under `lib/sdk`: crate sources, the overlay, the arms
+for crates.io crates, the generated C constants, the declaration checks, the `std`
+build, Zed.

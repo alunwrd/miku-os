@@ -22,6 +22,7 @@ dependencies = [
  "image",
  "libc",
  "libmay",
+ "miku-abi",
  "rquickjs",
  "rustybuzz",
  "unicode-linebreak",
@@ -209,6 +210,7 @@ name = "libmay"
 version = "0.1.0"
 dependencies = [
  "fontdue",
+ "miku-abi",
 ]
 
 [[package]]
@@ -216,6 +218,10 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "miku-abi"
+version = "1.0.1"
 
 [[package]]
 name = "miniz_oxide"

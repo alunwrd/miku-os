@@ -1,6 +1,6 @@
 # Filesystems
 
-MikuOS has two on-disk filesystem drivers and four in-memory ones. **ext2/ext3/ext4** (`lib/extfs`) is read-write with a JBD2 journal. **btrfs** (`lib/btrfs`) is mounted read-only. **tmpfs** is the root and holds `/tmp`. **devfs** and **procfs** are kernel-generated trees. **memfs** is a heap-backed filesystem used as a second test subject. The on-disk drivers are `no_std` crates that know nothing about the kernel. They reach the disk through one trait (`fshost::BlockHost`) and the VFS through another (`FileSystem`), so a volume can be built, corrupted and crashed in memory with `cargo test`. This page covers what each filesystem supports and refuses, how ext's journal and data path keep a crash consistent, how each one implements the VFS trait and locks itself, and how they are tested.
+MikuOS has two on-disk filesystem drivers and four in-memory ones. **ext2/ext3/ext4** (`lib/fs/extfs`) is read-write with a JBD2 journal. **btrfs** (`lib/fs/btrfs`) is mounted read-only. **tmpfs** is the root and holds `/tmp`. **devfs** and **procfs** are kernel-generated trees. **memfs** is a heap-backed filesystem used as a second test subject. The on-disk drivers are `no_std` crates that know nothing about the kernel. They reach the disk through one trait (`fshost::BlockHost`) and the VFS through another (`FileSystem`), so a volume can be built, corrupted and crashed in memory with `cargo test`. This page covers what each filesystem supports and refuses, how ext's journal and data path keep a crash consistent, how each one implements the VFS trait and locks itself, and how they are tested.
 
 ## Contents
 
@@ -57,9 +57,9 @@ MikuOS has two on-disk filesystem drivers and four in-memory ones. **ext2/ext3/e
 
 | Path | What |
 |:--|:--|
-| [`lib/fshost/`](../../lib/fshost/) | `BlockHost` (the disk seam), `MemDisk` (an in-memory disk with a volatile write cache and power cuts), crc32c |
-| [`lib/extfs/`](../../lib/extfs/) | The ext format: `fs.rs` (`MikuFS`), `mount.rs` (superblock checks, feature masks), `structs.rs`, `reader.rs` (`DiskReader`), `cache.rs`, `xattr.rs`, `trim.rs`, `ext2/` (bitmaps, directories, htree, inodes, writes, hard links), `ext3/` (journal, recovery, journalled operations), `ext4/` (extents, inline data, checksums, writes, upgrade), `fsck/`, `mkfs/` |
-| [`lib/btrfs/`](../../lib/btrfs/) | The btrfs format: `mount.rs`, `chunk.rs`, `node.rs`, `volume.rs`, `fs_tree.rs`, `file.rs`; and host-only write machinery (`trans.rs`, `shape.rs`, `commit.rs`, `extent.rs`, `space.rs`) |
+| [`lib/fs/fshost/`](../../lib/fs/fshost/) | `BlockHost` (the disk seam), `MemDisk` (an in-memory disk with a volatile write cache and power cuts), crc32c |
+| [`lib/fs/extfs/`](../../lib/fs/extfs/) | The ext format: `fs.rs` (`MikuFS`), `mount.rs` (superblock checks, feature masks), `structs.rs`, `reader.rs` (`DiskReader`), `cache.rs`, `xattr.rs`, `trim.rs`, `ext2/` (bitmaps, directories, htree, inodes, writes, hard links), `ext3/` (journal, recovery, journalled operations), `ext4/` (extents, inline data, checksums, writes, upgrade), `fsck/`, `mkfs/` |
+| [`lib/fs/btrfs/`](../../lib/fs/btrfs/) | The btrfs format: `mount.rs`, `chunk.rs`, `node.rs`, `volume.rs`, `fs_tree.rs`, `file.rs`; and host-only write machinery (`trans.rs`, `shape.rs`, `commit.rs`, `extent.rs`, `space.rs`) |
 | [`kernel/fs/host.rs`](../../kernel/fs/host.rs) | `KernelHost`: `BlockHost` over the kernel block layer |
 | [`kernel/fs/ext/`](../../kernel/fs/ext/) | `mount.rs` (slot table `STATE`, probing, root mount, remount), `fsimpl.rs` (`FileSystem` for `MikuFS`), `selftest.rs` |
 | [`kernel/fs/btrfs/`](../../kernel/fs/btrfs/) | `mount.rs`, `fsimpl.rs`, `selftest.rs` |
@@ -75,7 +75,7 @@ Design history: [`dev/fs-architecture.md`](../../dev/fs-architecture.md).
 
 ## The host seam: fshost
 
-`fshost::BlockHost` ([`lib/fshost/src/host.rs`](../../lib/fshost/src/host.rs)) is "a disk and a clock". `lib/extfs` re-exports it as `ExtHost`.
+`fshost::BlockHost` ([`lib/fs/fshost/src/host.rs`](../../lib/fs/fshost/src/host.rs)) is "a disk and a clock". `lib/fs/extfs` re-exports it as `ExtHost`.
 
 | Method | Meaning |
 |:--|:--|
@@ -89,7 +89,7 @@ Design history: [`dev/fs-architecture.md`](../../dev/fs-architecture.md).
 **The four write methods are the load-bearing decision.** The journal writes its descriptor and block copies with `write_sync` and its commit record with `write_barrier`; a backend that implements all four the same way degrades crash consistency to whatever the device does.
 
 - **`KernelHost`** ([`kernel/fs/host.rs`](../../kernel/fs/host.rs)) maps them to the block layer's write-back, write-through, FUA and flush paths ([storage.md](storage.md)); `ticks` is the 250 Hz tick, `wall_clock` the kernel clock (`None` when unset).
-- **`MemDisk`** models a device with a *volatile* write cache: `crash()` loses everything not flushed, `crash_at(n)` cuts the power after the n-th write. `lib/fshost/tests/memdisk.rs` tests the model itself (a write-through that did not invalidate the cache it bypassed once made the earlier write win; breaking `write_sectors_barrier` passed until a case with no `flush` at all was added).
+- **`MemDisk`** models a device with a *volatile* write cache: `crash()` loses everything not flushed, `crash_at(n)` cuts the power after the n-th write. `lib/fs/fshost/tests/memdisk.rs` tests the model itself (a write-through that did not invalidate the cache it bypassed once made the earlier write win; breaking `write_sectors_barrier` passed until a case with no `flush` at all was added).
 
 Blocks (1-4 KiB) are one layer up in `DiskReader`, which owns the partition offset and the read-only flag and is the single point every write goes through.
 
@@ -97,11 +97,11 @@ Blocks (1-4 KiB) are one layer up in `DiskReader`, which owns the partition offs
 
 ## ext2, ext3, ext4
 
-`lib/extfs` is about 17,000 lines. `MikuFS<H: ExtHost>` is one mounted filesystem. The kernel keeps up to four (`kernel/fs/ext/mount.rs`, `MAX_MOUNTS = 4`). Which flavour a volume is (`fs_type`) comes from its superblock: ext4 if it has ext4 features, ext3 if it has a journal, else ext2.
+`lib/fs/extfs` is about 17,000 lines. `MikuFS<H: ExtHost>` is one mounted filesystem. The kernel keeps up to four (`kernel/fs/ext/mount.rs`, `MAX_MOUNTS = 4`). Which flavour a volume is (`fs_type`) comes from its superblock: ext4 if it has ext4 features, ext3 if it has a journal, else ext2.
 
 ### Features supported and refused
 
-Mount-time checks are in [`lib/extfs/src/mount.rs`](../../lib/extfs/src/mount.rs) (`check_superblock`). A bit in the supported mask is a promise the code keeps; a bit outside it is refused or forces read-only.
+Mount-time checks are in [`lib/fs/extfs/src/mount.rs`](../../lib/fs/extfs/src/mount.rs) (`check_superblock`). A bit in the supported mask is a promise the code keeps; a bit outside it is refused or forces read-only.
 
 **Incompatible features (`EXT_INCOMPAT_SUPP`)** — anything else refuses the mount:
 
@@ -154,7 +154,7 @@ Mount-time checks are in [`lib/extfs/src/mount.rs`](../../lib/extfs/src/mount.rs
 
 ### The jbd2 journal
 
-[`lib/extfs/src/ext3/`](../../lib/extfs/src/ext3/): `journal.rs`, `ops.rs`, `recovery.rs`.
+[`lib/fs/extfs/src/ext3/`](../../lib/fs/extfs/src/ext3/): `journal.rs`, `ops.rs`, `recovery.rs`.
 
 **One mode, `data=writeback`: metadata only.** The coverage rule is a function, not a policy: *a block is journalled because it went through `write_meta_block`*. Every new directory block, both halves of an htree split, every new index node and indirect block is covered that way. File data never goes through the journal.
 
@@ -202,13 +202,13 @@ Since 2026-10-28 file data does not go through ext's metadata cache (`ext4/write
 
 ### The metadata cache
 
-`lib/extfs/src/cache.rs`: 2 MiB of metadata blocks (at most 1024 entries; 512 at 4 KiB blocks), indexed by a map from block number to slot with a free list and a dirty count. A hit is a map lookup; only taking a slot from a full cache scans for the least recently used. Its job is the pins, not caching: the block layer below has its own cache ([storage.md](storage.md)). At 128 slots a transaction of 2000 creates filled it with pins and committed inside the create, under the VFS lock; at 2 MiB a whole transaction's pins fit (a descriptor holds 510 tags).
+`lib/fs/extfs/src/cache.rs`: 2 MiB of metadata blocks (at most 1024 entries; 512 at 4 KiB blocks), indexed by a map from block number to slot with a free list and a dirty count. A hit is a map lookup; only taking a slot from a full cache scans for the least recently used. Its job is the pins, not caching: the block layer below has its own cache ([storage.md](storage.md)). At 128 slots a transaction of 2000 creates filled it with pins and committed inside the create, under the VFS lock; at 2 MiB a whole transaction's pins fit (a descriptor holds 510 tags).
 
 `extcache` shows its state and `extcacheflush` flushes it (kernel shell).
 
 ### Extended attributes
 
-[`lib/extfs/src/xattr.rs`](../../lib/extfs/src/xattr.rs).
+[`lib/fs/extfs/src/xattr.rs`](../../lib/fs/extfs/src/xattr.rs).
 
 - **Read** from both places: the inode body after the extra fields (`inode_size - 128 - extra_isize`, with a 4-byte magic) and an external block named by `i_file_acl` (magic `0xEA020000`).
 - **Written** to the external block only.
@@ -218,7 +218,7 @@ Since 2026-10-28 file data does not go through ext's metadata cache (`ext4/write
 
 ### fsck
 
-[`lib/extfs/src/fsck/`](../../lib/extfs/src/fsck/), command `extfsck [-y|--repair]` in the kernel shell. The five passes e2fsck uses, in its order, because each depends on the last:
+[`lib/fs/extfs/src/fsck/`](../../lib/fs/extfs/src/fsck/), command `extfsck [-y|--repair]` in the kernel shell. The five passes e2fsck uses, in its order, because each depends on the last:
 
 | Pass | Checks |
 |:--|:--|
@@ -233,7 +233,7 @@ With repair, each pass fixes what it found before the next runs, and every write
 
 ### mkfs
 
-[`lib/extfs/src/mkfs/`](../../lib/extfs/src/mkfs/). Defaults (`MkfsParams::new`):
+[`lib/fs/extfs/src/mkfs/`](../../lib/fs/extfs/src/mkfs/). Defaults (`MkfsParams::new`):
 
 | Type | Block size | Inode size | Journal | Features |
 |:--|:--|:--|:--|:--|
@@ -286,14 +286,14 @@ From [`dev/fs-architecture.md`](../../dev/fs-architecture.md):
 **Host tests** (no boot):
 
 ```
-cd lib/extfs && cargo test
+cd lib/fs/extfs && cargo test
 ```
 
 234 test functions in `src/` and `tests/` (229 when the design note was written): mount checks, checksums against `mke2fs` images, extents, htree (against `e2fsck -D` and `debugfs`), inline data, journal machinery, orphans, truncate, rename, fallocate, timestamps past 2038, ownership, big volumes past 32 block groups, limits, fsck and repair, foreign images. Tests that need **e2fsprogs** (`e2fsck`, `mke2fs`, `debugfs`) skip themselves when it is not installed.
 
 **The crash tests** (`tests/crash.rs`): `MemDisk::crash_at(n)` cuts the power after the n-th write of an operation, for **every** n; each image is mounted (which replays the journal) and handed to `e2fsck`. A journal is right at all cut points or it is not a journal.
 
-`cd lib/fshost && cargo test` runs the 29 tests of `MemDisk` and crc32c.
+`cd lib/fs/fshost && cargo test` runs the 29 tests of `MemDisk` and crc32c.
 
 **On the machine**: `ext test` in the kernel shell or `run=ext_test` on the GRUB line ([`kernel/fs/ext/selftest.rs`](../../kernel/fs/ext/selftest.rs)) covers what the host cannot: the kernel's mkfs on a real device and mounting what it wrote, a remount finding what was written, sync reaching the medium, 200 files through a cache that cannot hold them, a directory indexed past one block, a bitmap fault found and repaired, the filesystem passing its own check, and two filesystems with one name and no confusion. Baseline "ext 10" (2026-10-27). The VFS suite (`vfs test`) also runs against a scratch ext4 ([vfs.md](vfs.md)).
 
@@ -301,7 +301,7 @@ cd lib/extfs && cargo test
 
 ## btrfs
 
-`lib/btrfs` reads btrfs volumes; the kernel driver ([`kernel/fs/btrfs/`](../../kernel/fs/btrfs/)) mounts them **read-only**. Every mutating `FileSystem` method returns `ReadOnly` (`EROFS`), not `NotSupported`, because the operation is valid btrfs and only this driver does not write.
+`lib/fs/btrfs` reads btrfs volumes; the kernel driver ([`kernel/fs/btrfs/`](../../kernel/fs/btrfs/)) mounts them **read-only**. Every mutating `FileSystem` method returns `ReadOnly` (`EROFS`), not `NotSupported`, because the operation is valid btrfs and only this driver does not write.
 
 **What it reads:**
 
@@ -321,11 +321,11 @@ cd lib/extfs && cargo test
 - **The default subvolume only.** A name that points into another subvolume returns `NotSupported`. `NodeId` has two words for `(tree, objectid)`, but a vnode still carries one, so the tree word arrives as zero and `tree_or_default` maps it to the default subvolume.
 - **No xattrs, no compression.**
 
-**Write machinery that the kernel does not use.** `lib/btrfs` also contains copy-on-write transactions (`trans.rs`), item insertion and deletion with leaf splits and tree growth (`shape.rs`), the superblock commit in Linux's `write_all_supers` order (`commit.rs`), extent-tree writes (`extent.rs`) and free-space accounting (`space.rs`). They are exercised by host tests against `mkfs.btrfs` images; no kernel path calls them.
+**Write machinery that the kernel does not use.** `lib/fs/btrfs` also contains copy-on-write transactions (`trans.rs`), item insertion and deletion with leaf splits and tree growth (`shape.rs`), the superblock commit in Linux's `write_all_supers` order (`commit.rs`), extent-tree writes (`extent.rs`) and free-space accounting (`space.rs`). They are exercised by host tests against `mkfs.btrfs` images; no kernel path calls them.
 
 **Kernel side.** Up to two volumes (`btrfs::mount::MAX_MOUNTS = 2`) in `STATE`, a `SchedMutex` named `btrfs`; `with_btrfs_for(slot, f)` holds it across the call. Mount with `mount btrfs [/path]` in the kernel shell: it probes every device and partition and mounts the first btrfs it finds (no `rw` to ask for, so no drive to name), at `/mnt` by default ([storage.md](storage.md)).
 
-**Tests.** `cd lib/btrfs && cargo test` (189 test functions: superblocks, the chunk map, trees, reads compared byte for byte with what `mkfs.btrfs` wrote, and the write machinery). `btrfs test` / `run=btrfs_test` on the machine needs a device holding the volume built by `mkfs.btrfs -r` from `miku-os/btrfs.img`; without one every case skips. Cases: mount it, graft it into the tree, statfs reports btrfs, a file in a subdirectory resolves, a 200,000-byte file reports its size and reads back what was put in it to the end, the staged names come back.
+**Tests.** `cd lib/fs/btrfs && cargo test` (189 test functions: superblocks, the chunk map, trees, reads compared byte for byte with what `mkfs.btrfs` wrote, and the write machinery). `btrfs test` / `run=btrfs_test` on the machine needs a device holding the volume built by `mkfs.btrfs -r` from `miku-os/btrfs.img`; without one every case skips. Cases: mount it, graft it into the tree, statfs reports btrfs, a file in a subdirectory resolves, a 200,000-byte file reports its size and reads back what was put in it to the end, the staged names come back.
 
 ---
 

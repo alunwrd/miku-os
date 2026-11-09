@@ -13,7 +13,7 @@
 //! Used by `main` for the image (always aosh, `stdapps` on request) and by the
 //! subcommands `std <crate>`, `zed build|check|tree`, and `overlay`.
 //!
-//! `lib/c/miku-cc` stays outside: `cc` invokes a compiler by path, so it must
+//! `lib/sdk/c/miku-cc` stays outside: `cc` invokes a compiler by path, so it must
 //! be an executable.
 
 mod arms;

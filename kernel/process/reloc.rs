@@ -349,7 +349,7 @@ fn apply_rela_entries_phys<S: ElfSource + ?Sized>(
             // index and a thread-block offset that exist only once a TLS block
             // is laid out per thread.
             //
-            // All three are ld-miku's work (lib/ld-miku/src/loader.rs), so with
+            // All three are ld-miku's work (lib/runtime/ld-miku/src/loader.rs), so with
             // a PT_INTERP they are skipped here and resolved there. Without one
             // (a static-pie, or a binary built against the wrong linker) nobody
             // can do it, and this is an error: a zero left in the GOT would

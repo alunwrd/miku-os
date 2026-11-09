@@ -21,21 +21,21 @@ pub struct Build<'a> {
     pub args: Vec<String>,
 }
 
-/// Builds the link stubs first. `lib/miku/stubs/` comes from `lib/miku`'s build
+/// Builds the link stubs first. `lib/sdk/miku/stubs/` comes from `lib/sdk/miku`'s build
 /// script, a crate `std` programs do not depend on. With LTO a missing stub
 /// links successfully and drops the call
 fn link_stubs(root: &Path) -> Result<(), String> {
     let _ = Command::new("cargo")
-        .current_dir(root.join("lib/miku"))
+        .current_dir(root.join("lib/sdk/miku"))
         .args(["+nightly", "build", "--release", "--target"])
-        .arg(root.join("lib/miku/x86_64-miku-app.json"))
+        .arg(root.join("lib/sdk/miku/x86_64-miku-app.json"))
         .args(["-Z", "json-target-spec", "-Z", "build-std=core,alloc",
                "-Z", "build-std-features=compiler-builtins-mem"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    if !root.join("lib/miku/stubs").is_dir() {
-        return Err("lib/miku/stubs/ was not generated - the link would fail".into());
+    if !root.join("lib/sdk/miku/stubs").is_dir() {
+        return Err("lib/sdk/miku/stubs/ was not generated - the link would fail".into());
     }
     Ok(())
 }
@@ -45,13 +45,15 @@ pub fn run(b: &Build) -> Result<(), String> {
     link_stubs(root)?;
 
     // Cargo fingerprints `-Z build-std` sysroot sources by path, not content.
-    // So the patch tree and spec are hashed, and a change removes the target
+    // So the patch trees and spec are hashed, and a change removes the target
     // directory. The stamp is written only after a successful build
-    let spec = root.join("lib/rust-std/x86_64-unknown-miku.json");
+    let spec = root.join("lib/sdk/rust-std/x86_64-unknown-miku.json");
     let base = b.target_dir.clone().unwrap_or_else(|| b.dir.join("target"));
     let tdir = base.join("x86_64-unknown-miku");
     let stamp = base.join(".miku-std-patch");
-    let mut patch_files = fsx::files_sorted(&root.join("lib/rust-std/library"));
+    let mut patch_files = fsx::files_sorted(&root.join("lib/sdk/rust-std/library"));
+    patch_files.extend(fsx::files_sorted(&root.join("lib/abi/src")));
+    patch_files.extend(fsx::files_sorted(&root.join("lib/sdk/rust-libc")));
     patch_files.push(spec.clone());
     let hash = fsx::hash_files(&patch_files);
     if fs::read_to_string(&stamp).ok().as_deref().map(str::trim) != Some(hash.as_str()) {
@@ -65,8 +67,9 @@ pub fn run(b: &Build) -> Result<(), String> {
     // header hash goes into CFLAGS
     cheaders::generate(root)?;
     cheaders::check_declarations(root)?;
-    let mut c_files = fsx::files_sorted(&root.join("lib/c"));
-    c_files.push(root.join("lib/rust-libc/libc/src/unix/miku/mod.rs"));
+    cheaders::check_signatures(root)?;
+    let mut c_files = fsx::files_sorted(&root.join("lib/sdk/c"));
+    c_files.push(root.join("lib/sdk/rust-libc/libc/src/unix/miku/mod.rs"));
     let c_hash: String = fsx::hash_files(&c_files).chars().take(16).collect();
 
     // Absolute linker script and stub paths, since relative ones resolve
@@ -77,16 +80,16 @@ pub fn run(b: &Build) -> Result<(), String> {
     let check_cfg = r#""--check-cfg=cfg(target_os,values(\"miku\"))""#;
     let target_flags = format!(
         r#"target.x86_64-unknown-miku.rustflags=["-Clink-arg=-T{}", "-Clink-arg=-L{}", {check_cfg}]"#,
-        root.join("lib/miku/linker.ld").display(), root.join("lib/miku/stubs").display());
+        root.join("lib/sdk/miku/linker.ld").display(), root.join("lib/sdk/miku/stubs").display());
 
     let mut cmd = Command::new("cargo");
     cmd.current_dir(b.dir)
         .env("__CARGO_TESTS_ONLY_SRC_ROOT", b.overlay.join("library"))
-        .env("CC_x86_64_unknown_miku", root.join("lib/c/miku-cc"))
+        .env("CC_x86_64_unknown_miku", root.join("lib/sdk/c/miku-cc"))
         .env("AR_x86_64_unknown_miku", "llvm-ar")
         // `MDB_USE_ROBUST=0`: LMDB without robust mutexes. `NO_TM_GMTOFF`:
         // QuickJS without `tm_gmtoff`, since MikuOS's `struct tm` has the nine
-        // POSIX fields (`lib/c/check/layout.c`)
+        // POSIX fields (`lib/sdk/c/check/layout.c`)
         .env("CFLAGS_x86_64_unknown_miku",
              format!("-DMIKU_C_HEADERS=0x{c_hash} -DMDB_USE_ROBUST=0 -DNO_TM_GMTOFF"))
         .args(["+nightly", b.cargo, "--release", "--target"])

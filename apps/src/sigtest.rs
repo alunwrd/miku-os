@@ -16,7 +16,7 @@ extern "C" fn on_usr1(sig: u32) {
     FIRED.store(sig, Ordering::SeqCst);
 }
 
-const SIGUSR1: u32 = 10;
+const SIGUSR1: u32 = miku_abi::signal::SIGUSR1 as u32;
 
 #[no_mangle]
 pub extern "C" fn _start_main() -> ! {

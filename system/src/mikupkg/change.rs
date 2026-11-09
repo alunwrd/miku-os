@@ -336,8 +336,8 @@ fn hand_over(cfg: &Config, serial: u64, items: Vec<Item>, allow_unsigned: bool) 
 /// `wheel`, so `mikudo` would refuse it
 fn already_allowed() -> bool {
     /// `kernel/process/cred.rs`
-    const CAP_DAC_OVERRIDE: u64 = 3;
-    const CAP_CHOWN: u64 = 6;
+    const CAP_DAC_OVERRIDE: u64 = miku_abi::cred::CAP_DAC_OVERRIDE as u64;
+    const CAP_CHOWN: u64 = miku_abi::cred::CAP_CHOWN as u64;
 
     let mut sets = [0u64; 3];
     let rc = unsafe { miku::miku_capget(sets.as_mut_ptr()) };

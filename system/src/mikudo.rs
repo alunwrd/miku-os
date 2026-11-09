@@ -260,8 +260,8 @@ fn send_password(conn: &Conn, pw: &[u8]) -> bool {
     sent
 }
 
-const TCGETS: u64 = 0x5401;
-const TCSETS: u64 = 0x5402;
+use miku_abi::ioctl::TCGETS;
+use miku_abi::ioctl::TCSETS;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

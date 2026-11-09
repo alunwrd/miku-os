@@ -31,7 +31,9 @@ edition = "2021"
 path = "src/lib.rs"
 
 [dependencies]
-miku = { path = "../miku", optional = true }
+miku = { path = "../sdk/miku", optional = true }
+miku-base = { path = "../base" }
+mikucrypto = { path = "../crypto", optional = true }
 # The resolver cache is shared state in a library. Same version the kernel uses
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 
@@ -41,7 +43,7 @@ stack     = []
 # ASN.1, X.509, the bignum arithmetic, RSA, EC, GCM and the chain check.
 # On by default so `cargo test` covers them with no flags, and off in the
 # kernel, which links this crate for `stack` alone
-crypto    = []
+crypto    = ["dep:mikucrypto"]
 userspace = ["dep:miku", "crypto"]
 
 [profile.release]

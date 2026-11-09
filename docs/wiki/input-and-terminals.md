@@ -80,7 +80,7 @@ Scope: xHCI only (every board since about 2012 routes all ports through it); roo
 
 **The `\` and `|` key.** `pc-keyboard` 0.7 decodes Set-1 scancode 0x2B to `KeyCode::Oem7`, but its US layout has an arm only for `Oem5`, where `\` and `|` live, so those two characters were silently lost. `MikuUs104` delegates every keycode to `Us104Key` and maps `Oem7` to `\` or `|` by the shift state. A diff of the whole table showed this is the only printable key Set 1 produces that the crate's US layout drops (fixed 2026-09-17). A layout is the right place because it is handed the modifiers, and because `\` must arrive through `tty::feed_char` like every character (non-character keys go through `feed_key`, which passes them only in raw mode).
 
-**Layouts.** The tables are `libmay::keymap::LAYOUTS` (`lib/mayland/src/keymap.rs`), shared with every window: `us` (English US) and `ru` (Russian, xkb's `ru(winkeys)`). The seat has up to four layout groups (`MAX_GROUPS`); the default is `us,ru`. The active group is an atomic read by both the keyboard interrupt and the terminal decoder. The config sets the list and the switch through maywm (`input { kb_layout = us,ru; kb_options = grp:alt_shift_toggle }`, see [mayland.md](mayland.md)).
+**Layouts.** The tables are `libmay::keymap::LAYOUTS` (`lib/gfx/mayland/src/keymap.rs`), shared with every window: `us` (English US) and `ru` (Russian, xkb's `ru(winkeys)`). The seat has up to four layout groups (`MAX_GROUPS`); the default is `us,ru`. The active group is an atomic read by both the keyboard interrupt and the terminal decoder. The config sets the list and the switch through maywm (`input { kb_layout = us,ru; kb_options = grp:alt_shift_toggle }`, see [mayland.md](mayland.md)).
 
 **Switching** (`kernel/mayland/input/switch.rs`). With `grp:alt_shift_toggle`, the group moves on when the second of Alt and Shift goes down while the first is held, either order, either side. It is watched in `intercept`, the one place every key passes, so it works in a window as well as at a console. The keys are not swallowed. A latch requires the pair to be released before the next switch, because the keyboard repeats make codes while keys are held. Windows are told through `may_keyboard.modifiers` (the group) and the bar through `may_desktop.keyboard_layout`. Ctrl and every key binding read the first layout whatever is active.
 
@@ -339,7 +339,7 @@ Type with the monitor's `sendkey`. QEMU's xHCI reports no port power control and
 | `kernel/syscall/adapters/tty.rs` | The `tty` syscall |
 | `kernel/fs/devfs.rs` | `/dev/ptmx`, `/dev/ptsN`, `/dev/tty`, `/dev/console` |
 | `kernel/mayland/input/` | Compositor side: chords, escape keys, layout switch, pointer, grabs, input params |
-| `lib/mayland/src/keymap.rs` | Layout tables and the keymap wire format |
+| `lib/gfx/mayland/src/keymap.rs` | Layout tables and the keymap wire format |
 | `kernel/shell/mod.rs` | The kernel shell's line editor |
 | `system/src/mayterm/` | The terminal window |
 

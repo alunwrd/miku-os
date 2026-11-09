@@ -313,7 +313,7 @@ pub(super) fn test_keymap(t: &mut Runner) {
 
     // The layouts the compositor sends have to be the layouts the seat has:
     // every keycode in every group, under every combination of the modifiers
-    // that change what a key produces. The host tests in `lib/mayland` go
+    // that change what a key produces. The host tests in `lib/gfx/mayland` go
     // through the same; this is the kernel's build of it, against the seat's
     // own list
     let mut list = [&keymap::LAYOUTS[0]; keymap::MAX_GROUPS];

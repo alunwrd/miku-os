@@ -34,7 +34,7 @@
 // # It should shrink
 //
 // The end state is Linux's: `mount` is a syscall, `mkfs` is a program opening
-// `/dev/blk0` and writing a filesystem with `lib/extfs`, `nvidia` is a program
+// `/dev/blk0` and writing a filesystem with `lib/fs/extfs`, `nvidia` is a program
 // asking `gpu_info`. It must not be the preferred way to add an administrative
 // operation: nobody can review the arguments of a syscall you pass a sentence
 // to.

@@ -219,6 +219,7 @@ fn test_futex_timeout() -> bool {
 
 // 6. The mutex hands over the lock instead of spinning
 
+use miku::MutexOps;
 static MTX: miku::MikuMutex = miku::MikuMutex::new();
 static GUARDED: AtomicU64 = AtomicU64::new(0);
 static MTX_DONE: AtomicU64 = AtomicU64::new(0);

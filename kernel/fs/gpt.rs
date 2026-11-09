@@ -153,31 +153,7 @@ impl GptTable {
 
 static GPT_CACHE: Mutex<GptTable> = Mutex::new(GptTable::empty());
 
-const fn make_crc32_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut i = 0u32;
-    while i < 256 {
-        let mut c = i;
-        let mut j = 0;
-        while j < 8 {
-            if c & 1 != 0 { c = 0xEDB8_8320 ^ (c >> 1); } else { c >>= 1; }
-            j += 1;
-        }
-        table[i as usize] = c;
-        i += 1;
-    }
-    table
-}
-
-static CRC32_TABLE: [u32; 256] = make_crc32_table();
-
-pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc = CRC32_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    !crc
-}
+pub use miku_base::crc32::crc32;
 
 fn guid_pseudo(seed: u32) -> [u8; 16] {
     let mut g = [0u8; 16];
@@ -259,14 +235,11 @@ fn bytes_to_entry(buf: &[u8]) -> GptEntry {
 }
 
 fn entries_crc(entries: &[GptEntry; GPT_MAX_ENTRIES]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
+    let mut crc = 0;
     for e in entries.iter() {
-        let eb = entry_to_bytes(e);
-        for &b in eb.iter() {
-            crc = CRC32_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
-        }
+        crc = miku_base::crc32::update(crc, &entry_to_bytes(e));
     }
-    !crc
+    crc
 }
 
 fn header_crc(h: &GptHeader) -> u32 {

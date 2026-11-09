@@ -1,6 +1,6 @@
 // The VFS, tested on the machine
 //
-// `lib/extfs`'s only contact with the world is one trait, so its tests run on
+// `lib/fs/extfs`'s only contact with the world is one trait, so its tests run on
 // the host. `MikuVFS` depends on the scheduler, credentials, the page cache and
 // the block layer, so these checks are on the machine, driven through
 // `MikuVFS`:

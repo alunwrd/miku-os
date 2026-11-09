@@ -33,7 +33,7 @@ pub fn run(root: &Path, cmd: &str, args: &[String]) -> Result<(), String> {
     // the fresh copy, failing if upstream moved. `patch` rather than
     // `git apply`, which inside this repository silently skips paths outside
     // the current directory
-    let mut patches: Vec<_> = fs::read_dir(root.join("lib/rust-std/zed-patches"))
+    let mut patches: Vec<_> = fs::read_dir(root.join("lib/sdk/rust-std/zed-patches"))
         .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "patch")).collect())
         .unwrap_or_default();
     patches.sort();
@@ -45,7 +45,7 @@ pub fn run(root: &Path, cmd: &str, args: &[String]) -> Result<(), String> {
         }
     }
     // New files, such as gpui's Mayland backend: `zed-files/` mirrors the tree
-    let files = root.join("lib/rust-std/zed-files");
+    let files = root.join("lib/sdk/rust-std/zed-files");
     if files.is_dir() {
         mirror(&files, &work, false, &[]).map_err(|e| format!("{}: {e}", work.display()))?;
     }
@@ -104,7 +104,7 @@ pub fn run(root: &Path, cmd: &str, args: &[String]) -> Result<(), String> {
         }
     }
 
-    let spec = root.join("lib/rust-std/x86_64-unknown-miku.json");
+    let spec = root.join("lib/sdk/rust-std/x86_64-unknown-miku.json");
     if cmd == "tree" {
         let ok = Command::new("cargo").current_dir(&work)
             .args(["+nightly", "tree", "-Z", "json-target-spec", "--target"]).arg(&spec)

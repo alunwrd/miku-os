@@ -1,0 +1,73 @@
+[package]
+name    = "libmiku"
+version = "0.1.0"
+edition = "2021"
+build   = "build.rs"
+
+[workspace]
+
+[build-dependencies]
+miku-buildgen = { path = "../../buildgen" }
+
+# `libm` (musl's math library in Rust) for `libc_miku.so`'s C math
+# (`lib/runtime/libmiku/libc/cmath.rs`). The only dependency here
+[dependencies]
+libm = "0.2"
+miku-abi = { path = "../../abi" }
+miku-base = { path = "../../base" }
+mikucrypto = { path = "../../crypto", default-features = false }
+
+[profile.release]
+opt-level = 1
+lto = false
+
+# One function per object in compiler_builtins, as rust-lang builds it for its
+# own `std`. `compiler_builtins` defines `floor`, `pow`, `sin` and the rest of a
+# libm as WEAK HIDDEN symbols, and a linker merging two definitions of one name
+# keeps the stricter visibility. So when the archive member holding its `pow` is
+# pulled in for an unrelated routine in the same object, `libc_miku.so`'s
+# exported `pow` becomes hidden too and `--gc-sections` throws both away. With a
+# member per function, the one defining `pow` is only extracted if `pow` is
+# undefined, and in `libc_miku` it never is.
+[profile.release.package.compiler_builtins]
+codegen-units = 10000
+
+[[bin]]
+name = "core_miku"
+path = "core/main.rs"
+
+[[bin]]
+name = "sys_miku"
+path = "sys/main.rs"
+
+[[bin]]
+name = "text_miku"
+path = "text/main.rs"
+
+[[bin]]
+name = "ds_miku"
+path = "ds/main.rs"
+
+[[bin]]
+name = "algo_miku"
+path = "algo/main.rs"
+
+[[bin]]
+name = "codec_miku"
+path = "codec/main.rs"
+
+[[bin]]
+name = "fs_miku"
+path = "fs/main.rs"
+
+[[bin]]
+name = "net_miku"
+path = "net/main.rs"
+
+[[bin]]
+name = "parse_miku"
+path = "parse/main.rs"
+
+[[bin]]
+name = "libc_miku"
+path = "libc/main.rs"

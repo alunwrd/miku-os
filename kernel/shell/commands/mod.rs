@@ -539,14 +539,14 @@ pub fn execute(input: &str) -> bool {
         },
         // `btrfs test`, or `run=btrfs_test` on the GRUB line. The probe
         // registry, the real block layer, the mount table and a path through
-        // `MikuVFS`, which `lib/btrfs`'s host tests cannot reach
+        // `MikuVFS`, which `lib/fs/btrfs`'s host tests cannot reach
         "btrfs" => match rest.trim() {
             "test" => crate::fs::btrfs::selftest::cmd_selftest(),
             _ => crate::println!("Usage: btrfs test"),
         },
         // `vfs test`, or `run=vfs_test` on the GRUB line. The vnode tree driven
         // through its own API against a real filesystem: the layer
-        // `lib/extfs`'s host tests sit under
+        // `lib/fs/extfs`'s host tests sit under
         "vfs"  => match rest.trim() {
             "test" => crate::fs::vfs::selftest::cmd_selftest(),
             _ => crate::println!("Usage: vfs test"),

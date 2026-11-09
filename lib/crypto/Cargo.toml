@@ -1,0 +1,18 @@
+# mikucrypto: the machine's cryptography
+#
+# Primitives only: TLS and certificates are `mikunet`, password storage and
+# package trust are `lib/admin`. `alloc` gates what needs a heap; `libmiku` is
+# built with `core` alone and takes the hash compression function without it.
+#
+#     cd lib/crypto && cargo test
+[package]
+name    = "mikucrypto"
+version = "1.0.1"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["alloc"]
+alloc   = []
