@@ -10,7 +10,7 @@
 
 [![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Architecture](https://img.shields.io/badge/arch-x86__64-blue.svg)]()
-[![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.0.2-blue.svg)]()
 [![Status](https://img.shields.io/badge/status-beta-yellow.svg)]()
 [![License](https://img.shields.io/badge/license-Apache2.0-red.svg)]()
 

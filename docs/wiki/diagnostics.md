@@ -290,7 +290,7 @@ output past that is cut.
 ### /proc/version
 
 ```
-MikuOS v1.0.1 (x86_64)
+MikuOS v1.0.2 (x86_64)
 built with love <3
 ```
 
@@ -561,7 +561,7 @@ forwards unknown names to it through `kcmd`, and privileged ones need
 ### info
 
 ```
-  MikuOS v1.0.1
+  MikuOS v1.0.2
   VNodes: 1834 cached
   Mounts: 4
   Heap:   21504 / 131072 KB

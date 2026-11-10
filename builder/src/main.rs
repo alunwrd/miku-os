@@ -77,6 +77,17 @@ fn check_grub_mkrescue() {
         .map(|o| o.status.success()).unwrap_or(false);
     if !ok { panic!("grub-mkrescue not found"); }
     println!("[ok] grub-mkrescue found");
+    // grub-mkrescue puts in the ISO every platform it finds and says nothing
+    // about one it does not
+    match (grub_pc_dir().is_some(), grub_efi_dir().is_some()) {
+        (true, true) => println!("[ok] GRUB has BIOS and UEFI parts - the ISO boots on both"),
+        (true, false) => println!("[!] no GRUB x86_64-efi parts on this machine - the ISO will \
+                                   boot on BIOS only"),
+        (false, true) => println!("[!] no GRUB i386-pc parts on this machine - the ISO will \
+                                   boot on UEFI only"),
+        (false, false) => panic!("GRUB has neither i386-pc nor x86_64-efi parts - the ISO \
+                                  would not boot"),
+    }
 }
 
 fn build_kernel(root: &Path, low_ram: bool) {
@@ -795,6 +806,7 @@ fn stage_root_tree(root: &Path) -> Option<(PathBuf, bool)> {
         fs::copy(&kernel_src, boot_dir.join("kernel.elf")).ok();
     }
     build_boot_blobs(&staging);
+    build_efi_loader(&staging);
 
     if !have_firmware {
         // Both image writers stage from here; this avoids printing the notice
@@ -835,6 +847,20 @@ fn collect_files(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
 /// LBA of core.img on an installed disk: partition 1, a BIOS boot partition
 const INSTALL_CORE_LBA: u64 = 2048;
 
+/// The root filesystem's partition on an installed disk, the number in the
+/// prefix of both GRUB images. `install` adds its partitions in this order:
+/// BIOS boot, EFI system, root (`kernel/shell/commands/install_cmds.rs`)
+const INSTALL_ROOT_PART: u32 = 3;
+
+/// What both installed images carry: enough to read the root filesystem and
+/// its menu, plus all_video for the framebuffer. No module is loaded from the
+/// disk
+const INSTALL_MODULES: &[&str] = &[
+    "part_gpt", "ext2", "multiboot2",
+    "normal", "configfile", "search", "echo", "ls", "halt", "reboot",
+    "all_video", "gfxterm", "video",
+];
+
 /// The sector boot.img jumps to, which `grub-mkimage` leaves set to 1
 const BOOT_KERNEL_SECTOR: usize = 0x5c;
 /// Block list at the end of core.img's first sector: rest of core.img (u64),
@@ -847,6 +873,49 @@ fn grub_pc_dir() -> Option<PathBuf> {
         .iter()
         .map(PathBuf::from)
         .find(|p| p.join("boot.img").is_file())
+}
+
+/// GRUB's 64-bit UEFI files on this distribution
+fn grub_efi_dir() -> Option<PathBuf> {
+    ["/usr/lib/grub/x86_64-efi", "/usr/share/grub/x86_64-efi", "/lib/grub/x86_64-efi"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.join("moddep.lst").is_file())
+}
+
+/// One GRUB image for an installed disk. The prefix has no device: GRUB puts
+/// in the disk it started from, so `/boot/grub` is looked for on that disk's
+/// root partition
+fn grub_install_image(format: &str, dir: &Path, out: &Path, platform_modules: &[&str]) -> bool {
+    Command::new("grub-mkimage")
+        .args(["-O", format])
+        .arg("-d").arg(dir)
+        .args(["-p", &format!("(,gpt{INSTALL_ROOT_PART})/boot/grub")])
+        .arg("-o").arg(out)
+        .args(platform_modules)
+        .args(INSTALL_MODULES)
+        .status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// The loader an install puts in the EFI system partition as
+/// `\EFI\BOOT\BOOTX64.EFI`, staged as a file
+fn build_efi_loader(staging: &Path) -> bool {
+    let Some(efi) = grub_efi_dir() else {
+        println!("[i] no GRUB x86_64-efi parts on this machine - an installed disk \
+                  will boot on BIOS only");
+        return false;
+    };
+    let dst = staging.join("boot/grub/x86_64-efi");
+    fs::create_dir_all(&dst).ok();
+    let out = dst.join("bootx64.efi");
+    if !grub_install_image("x86_64-efi", &efi, &out, &["fat"]) {
+        println!("[!] grub-mkimage failed - an installed disk will boot on BIOS only");
+        fs::remove_file(&out).ok();
+        return false;
+    }
+    println!("[ok] bootloader: bootx64.efi ({} KB)",
+             fs::metadata(&out).map(|m| m.len() / 1024).unwrap_or(0));
+    true
 }
 
 /// Builds the two blobs an install writes raw. `grub-bios-setup` requires its
@@ -866,20 +935,7 @@ fn build_boot_blobs(staging: &Path) -> bool {
     fs::create_dir_all(&work).ok();
     let core_img = work.join("core.img");
 
-    // No device in the prefix: core.img looks for /boot/grub on the second
-    // partition of the boot disk. Modules are those needed to read a
-    // filesystem, plus all_video for the framebuffer
-    let ok = Command::new("grub-mkimage")
-        .args([
-            "-O", "i386-pc",
-            "-p", "(,gpt2)/boot/grub",
-            "-o", core_img.to_str().unwrap(),
-            "biosdisk", "part_gpt", "ext2", "multiboot2",
-            "normal", "configfile", "search", "echo", "ls", "halt", "reboot",
-            "all_video", "gfxterm", "video",
-        ])
-        .status().map(|s| s.success()).unwrap_or(false);
-    if !ok {
+    if !grub_install_image("i386-pc", &pc, &core_img, &["biosdisk"]) {
         println!("[!] grub-mkimage failed - 'install' will have no bootloader to write");
         return false;
     }

@@ -75,15 +75,15 @@ dependencies = [
 
 [[package]]
 name = "miku-abi"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "miku-base"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "miku-buildgen"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "miku-system"
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "mikucrypto"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "mikunet"

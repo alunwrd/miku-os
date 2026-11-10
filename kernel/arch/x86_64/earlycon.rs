@@ -33,6 +33,9 @@ fn fb() -> Option<Fb> {
     if i.bpp != 32 && i.bpp != 24 {
         return None;
     }
+    if !super::boot_entry::direct_mapped(i.addr, i.pitch as u64 * i.height as u64) {
+        return None;
+    }
     Some(Fb {
         base:   (i.addr + grub::HHDM_OFFSET) as *mut u8,
         pitch:  i.pitch as usize,

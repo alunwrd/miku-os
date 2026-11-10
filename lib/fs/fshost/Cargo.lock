@@ -11,4 +11,4 @@ dependencies = [
 
 [[package]]
 name = "miku-base"
-version = "1.0.1"
+version = "1.0.2"

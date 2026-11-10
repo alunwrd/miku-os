@@ -1,6 +1,23 @@
 use core::arch::global_asm;
 
+/// PML4 entries of direct map the entry stub fills, 512 GiB each
+pub const DIRECT_MAP_SLOTS: u64 = 2;
+/// Physical memory reachable through the direct map before `mm::vmm` can add
+/// to it
+pub const DIRECT_MAP_SPAN: u64 = DIRECT_MAP_SLOTS << 39;
+
+/// True if physical [base, base+len) is inside the entry stub's direct map
+pub fn direct_mapped(base: u64, len: u64) -> bool {
+    base.checked_add(len).is_some_and(|end| end <= DIRECT_MAP_SPAN)
+}
+
+// The page tables are part of the image. A bootloader keeps its own data clear
+// of the image and nothing else: under UEFI GRUB puts the multiboot2
+// information at 0x2000
 global_asm!(r#"
+.set HHDM_SLOTS, {slots}
+.set BOOT_TABLE_PAGES, 3 + HHDM_SLOTS
+
 .section .multiboot2_header, "a"
 .align 8
 _mb2_hdr_start:
@@ -42,6 +59,17 @@ _boot_gdt64_ptr:
     .short (_boot_gdt64_ptr - _boot_gdt64 - 1)
     .long  _boot_gdt64
 
+.section .boot_bss, "aw", @nobits
+.balign 4096
+_boot_pml4:
+    .skip 4096
+_boot_pdpt_low:
+    .skip 4096
+_boot_pdpt_kernel:
+    .skip 4096
+_boot_pdpt_hhdm:
+    .skip 4096 * HHDM_SLOTS
+
 .section .boot_text, "ax"
 .code32
 .global _start32
@@ -49,31 +77,36 @@ _start32:
     cli
     cld
 
-    movl  $0x1000, %edi
+    # ebx is the multiboot2 information and is not touched below
+    movl  $_boot_pml4, %edi
     xorl  %eax, %eax
-    movl  $4096, %ecx
+    movl  $(BOOT_TABLE_PAGES * 1024), %ecx
     rep   stosl
 
-    movl  $0x2003, 0x1000
-    movl  $0x3003, 0x1800
-    movl  $0x4003, 0x1FF8
+    movl  $(_boot_pdpt_low + 3),    _boot_pml4
+    movl  $(_boot_pdpt_kernel + 3), _boot_pml4 + 511 * 8
 
-    movl  $0x00000083, 0x2000
-    movl  $0,          0x2004
-    movl  $0x40000083, 0x2008
-    movl  $0,          0x200C
-    movl  $0x80000083, 0x2010
-    movl  $0,          0x2014
-    movl  $0xC0000083, 0x2018
-    movl  $0,          0x201C
+    # Identity, 0 .. 4 GiB
+    movl  $0x00000083, _boot_pdpt_low
+    movl  $0x40000083, _boot_pdpt_low + 8
+    movl  $0x80000083, _boot_pdpt_low + 16
+    movl  $0xC0000083, _boot_pdpt_low + 24
 
+    # Direct map: PML4[256 + n] is table n
+    movl  $(_boot_pml4 + 256 * 8), %edi
+    movl  $(_boot_pdpt_hhdm + 3), %eax
+    movl  $HHDM_SLOTS, %ecx
+.Lhhdm_slot:
+    movl  %eax, (%edi)
+    addl  $4096, %eax
+    addl  $8, %edi
+    decl  %ecx
+    jnz   .Lhhdm_slot
+
+    # One entry a gigabyte across all of them
     xorl  %ecx, %ecx
-    movl  $0x3000, %edi
-
+    movl  $_boot_pdpt_hhdm, %edi
 .Lfill_hhdm:
-    cmpl  $512, %ecx
-    jge   .Lfill_hhdm_done
-
     movl  %ecx, %eax
     andl  $3,   %eax
     shll  $30,  %eax
@@ -86,17 +119,17 @@ _start32:
 
     addl  $8,   %edi
     incl  %ecx
-    jmp   .Lfill_hhdm
+    cmpl  $(512 * HHDM_SLOTS), %ecx
+    jb    .Lfill_hhdm
 
-.Lfill_hhdm_done:
-    movl  $0x00000083, 0x4FF0
-    movl  $0,          0x4FF4
+    # The image: the top 2 GiB onto physical 0
+    movl  $0x00000083, _boot_pdpt_kernel + 510 * 8
 
     movl  %cr4, %eax
     orl   $0x20, %eax
     movl  %eax, %cr4
 
-    movl  $0x1000, %eax
+    movl  $_boot_pml4, %eax
     movl  %eax, %cr3
 
     movl  $0xC0000080, %ecx
@@ -122,8 +155,6 @@ _start64_compat:
     movw  %ax,   %fs
     movw  %ax,   %gs
 
-    movl  $0x5000, %esp
-
     movabsq $_start64_high, %rax
     jmpq   *%rax
 
@@ -133,9 +164,11 @@ _start64_compat:
 _start:
 _start64_high:
     movabsq $_stack_top, %rsp
-    movq    %rbx, %rdi
+    # The upper half of a register is undefined after 32-bit code, and a UEFI
+    # bootloader ran 64-bit code before it
+    movl    %ebx, %edi
     callq   kernel_main_grub
 .Lhlt:
     hlt
     jmp .Lhlt
-"#, options(att_syntax));
+"#, slots = const DIRECT_MAP_SLOTS, options(att_syntax));

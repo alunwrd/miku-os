@@ -27,6 +27,13 @@ pub const GUID_BIOS_BOOT: [u8; 16] = [
     0x74,0x4E, 0x65,0x65,0x64,0x45,0x46,0x49,
 ];
 
+/// The EFI system partition: FAT, read by UEFI firmware for
+/// `\EFI\BOOT\BOOTX64.EFI`. C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+pub const GUID_EFI_SYSTEM: [u8; 16] = [
+    0x28,0x73,0x2A,0xC1, 0x1F,0xF8, 0xD2,0x11,
+    0xBA,0x4B, 0x00,0xA0,0xC9,0x3E,0xC9,0x3B,
+];
+
 pub const GUID_LINUX_SWAP: [u8; 16] = [
     0x6D,0xFD,0x57,0x06, 0xAB,0xA4, 0xC4,0x43,
     0x84,0xE5, 0x09,0x33,0xC8,0x4B,0x4F,0x4F,
@@ -114,6 +121,7 @@ impl GptEntry {
         if self.type_guid == GUID_LINUX_FS   { "Linux FS" }
         else if self.type_guid == GUID_LINUX_SWAP { "Linux Swap" }
         else if self.type_guid == GUID_BIOS_BOOT  { "BIOS boot" }
+        else if self.type_guid == GUID_EFI_SYSTEM { "EFI system" }
         else                                      { "Unknown" }
     }
 }

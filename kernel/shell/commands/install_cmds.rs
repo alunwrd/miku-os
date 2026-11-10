@@ -3,10 +3,15 @@
 //! What an installed disk looks like
 //!
 //! ```text
-//!   LBA 0      the boot sector: 440 bytes of GRUB, then the protective MBR
-//!   LBA 2048   partition 1, BIOS boot, 2 MiB: core.img, written raw
-//!   LBA 6144   partition 2, "mikuos": /boot, /bin, /lib/firmware
+//!   LBA 0        the boot sector: 440 bytes of GRUB, then the protective MBR
+//!   LBA 2048     partition 1, BIOS boot, 2 MiB: core.img, written raw
+//!   LBA 6144     partition 2, EFI system, 100 MiB: FAT32, \EFI\BOOT\BOOTX64.EFI
+//!   LBA 210944   partition 3, "mikuos": /boot, /bin, /lib/firmware
 //! ```
+//!
+//! One disk for both kinds of firmware. Both loaders are GRUB images whose
+//! prefix names partition 3 of the disk they started from, so both read the
+//! same `/boot/grub/grub.cfg`.
 //!
 //! The BIOS reads sector 0, and sector 0 has to say where the rest of the
 //! bootloader is before there is a filesystem to look it up in. So partition 1
@@ -14,6 +19,10 @@
 //! sector when the ISO was built. `mbr.bin` and `core.bin` are opaque here: the
 //! two numbers that had to be patched were patched by the builder, which has
 //! GRUB's tools.
+//!
+//! UEFI firmware reads the EFI system partition and runs the file at the path
+//! it tries on a disk no boot entry names, so nothing is written to the
+//! firmware's variables.
 //!
 //! Why two commands and no question
 //!
@@ -30,7 +39,7 @@ use alloc::vec;
 use crate::fs::ext::mount::{
     self, dev_for_idx, with_ext2_slot, MAX_MOUNTS,
 };
-use crate::fs::gpt::{self, GUID_BIOS_BOOT, GUID_LINUX_FS};
+use crate::fs::gpt::{self, GUID_BIOS_BOOT, GUID_EFI_SYSTEM, GUID_LINUX_FS};
 use crate::fs::mkfs::{mkfs, FsType, MkfsError, MkfsParams};
 use crate::fs::vfs::types::BlockDevId;
 use crate::{cprintln, print_error, print_success, print_warn, println};
@@ -45,7 +54,13 @@ const CORE_LBA: u64 = 2048;
 /// 2 MiB for a 170 KiB core.img: room for modules a future grub.cfg might want
 /// without repartitioning
 const BIOS_BOOT_SECTORS: u64 = 4096;
-const ROOT_LBA: u64 = CORE_LBA + BIOS_BOOT_SECTORS;
+const ESP_LBA: u64 = CORE_LBA + BIOS_BOOT_SECTORS;
+/// 100 MiB. FAT32 is at least 65525 clusters, 33 MiB of one-sector clusters
+const ESP_SECTORS: u64 = 204_800;
+/// The root is partition 3: both GRUB images have that number in their prefix
+/// (`INSTALL_ROOT_PART` in `builder/src/main.rs`), so the order the partitions
+/// are added in is part of the layout
+const ROOT_LBA: u64 = ESP_LBA + ESP_SECTORS;
 /// GPT's backup header and entry array live in the last 33 sectors; the
 /// primary copy costs another one at the front
 const GPT_TAIL: u64 = 34;
@@ -67,6 +82,7 @@ const ROOT_FS: FsType = FsType::Ext4;
 const SRC_KERNEL: &str = "/boot/kernel.elf";
 const SRC_MBR: &str = "/boot/grub/i386-pc/mbr.bin";
 const SRC_CORE: &str = "/boot/grub/i386-pc/core.bin";
+const SRC_EFI: &str = "/boot/grub/x86_64-efi/bootx64.efi";
 /// Copied whole, in this order. Not `/boot`: its three files are placed one at
 /// a time, because two of them are written to raw sectors as well
 const COPY_TREES: [&str; 2] = ["/bin", "/lib/firmware"];
@@ -223,8 +239,7 @@ fn usage() {
     println!("Usage: install plan <drive>       what it would do, writing nothing");
     println!("       install go <drive> <MB>    do it - the MB is the size 'plan' printed");
     println!("  drives 0-3 are ATA, 4-7 PCI/NVMe/virtio-blk ('disks' lists them)");
-    println!("  MikuOS installs for a BIOS machine. UEFI is not supported: grub's");
-    println!("  multiboot2 faults under edk2, and the BIOS path is the one that works.");
+    println!("  the installed disk boots on BIOS and on UEFI machines (Secure Boot off)");
 }
 
 // Looking, which is all `plan` does
@@ -358,8 +373,51 @@ pub fn drives() -> alloc::vec::Vec<DriveSummary> {
 /// active slot is no longer the medium
 fn source_slot() -> Option<usize> {
     (0..MAX_MOUNTS).find(|&s| {
-        with_ext2_slot(s, |fs| fs.resolve_path(SRC_MBR).is_ok()).unwrap_or(false)
+        with_ext2_slot(s, |fs| {
+            fs.resolve_path(SRC_MBR).is_ok() || fs.resolve_path(SRC_EFI).is_ok()
+        })
+        .unwrap_or(false)
     })
+}
+
+/// What the medium has to make a disk bootable with. Either may be missing:
+/// the ISO was built on a machine without that half of GRUB
+struct Loaders {
+    /// `mbr.bin` and `core.bin`
+    bios: Option<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)>,
+    /// `bootx64.efi`
+    efi: Option<alloc::vec::Vec<u8>>,
+}
+
+impl Loaders {
+    /// Reads them whole. An error is a loader that is there and wrong
+    fn read(src: usize) -> Result<Self, &'static str> {
+        let bios = match (read_whole(src, SRC_MBR), read_whole(src, SRC_CORE)) {
+            (Some(mbr), Some(core)) => {
+                if mbr.len() != 440 || core.is_empty() || core.len() % 512 != 0 {
+                    return Err("mbr.bin or core.bin is not the size it should be");
+                }
+                if (core.len() / 512) as u64 > BIOS_BOOT_SECTORS {
+                    return Err("core.bin is larger than the boot partition");
+                }
+                Some((mbr, core))
+            }
+            _ => None,
+        };
+        let efi = read_whole(src, SRC_EFI).filter(|e| e.starts_with(b"MZ"));
+        if bios.is_none() && efi.is_none() {
+            return Err("this medium carries no bootloader to write");
+        }
+        Ok(Self { bios, efi })
+    }
+
+    fn firmware(&self) -> &'static str {
+        match (&self.bios, &self.efi) {
+            (Some(_), Some(_)) => "BIOS and UEFI",
+            (Some(_), None) => "BIOS only - this medium has no UEFI loader",
+            _ => "UEFI only - this medium has no BIOS loader",
+        }
+    }
 }
 
 /// Size of one file on the source, in bytes
@@ -381,14 +439,20 @@ fn tree_size(slot: usize, path: &str) -> Option<(u32, u64)> {
 
 fn plan(drive: Option<&str>) {
     let Some(t) = look_at(drive) else { return };
-    let Some(src) = source_slot() else {
-        print_error!("  install: this medium carries no bootloader to write");
-        println!("    ({} is missing - the ISO was built without GRUB's i386-pc parts)", SRC_MBR);
-        return;
+    let found = source_slot()
+        .ok_or("this medium carries no bootloader to write")
+        .and_then(|src| Loaders::read(src).map(|l| (src, l)));
+    let (src, loaders) = match found {
+        Ok(v) => v,
+        Err(e) => {
+            print_error!("  install: {}", e);
+            println!("    (looked for {} and {})", SRC_MBR, SRC_EFI);
+            return;
+        }
     };
 
     println!();
-    cprintln!(128, 222, 217, "  MikuOS installs for a BIOS machine, not UEFI.");
+    cprintln!(128, 222, 217, "  the disk will boot on: {}", loaders.firmware());
     println!();
 
     cprintln!(57, 197, 187, "  target: drive {} - {} MB ({} sectors)",
@@ -420,15 +484,26 @@ fn plan(drive: Option<&str>) {
         return;
     }
 
-    let core_sectors = file_size(src, SRC_CORE).unwrap_or(0).div_ceil(512);
     let root_sectors = t.sectors - ROOT_LBA - GPT_TAIL;
 
     println!();
     cprintln!(57, 197, 187, "  what would be written:");
-    println!("    LBA {:<10} the boot sector, 440 bytes of it", 0);
-    println!("    LBA {:<10} core.bin, {} sectors   (partition 1, BIOS boot, {} MB)",
-             CORE_LBA, core_sectors, BIOS_BOOT_SECTORS / 2048);
-    println!("    LBA {:<10} {} \"{}\", {} MB   (partition 2, the root)",
+    match &loaders.bios {
+        Some((_, core)) => {
+            println!("    LBA {:<10} the boot sector, 440 bytes of it", 0);
+            println!("    LBA {:<10} core.bin, {} sectors   (partition 1, BIOS boot, {} MB)",
+                     CORE_LBA, core.len() / 512, BIOS_BOOT_SECTORS / 2048);
+        }
+        None => println!("    LBA {:<10} nothing   (partition 1, BIOS boot, {} MB)",
+                         CORE_LBA, BIOS_BOOT_SECTORS / 2048),
+    }
+    match &loaders.efi {
+        Some(efi) => println!("    LBA {:<10} FAT32 with {}, {} KB   (partition 2, EFI system, {} MB)",
+                              ESP_LBA, ESP_LOADER, efi.len() / 1024, ESP_SECTORS / 2048),
+        None => println!("    LBA {:<10} FAT32, empty   (partition 2, EFI system, {} MB)",
+                         ESP_LBA, ESP_SECTORS / 2048),
+    }
+    println!("    LBA {:<10} {} \"{}\", {} MB   (partition 3, the root)",
              ROOT_LBA, ROOT_FS.name(), ROOT_LABEL, root_sectors / 2048);
 
     println!();
@@ -497,27 +572,16 @@ fn go(drive: Option<&str>, size_mb: Option<&str>) {
         return;
     }
 
-    // Reads the two blobs before anything is destroyed: if the medium cannot
+    // Reads the loaders before anything is destroyed: if the medium cannot
     // produce them there is no point partitioning a disk that cannot be made
     // bootable
-    let Some(mbr) = read_whole(src, SRC_MBR) else {
-        print_error!("  install: cannot read {}", SRC_MBR);
-        return;
+    let loaders = match Loaders::read(src) {
+        Ok(l) => l,
+        Err(e) => {
+            print_error!("  install: {}", e);
+            return;
+        }
     };
-    let Some(core) = read_whole(src, SRC_CORE) else {
-        print_error!("  install: cannot read {}", SRC_CORE);
-        return;
-    };
-    if mbr.len() != 440 || core.is_empty() || core.len() % 512 != 0 {
-        print_error!("  install: the bootloader blobs are {} and {} bytes, which is \
-                      not what they should be", mbr.len(), core.len());
-        return;
-    }
-    if (CORE_LBA + (core.len() / 512) as u64) > ROOT_LBA {
-        print_error!("  install: core.bin is {} sectors and the boot partition holds {}",
-                     core.len() / 512, BIOS_BOOT_SECTORS);
-        return;
-    }
 
     println!();
     cprintln!(255, 80, 80, "  erasing drive {} ({} MB)", t.drive, t.mb());
@@ -546,6 +610,13 @@ fn go(drive: Option<&str>, size_mb: Option<&str>) {
         progress::fail("could not make the boot partition");
         return;
     }
+    if let Err(e) = gpt::gpt_add_partition_at(
+        t.dev, GUID_EFI_SYSTEM, ESP_LBA, ESP_SECTORS, "EFI system", seed ^ 0xE5E5)
+    {
+        print_error!("  install: could not make the EFI system partition: {:?}", e);
+        progress::fail("could not make the EFI system partition");
+        return;
+    }
     let root_sectors = t.sectors - ROOT_LBA - GPT_TAIL;
     if let Err(e) = gpt::gpt_add_partition_at(
         t.dev, GUID_LINUX_FS, ROOT_LBA, root_sectors, "mikuos", seed ^ 0x5A5A)
@@ -554,8 +625,8 @@ fn go(drive: Option<&str>, size_mb: Option<&str>) {
         progress::fail("could not make the root partition");
         return;
     }
-    print_success!("  partitioned: BIOS boot at {}, root at {} ({} MB)",
-                   CORE_LBA, ROOT_LBA, root_sectors / 2048);
+    print_success!("  partitioned: BIOS boot at {}, EFI system at {}, root at {} ({} MB)",
+                   CORE_LBA, ESP_LBA, ROOT_LBA, root_sectors / 2048);
 
     // 2. the filesystem: see ROOT_FS
     progress::step(progress::Step::Formatting);
@@ -633,13 +704,26 @@ fn go(drive: Option<&str>, size_mb: Option<&str>) {
     print_success!("  wrote /boot/grub/grub.cfg (root=LABEL={}, with {}:{} as the fallback)",
                    ROOT_LABEL, t.drive, ROOT_LBA);
 
-    // 6. the bootloader, into sectors no filesystem owns
-    if let Err(e) = write_bootloader(&t, &mbr, &core) {
+    // 6. the BIOS loader, into sectors no filesystem owns
+    if let Some((mbr, core)) = &loaders.bios {
+        if let Err(e) = write_bootloader(&t, mbr, core) {
+            fail_after_mount(dst, e);
+            return;
+        }
+        print_success!("  wrote the boot sector and core.bin ({} sectors at LBA {})",
+                       core.len() / 512, CORE_LBA);
+    }
+
+    // 7. the UEFI loader, into a filesystem of its own
+    if let Err(e) = write_esp(&t, loaders.efi.as_deref()) {
         fail_after_mount(dst, e);
         return;
     }
-    print_success!("  wrote the boot sector and core.bin ({} sectors at LBA {})",
-                   core.len() / 512, CORE_LBA);
+    match &loaders.efi {
+        Some(efi) => print_success!("  wrote the EFI system partition: {} ({} KB)",
+                                    ESP_LOADER, efi.len() / 1024),
+        None => print_warn!("  the EFI system partition is empty: this medium has no UEFI loader"),
+    }
 
     let _ = mount::remount_ro(dst);
     mount::unmount_slot(dst);
@@ -647,6 +731,7 @@ fn go(drive: Option<&str>, size_mb: Option<&str>) {
     println!();
     progress::step(progress::Step::Done);
     print_success!("  MikuOS is on drive {} - {} MB copied", t.drive, copied / (1024 * 1024));
+    cprintln!(128, 222, 217, "  it boots on: {}", loaders.firmware());
     cprintln!(128, 222, 217, "  take the medium out and boot it. The first menu entry \
                              mounts the root read-only; the second one mounts it writable.");
     cprintln!(128, 222, 217, "  the root is found by its label '{}', so the disk boots \
@@ -764,10 +849,15 @@ fn copy_dir(
     // the same lock again
     let entries = with_ext2_slot(src, |fs| {
         let inode = fs.read_inode(src_ino).ok()?;
-        let mut buf = [const { crate::fs::ext::structs::DirEntry::empty() }; 64];
-        let n = fs.read_dir(&inode, &mut buf).ok()?;
+        // Every entry: /bin holds more than a fixed buffer of them
+        let mut listed = alloc::vec::Vec::new();
+        fs.read_dir_each(&inode, |e| {
+            listed.push(*e);
+            true
+        })
+        .ok()?;
         let mut out = alloc::vec::Vec::new();
-        for e in buf.iter().take(n) {
+        for e in &listed {
             let name = e.name_str();
             if name == "." || name == ".." {
                 continue;
@@ -837,17 +927,24 @@ fn copy_named(
     Ok(done)
 }
 
-/// /boot: the kernel, and the two blobs kept as files as well as written raw,
+/// /boot: the kernel, and the loaders kept as files as well as written out,
 /// so a disk can be made bootable again without the medium
 fn copy_boot(src: usize, dst: usize) -> Result<u64, &'static str> {
     let boot = ensure_dir(dst, "/boot")?;
-    let n = copy_file(src, dst, SRC_KERNEL, boot, "kernel.elf")?;
+    let mut n = copy_file(src, dst, SRC_KERNEL, boot, "kernel.elf")?;
     print_success!("  copied {} ({} KB)", SRC_KERNEL, n / 1024);
 
-    let pc = ensure_dir(dst, "/boot/grub/i386-pc")?;
-    let a = copy_file(src, dst, SRC_MBR, pc, "mbr.bin")?;
-    let b = copy_file(src, dst, SRC_CORE, pc, "core.bin")?;
-    Ok(n + a + b)
+    for (path, dir, name) in [
+        (SRC_MBR, "/boot/grub/i386-pc", "mbr.bin"),
+        (SRC_CORE, "/boot/grub/i386-pc", "core.bin"),
+        (SRC_EFI, "/boot/grub/x86_64-efi", "bootx64.efi"),
+    ] {
+        if file_size(src, path).is_some() {
+            let parent = ensure_dir(dst, dir)?;
+            n += copy_file(src, dst, path, parent, name)?;
+        }
+    }
+    Ok(n)
 }
 
 /// Writes the boot menu.
@@ -898,6 +995,29 @@ fn write_grub_cfg(dst: usize, drive: usize) -> Result<(), &'static str> {
     if n != cfg.len() {
         return Err("grub.cfg was written short");
     }
+    Ok(())
+}
+
+/// Where UEFI firmware looks on a disk no boot entry names
+const ESP_LOADER: &str = "\\EFI\\BOOT\\BOOTX64.EFI";
+
+/// Formats partition 2 as FAT32 and puts the loader at `ESP_LOADER`. With no
+/// loader the volume is left empty
+fn write_esp(t: &Target, loader: Option<&[u8]>) -> Result<(), &'static str> {
+    let fat = |e: fatfs::FatError| match e {
+        fatfs::FatError::Io => "the disk failed while the EFI system partition was written",
+        fatfs::FatError::NoSpace => "the UEFI loader does not fit the EFI system partition",
+        _ => "could not create the EFI system partition",
+    };
+    let serial = t.sectors as u32 ^ crate::fs::procfs::wall_clock() as u32;
+    let host = crate::fs::host::KernelHost::new(t.dev);
+    let mut vol = fatfs::format(host, ESP_LBA, ESP_SECTORS, b"MIKUOS ESP ", serial).map_err(fat)?;
+    if let Some(loader) = loader {
+        let efi = vol.mkdir(vol.root(), "EFI").map_err(fat)?;
+        let boot = vol.mkdir(efi, "BOOT").map_err(fat)?;
+        vol.write_file(boot, "BOOTX64.EFI", loader).map_err(fat)?;
+    }
+    vol.finish().map_err(fat)?;
     Ok(())
 }
 

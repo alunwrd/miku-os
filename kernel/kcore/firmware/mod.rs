@@ -22,7 +22,7 @@ pub mod probe;
 
 use x86_64::instructions::port::Port;
 
-use crate::arch::x86_64::grub;
+use crate::arch::x86_64::{acpi, grub};
 
 const PCI_ADDR: u16 = 0xCF8;
 const PCI_DATA: u16 = 0xCFC;
@@ -53,24 +53,6 @@ fn pci_read8(bus: u8, dev: u8, func: u8, off: u8) -> u8 {
 // ACPI enable
 
 #[repr(C, packed)]
-struct Rsdp10 {
-    signature: [u8; 8],
-    checksum:  u8,
-    oem_id:    [u8; 6],
-    revision:  u8,
-    rsdt_addr: u32,
-}
-
-#[repr(C, packed)]
-struct Rsdp20 {
-    v10:          Rsdp10,
-    length:       u32,
-    xsdt_addr:    u64,
-    ext_checksum: u8,
-    _reserved:    [u8; 3],
-}
-
-#[repr(C, packed)]
 struct SdtHeader {
     signature:      [u8; 4],
     length:         u32,
@@ -83,67 +65,11 @@ struct SdtHeader {
     creator_rev:    u32,
 }
 
-unsafe fn find_rsdp() -> Option<u64> {
-    let hhdm = grub::hhdm();
-    // EBDA segment (KB at 0x40E) shifted left 4
-    let ebda_seg = unsafe { *((0x40E + hhdm) as *const u16) };
-    let ebda_phys = (ebda_seg as u64) << 4;
-    let ranges: [(u64, u64); 2] = [(ebda_phys, ebda_phys + 1024), (0xE0000, 0x100000)];
-    for (start, end) in ranges {
-        let mut a = start & !0xF;
-        while a + 20 < end {
-            let virt = (a + hhdm) as *const u8;
-            let sig = unsafe { core::slice::from_raw_parts(virt, 8) };
-            if sig == b"RSD PTR " {
-                return Some(a);
-            }
-            a += 16;
-        }
-    }
-    None
-}
-
-fn find_fadt(hhdm: u64) -> Option<u64> {
-    let rsdp_phys = unsafe { find_rsdp() }?;
-    let rsdp10 = unsafe { &*((rsdp_phys + hhdm) as *const Rsdp10) };
-    let revision = rsdp10.revision;
-
-    let (sdt_phys, is_xsdt) = if revision >= 2 {
-        let rsdp20 = unsafe { &*((rsdp_phys + hhdm) as *const Rsdp20) };
-        let xsdt = unsafe { core::ptr::addr_of!(rsdp20.xsdt_addr).read_unaligned() };
-        if xsdt != 0 { (xsdt, true) } else { (rsdp10.rsdt_addr as u64, false) }
-    } else {
-        (rsdp10.rsdt_addr as u64, false)
-    };
-
-    let sdt_hdr = unsafe { &*((sdt_phys + hhdm) as *const SdtHeader) };
-    let total_len = unsafe { core::ptr::addr_of!(sdt_hdr.length).read_unaligned() } as usize;
-    if total_len < 36 { return None; }
-
-    let entry_size = if is_xsdt { 8usize } else { 4usize };
-    let entry_count = (total_len - 36) / entry_size;
-    let entries_base = sdt_phys + hhdm + 36;
-
-    for i in 0..entry_count {
-        let addr = entries_base + (i * entry_size) as u64;
-        let ent_phys = if is_xsdt {
-            unsafe { (addr as *const u64).read_unaligned() }
-        } else {
-            unsafe { (addr as *const u32).read_unaligned() as u64 }
-        };
-        let hdr = unsafe { &*((ent_phys + hhdm) as *const SdtHeader) };
-        if &hdr.signature == b"FACP" {
-            return Some(ent_phys);
-        }
-    }
-    None
-}
-
 /// Issue the ACPI mode enable command. After success, SCI_EN=1 and
 /// platform power events fire as SCI rather than SMI
 pub fn acpi_enable() {
     let hhdm = grub::hhdm();
-    let fadt_phys = match find_fadt(hhdm) {
+    let fadt_phys = match acpi::find_table(b"FACP") {
         Some(p) => p,
         None => {
             crate::serial_println!("[firmware] FADT not found, skipping ACPI enable");
@@ -221,7 +147,7 @@ pub fn acpi_enable() {
 /// silenced at the source by clearing its own enable register
 pub fn disable_gpe0() {
     let hhdm = grub::hhdm();
-    let fadt_phys = match find_fadt(hhdm) {
+    let fadt_phys = match acpi::find_table(b"FACP") {
         Some(p) => p,
         None => {
             crate::serial_println!("[firmware] FADT not found, cannot disable GPE0");
@@ -461,36 +387,6 @@ pub fn disable_hpet_smi() {
 
 // madt-driven lvt conf
 
-fn find_madt(hhdm: u64) -> Option<u64> {
-    let rsdp_phys = unsafe { find_rsdp() }?;
-    let rsdp10 = unsafe { &*((rsdp_phys + hhdm) as *const Rsdp10) };
-    let revision = rsdp10.revision;
-    let (sdt_phys, is_xsdt) = if revision >= 2 {
-        let r2 = unsafe { &*((rsdp_phys + hhdm) as *const Rsdp20) };
-        let xsdt = unsafe { core::ptr::addr_of!(r2.xsdt_addr).read_unaligned() };
-        if xsdt != 0 { (xsdt, true) } else { (rsdp10.rsdt_addr as u64, false) }
-    } else {
-        (rsdp10.rsdt_addr as u64, false)
-    };
-    let hdr = unsafe { &*((sdt_phys + hhdm) as *const SdtHeader) };
-    let total = unsafe { core::ptr::addr_of!(hdr.length).read_unaligned() } as usize;
-    if total < 36 { return None; }
-    let esz = if is_xsdt { 8 } else { 4 };
-    let count = (total - 36) / esz;
-    let base = sdt_phys + hhdm + 36;
-    for i in 0..count {
-        let a = base + (i * esz) as u64;
-        let p = if is_xsdt {
-            unsafe { (a as *const u64).read_unaligned() }
-        } else {
-            unsafe { (a as *const u32).read_unaligned() as u64 }
-        };
-        let h = unsafe { &*((p + hhdm) as *const SdtHeader) };
-        if &h.signature == b"APIC" { return Some(p); }
-    }
-    None
-}
-
 // Honor ACPI MADT "LAPIC NMI" (type 4) entries by programming LVT_LINT0/LINT1
 // with delivery mode = NMI on the BSP. Otherwise the BIOS keeps asserting LINT1
 // (expecting NMI delivery per MADT), an LVT in FIX mode translates the signal
@@ -506,7 +402,7 @@ fn find_madt(hhdm: u64) -> Option<u64> {
 // mask bit set), so a stray hardware signal cannot deliver garbage
 pub fn configure_lapic_per_madt() {
     let hhdm = grub::hhdm();
-    let madt_phys = match find_madt(hhdm) {
+    let madt_phys = match acpi::find_table(b"APIC") {
         Some(p) => p,
         None => {
             crate::serial_println!("[firmware] MADT not found, LVT defaults retained");

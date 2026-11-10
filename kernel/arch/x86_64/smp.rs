@@ -9,12 +9,25 @@ use crate::arch::x86_64::grub;
 use crate::arch::x86_64::percpu;
 use crate::mm::pmm;
 
-const TRAMPOLINE_PHYS: u32   = 0x8000;
 const AP_STACK_PAGES:  usize = 16;  // 64KB per AP
 
 extern "C" {
     fn _ap_trampoline_start();
     fn _ap_trampoline_end();
+    // 32-bit fields holding an offset into the trampoline, made addresses once
+    // its page is known
+    fn _ap_fix_gdt();
+    fn _ap_fix_jmp32();
+    fn _ap_fix_jmp64();
+}
+
+/// A page below 1 MiB for the trampoline: usable RAM holding nothing the
+/// bootloader left. 0x8000 when it qualifies, the lowest that does otherwise.
+/// Everything below the image is reserved from the frame allocator
+fn trampoline_page() -> Option<u32> {
+    core::iter::once(0x8000u32)
+        .chain((0x1000..0xA0000).step_by(0x1000))
+        .find(|&p| grub::is_usable_ram(p as u64, 0x1000) && !grub::holds_boot_data(p as u64, 0x1000))
 }
 
 /// Parameter block written by BSP before firing SIPIs, read by the trampoline
@@ -116,7 +129,6 @@ pub fn start_aps() {
 
     let _ = ticks_per_hz; // APs fetch their own via apic::bsp_ticks_per_hz()
 
-    // Copy trampoline to 0x8000
     let tramp_start = _ap_trampoline_start as *const () as u64;
     let tramp_end   = _ap_trampoline_end   as *const () as u64;
     let tramp_len   = (tramp_end - tramp_start) as usize;
@@ -126,13 +138,22 @@ pub fn start_aps() {
         crate::serial_println!("[smp] trampoline too large: {} bytes", tramp_len);
         return;
     }
+    let Some(page) = trampoline_page() else {
+        crate::serial_println!("[smp] no usable page below 1 MiB for the trampoline; one cpu");
+        return;
+    };
+    crate::trace_println!("[smp] trampoline at {:#x}", page);
 
     unsafe {
         core::ptr::copy_nonoverlapping(
             tramp_start as *const u8,
-            (TRAMPOLINE_PHYS as u64 + hhdm) as *mut u8,
+            (page as u64 + hhdm) as *mut u8,
             tramp_len,
         );
+        for fix in [_ap_fix_gdt as *const (), _ap_fix_jmp32 as *const (), _ap_fix_jmp64 as *const ()] {
+            let at = (page as u64 + (fix as u64 - tramp_start) + hhdm) as *mut u32;
+            at.write_unaligned(at.read_unaligned() + page);
+        }
     }
 
     let kernel_cr3 = crate::mm::vmm::kernel_cr3();
@@ -192,8 +213,7 @@ pub fn start_aps() {
         core::mem::forget(stack);
 
         unsafe {
-            // Fill ApParams at TRAMPOLINE_PHYS + PARAM_OFFSET
-            let params = (TRAMPOLINE_PHYS as u64 + PARAM_OFFSET as u64 + hhdm) as *mut ApParams;
+            let params = (page as u64 + PARAM_OFFSET as u64 + hhdm) as *mut ApParams;
             (*params).page_table = kernel_cr3;
             (*params).stack_top  = stack_top;
             (*params).entry      = ap_entry as *const () as u64;
@@ -211,10 +231,10 @@ pub fn start_aps() {
 
         crate::serial_println!("[smp] starting AP lapic_id={} cpu_idx={}", cpu.lapic_id, cpu_idx);
 
-        apic::send_sipi(cpu.lapic_id, TRAMPOLINE_PHYS);
+        apic::send_sipi(cpu.lapic_id, page);
 
         // Wait up to 100ms for AP to signal ready
-        let params = (TRAMPOLINE_PHYS as u64 + PARAM_OFFSET as u64 + hhdm) as *mut ApParams;
+        let params = (page as u64 + PARAM_OFFSET as u64 + hhdm) as *mut ApParams;
         let mut waited_us = 0u64;
         let mut ok = false;
         while waited_us < 100_000 {
@@ -261,11 +281,13 @@ pub fn start_aps() {
 
 // AP trampoline
 //
-// The trampoline lives in its own ELF section: position-independent real-mode
-// -> long-mode bootstrap code followed by an ApParams block at offset 0xF00.
-// The whole blob is copied to physical 0x8000 before the SIPIs; APs start at
-// CS:IP = 0x800:0
+// Real mode to long mode, in a section of its own, with the ApParams block at
+// offset 0xF00. The blob is copied to a page below 1 MiB and the APs start at
+// its first byte. It holds no address of its own: the page comes from CS, and
+// the three fields a far jump or `lgdt` needs absolute are fixed by the BSP
 core::arch::global_asm!(r#"
+.set AP_PARAMS, {params}
+
 .section .ap_trampoline, "ax"
 .code16
 .balign 4096
@@ -273,24 +295,24 @@ core::arch::global_asm!(r#"
 _ap_trampoline_start:
     cli
     cld
-    xor    %ax, %ax
-    mov    %ax, %ds
-    mov    %ax, %es
-    mov    %ax, %ss
-    mov    %ax, %fs
-    mov    %ax, %gs
 
-    // Load 16-bit GDT (flat code/data for pmode)
-    lgdtl  ap_gdtr_16 - _ap_trampoline_start + 0x8000
+    // Linear address of this page, kept in ebx to the end
+    xorl   %ebx, %ebx
+    movw   %cs, %bx
+    shll   $4, %ebx
+
+    lgdtl  %cs:(ap_gdtr - _ap_trampoline_start)
 
     // Enable PE in CR0
     mov    %cr0, %eax
     or     $1, %eax
     mov    %eax, %cr0
 
-    // Far jump to 32-bit code - absolute physical address 0x8000 + offset
+    // Far jump to 32-bit code
     .byte  0x66, 0xEA
-    .long  ap_pm32 - _ap_trampoline_start + 0x8000
+.globl _ap_fix_jmp32
+_ap_fix_jmp32:
+    .long  ap_pm32 - _ap_trampoline_start
     .word  0x08
 
 .code32
@@ -307,8 +329,8 @@ ap_pm32:
     or     $(1 << 5) | (1 << 4), %eax
     mov    %eax, %cr4
 
-    // Load CR3 from ApParams.page_table (at 0x8F00 + 0)
-    mov    (0x8F00), %eax
+    // ApParams.page_table
+    mov    AP_PARAMS(%ebx), %eax
     mov    %eax, %cr3
 
     // Enable LM in EFER MSR, and NX with it. Without NXE the NX bit is a
@@ -326,10 +348,12 @@ ap_pm32:
     or     $(1 << 31), %eax
     mov    %eax, %cr0
 
-    // Load 64-bit GDT and far jump to 64-bit code
-    lgdt   ap_gdtr_64 - _ap_trampoline_start + 0x8000
-
-    ljmpl  $0x18, $(ap_pm64 - _ap_trampoline_start + 0x8000)
+    // Far jump to 64-bit code
+    .byte  0xEA
+.globl _ap_fix_jmp64
+_ap_fix_jmp64:
+    .long  ap_pm64 - _ap_trampoline_start
+    .word  0x18
 
 .code64
 ap_pm64:
@@ -340,21 +364,21 @@ ap_pm64:
     mov    %ax, %fs
     mov    %ax, %gs
 
-    // Load kernel stack pointer from ApParams.stack_top
-    mov    (0x8F08), %rsp
+    // The upper half of rbx is undefined after 32-bit code
+    movl   %ebx, %ebx
 
-    // Mark ready
-    movq   $1, (0x8F20)
+    // stack_top, cpu_index (arg 0), entry
+    mov    AP_PARAMS + 0x08(%rbx), %rsp
+    mov    AP_PARAMS + 0x18(%rbx), %rdi
+    mov    AP_PARAMS + 0x10(%rbx), %rax
 
-    // Load cpu_index into rdi (arg 0)
-    mov    (0x8F18), %rdi
+    // Ready last: the BSP refills the block for the next AP once it is set
+    movq   $1, AP_PARAMS + 0x20(%rbx)
 
-    // Jump to ap_entry (virtual address in kernel)
-    mov    (0x8F10), %rax
     jmp    *%rax
 
 .balign 8
-ap_gdt_16:
+ap_gdt:
     .quad 0x0000000000000000
     .quad 0x00CF9A000000FFFF  // 32-bit code
     .quad 0x00CF92000000FFFF  // 32-bit data
@@ -362,15 +386,13 @@ ap_gdt_16:
     .quad 0x00AF92000000FFFF  // 64-bit data
 ap_gdt_end:
 
-ap_gdtr_16:
-    .word ap_gdt_end - ap_gdt_16 - 1
-    .long ap_gdt_16 - _ap_trampoline_start + 0x8000
-
-ap_gdtr_64:
-    .word ap_gdt_end - ap_gdt_16 - 1
-    .quad ap_gdt_16 - _ap_trampoline_start + 0x8000
+ap_gdtr:
+    .word ap_gdt_end - ap_gdt - 1
+.globl _ap_fix_gdt
+_ap_fix_gdt:
+    .long ap_gdt - _ap_trampoline_start
 
 .balign 64
 .globl _ap_trampoline_end
 _ap_trampoline_end:
-"#, options(att_syntax));
+"#, params = const PARAM_OFFSET, options(att_syntax));

@@ -12,7 +12,7 @@
 # What the machine needs is in `system/`.
 [package]
 name    = "miku-apps"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 
 [workspace]

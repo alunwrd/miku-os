@@ -104,27 +104,13 @@ fn flush(ptr: *const u8, len: usize) {
     crate::mm::dma::flush_lines(ptr, len);
 }
 
-/// True if [base, base+len) lies wholly inside one usable memory-map entry
-fn is_usable_ram(base: u64, len: u64) -> bool {
-    let Some(mmap) = grub::memory_map() else { return false };
-    for e in mmap {
-        if e.mem_type() == grub::MMAP_USABLE
-            && base >= e.base()
-            && base + len <= e.base() + e.length()
-        {
-            return true;
-        }
-    }
-    false
-}
-
 /// Pick a physical base clear of the kernel image and every GRUB module.
 /// Returns None if no candidate in the probe range is usable RAM
 fn choose_base(kernel_end: u64) -> Option<u64> {
     let floor = kernel_end.max(grub::modules_end()).max(PREFERRED_BASE);
     let mut base = (floor + PROBE_STEP - 1) & !(PROBE_STEP - 1);
     for _ in 0..PROBE_TRIES {
-        if is_usable_ram(base, REGION_SIZE) {
+        if grub::is_usable_ram(base, REGION_SIZE) {
             return Some(base);
         }
         base += PROBE_STEP;

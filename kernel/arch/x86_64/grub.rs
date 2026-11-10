@@ -63,6 +63,8 @@ const TAG_FB:     u32 = 8;
 const TAG_END:    u32 = 0;
 const TAG_MODULE: u32 = 3;
 const TAG_ELF_SECTIONS: u32 = 9;
+const TAG_ACPI_OLD: u32 = 14;
+const TAG_ACPI_NEW: u32 = 15;
 // EFI tags exist only when GRUB itself ran as an EFI application, i.e. the
 // firmware POSTed in UEFI mode (GPU option ROM executed as a GOP driver).
 // All of them are absent on a CSM/legacy boot
@@ -80,6 +82,19 @@ pub fn booted_via_uefi() -> bool {
         || find_tag(TAG_EFI_MMAP).is_some()
         || find_tag(TAG_EFI64_IH).is_some()
         || find_tag(TAG_EFI32_IH).is_some()
+}
+
+/// Physical address of the RSDP copy in the bootloader's tags, the ACPI 2.0
+/// form first. UEFI firmware keeps the original outside the BIOS area
+pub fn acpi_rsdp() -> Option<u64> {
+    for tag in [TAG_ACPI_NEW, TAG_ACPI_OLD] {
+        if let Some(ptr) = find_tag(tag) {
+            if unsafe { read_tag_size(ptr) } >= 8 + 20 {
+                return Some(ptr + 8 - HHDM_OFFSET);
+            }
+        }
+    }
+    None
 }
 
 pub const MMAP_USABLE:   u32 = 1;
@@ -463,6 +478,28 @@ pub fn framebuffer() -> Option<FbInfo> {
         return None;
     }
     Some(FbInfo { addr, pitch, width, height, bpp })
+}
+
+/// True if [base, base+len) lies inside one usable entry of the memory map
+pub fn is_usable_ram(base: u64, len: u64) -> bool {
+    let Some(mmap) = memory_map() else { return false };
+    for e in mmap {
+        if e.mem_type() == MMAP_USABLE
+            && base >= e.base()
+            && base + len <= e.base() + e.length()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if [base, base+len) touches the multiboot2 information or a module
+pub fn holds_boot_data(base: u64, len: u64) -> bool {
+    let end = base + len;
+    let mut hit = mb2_span().is_some_and(|(b, l)| base < b + l && b < end);
+    for_each_module(&mut |start, stop| hit |= base < stop && start < end);
+    hit
 }
 
 pub fn mmap_type_str(t: u32) -> &'static str {

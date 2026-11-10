@@ -7,7 +7,7 @@
 #     cd lib/crypto && cargo test
 [package]
 name    = "mikucrypto"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 
 [lib]

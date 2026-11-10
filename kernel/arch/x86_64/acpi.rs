@@ -2,7 +2,7 @@
 // onto PCIe extended config space
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 use crate::arch::x86_64::grub;
@@ -144,27 +144,29 @@ pub fn is_ready() -> bool {
 
 // Scan physical memory region for RSDP signature on 16-byte boundaries
 unsafe fn scan_for_rsdp(phys_start: u64, phys_end: u64) -> Option<u64> {
-    let hhdm = grub::hhdm();
     let mut p = phys_start & !0xF;
     while p + 20 <= phys_end {
-        let virt = (p + hhdm) as *const u8;
-        let sig = core::slice::from_raw_parts(virt, 8);
-        if sig == b"RSD PTR " {
-            // verify checksum v1
-            let mut sum: u8 = 0;
-            for i in 0..20 {
-                sum = sum.wrapping_add(*virt.add(i));
-            }
-            if sum == 0 {
-                return Some(p);
-            }
+        if rsdp_at(p) {
+            return Some(p);
         }
         p += 16;
     }
     None
 }
 
+/// True if a version 1 RSDP with a good checksum starts at `phys`
+unsafe fn rsdp_at(phys: u64) -> bool {
+    let virt = (phys + grub::hhdm()) as *const u8;
+    core::slice::from_raw_parts(virt, 8) == b"RSD PTR " && checksum(virt, 20)
+}
+
 unsafe fn find_rsdp() -> Option<u64> {
+    // The bootloader's copy first: on a UEFI boot it is the only one
+    if let Some(phys) = grub::acpi_rsdp() {
+        if rsdp_at(phys) {
+            return Some(phys);
+        }
+    }
     let hhdm = grub::hhdm();
     // EBDA pointer is at 0x40E (two bytes, shifted left by 4)
     let ebda_ptr_virt = (0x40E + hhdm) as *const u16;
@@ -178,6 +180,22 @@ unsafe fn find_rsdp() -> Option<u64> {
     scan_for_rsdp(0xE0000, 0x100000)
 }
 
+/// 0 until looked for, `NO_RSDP` when the machine has none
+static RSDP: AtomicU64 = AtomicU64::new(0);
+const NO_RSDP: u64 = u64::MAX;
+
+/// Physical address of the RSDP
+pub fn rsdp() -> Option<u64> {
+    match RSDP.load(Ordering::Relaxed) {
+        0 => {}
+        NO_RSDP => return None,
+        phys => return Some(phys),
+    }
+    let found = unsafe { find_rsdp() };
+    RSDP.store(found.unwrap_or(NO_RSDP), Ordering::Relaxed);
+    found
+}
+
 unsafe fn checksum(ptr: *const u8, len: usize) -> bool {
     let mut sum: u8 = 0;
     for i in 0..len {
@@ -186,69 +204,89 @@ unsafe fn checksum(ptr: *const u8, len: usize) -> bool {
     sum == 0
 }
 
-pub fn init() -> Result<(), &'static str> {
-    let hhdm = grub::hhdm();
-    let rsdp_phys = unsafe { find_rsdp() }.ok_or("RSDP not found")?;
-    crate::serial_println!("[acpi] rsdp @ {:#x}", rsdp_phys);
+/// The root table: XSDT when the RSDP has one, RSDT otherwise
+struct Root {
+    phys:    u64,
+    is_xsdt: bool,
+    count:   usize,
+}
 
-    let rsdp10 = unsafe { &*((rsdp_phys + hhdm) as *const Rsdp10) };
-    let revision = rsdp10.revision;
-    crate::serial_println!("[acpi] rsdp revision={}", revision);
+impl Root {
+    fn find() -> Result<Self, &'static str> {
+        let hhdm = grub::hhdm();
+        let rsdp_phys = rsdp().ok_or("RSDP not found")?;
+        let rsdp10 = unsafe { &*((rsdp_phys + hhdm) as *const Rsdp10) };
 
-    // Prefer XSDT (ACPI 2.0+) if available
-    let (sdt_phys, is_xsdt) = if revision >= 2 {
-        let rsdp20 = unsafe { &*((rsdp_phys + hhdm) as *const Rsdp20) };
-        let len = unsafe { core::ptr::addr_of!(rsdp20.length).read_unaligned() };
-        if len >= 36 {
-            unsafe {
-                if !checksum((rsdp_phys + hhdm) as *const u8, len as usize) {
-                    return Err("RSDP v2 bad checksum");
+        // Prefer XSDT (ACPI 2.0+) if available
+        let (phys, is_xsdt) = if rsdp10.revision >= 2 {
+            let rsdp20 = unsafe { &*((rsdp_phys + hhdm) as *const Rsdp20) };
+            let len = unsafe { core::ptr::addr_of!(rsdp20.length).read_unaligned() };
+            if len >= 36 {
+                unsafe {
+                    if !checksum((rsdp_phys + hhdm) as *const u8, len as usize) {
+                        return Err("RSDP v2 bad checksum");
+                    }
                 }
+                let xsdt = unsafe { core::ptr::addr_of!(rsdp20.xsdt_addr).read_unaligned() };
+                (xsdt, true)
+            } else {
+                (rsdp10.rsdt_addr as u64, false)
             }
-            let xsdt = unsafe { core::ptr::addr_of!(rsdp20.xsdt_addr).read_unaligned() };
-            (xsdt, true)
         } else {
             (rsdp10.rsdt_addr as u64, false)
-        }
-    } else {
-        (rsdp10.rsdt_addr as u64, false)
-    };
-
-    crate::serial_println!("[acpi] {} @ {:#x}", if is_xsdt { "xsdt" } else { "rsdt" }, sdt_phys);
-
-    let sdt_hdr = unsafe { &*((sdt_phys + hhdm) as *const SdtHeader) };
-    let total_len = unsafe { core::ptr::addr_of!(sdt_hdr.length).read_unaligned() } as usize;
-    if total_len < 36 {
-        return Err("SDT too short");
-    }
-    unsafe {
-        if !checksum((sdt_phys + hhdm) as *const u8, total_len) {
-            return Err("SDT bad checksum");
-        }
-    }
-
-    let entry_size = if is_xsdt { 8usize } else { 4usize };
-    let entry_count = (total_len - 36) / entry_size;
-    let entries_base = sdt_phys + hhdm + 36;
-
-    let mut madt_phys: u64 = 0;
-    let mut mcfg_phys: u64 = 0;
-
-    for i in 0..entry_count {
-        let addr = entries_base + (i * entry_size) as u64;
-        let ent_phys = if is_xsdt {
-            unsafe { (addr as *const u64).read_unaligned() }
-        } else {
-            unsafe { (addr as *const u32).read_unaligned() as u64 }
         };
-        let hdr = unsafe { &*((ent_phys + hhdm) as *const SdtHeader) };
-        let sig = hdr.signature;
-        if &sig == b"APIC" && madt_phys == 0 {
-            madt_phys = ent_phys;
-        } else if &sig == b"MCFG" && mcfg_phys == 0 {
-            mcfg_phys = ent_phys;
+
+        let sdt_hdr = unsafe { &*((phys + hhdm) as *const SdtHeader) };
+        let total_len = unsafe { core::ptr::addr_of!(sdt_hdr.length).read_unaligned() } as usize;
+        if total_len < 36 {
+            return Err("SDT too short");
+        }
+        unsafe {
+            if !checksum((phys + hhdm) as *const u8, total_len) {
+                return Err("SDT bad checksum");
+            }
+        }
+        let entry_size = if is_xsdt { 8 } else { 4 };
+        Ok(Self { phys, is_xsdt, count: (total_len - 36) / entry_size })
+    }
+
+    /// Physical address of table `i`
+    fn table(&self, i: usize) -> u64 {
+        let base = self.phys + grub::hhdm() + 36;
+        unsafe {
+            if self.is_xsdt {
+                ((base + i as u64 * 8) as *const u64).read_unaligned()
+            } else {
+                ((base + i as u64 * 4) as *const u32).read_unaligned() as u64
+            }
         }
     }
+
+    fn find_table(&self, sig: &[u8; 4]) -> Option<u64> {
+        let hhdm = grub::hhdm();
+        (0..self.count).map(|i| self.table(i)).find(|&phys| {
+            let hdr = unsafe { &*((phys + hhdm) as *const SdtHeader) };
+            hdr.signature == *sig
+        })
+    }
+}
+
+/// Physical address of the first table with this signature
+pub fn find_table(sig: &[u8; 4]) -> Option<u64> {
+    Root::find().ok()?.find_table(sig)
+}
+
+pub fn init() -> Result<(), &'static str> {
+    let root = Root::find()?;
+    if let Some(rsdp_phys) = rsdp() {
+        let rsdp10 = unsafe { &*((rsdp_phys + grub::hhdm()) as *const Rsdp10) };
+        crate::serial_println!("[acpi] rsdp @ {:#x}", rsdp_phys);
+        crate::serial_println!("[acpi] rsdp revision={}", rsdp10.revision);
+    }
+    crate::serial_println!("[acpi] {} @ {:#x}", if root.is_xsdt { "xsdt" } else { "rsdt" }, root.phys);
+
+    let madt_phys = root.find_table(b"APIC").unwrap_or(0);
+    let mcfg_phys = root.find_table(b"MCFG").unwrap_or(0);
 
     // Not an error to lack: without MCFG a machine has only the legacy 256
     // bytes of config space per function, and callers of the extended space

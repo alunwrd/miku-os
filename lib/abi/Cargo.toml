@@ -7,7 +7,7 @@
 # to each other through `super::`.
 [package]
 name    = "miku-abi"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 
 [lib]

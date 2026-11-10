@@ -128,10 +128,8 @@ fn kernel_main() -> ! {
         kend_aligned / 1024 / 1024
     );
 
-    pmm::reserve_region(0x0, 0x6000);
-    // Reserve AP trampoline page (used once by smp::start_aps, never returned
-    // to pool)
-    pmm::reserve_region(0x8000, 0x9000);
+    // Everything below the end of the image, the first megabyte with it:
+    // `smp::start_aps` takes its trampoline page from there
     pmm::reserve_region(grub::KERNEL_PHYS, kend_aligned);
 
     // What the bootloader left in memory
@@ -676,6 +674,12 @@ static FB_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 /// `init_framebuffer` runs earlier, so a failure in between has a screen to be
 /// reported on
 fn remap_framebuffer_wc() {
+    if FB_LATE.load(core::sync::atomic::Ordering::Relaxed) {
+        if let Some(fb_info) = grub::framebuffer() {
+            mm::vmm::map_mmio_wc(fb_info.addr, fb_info.pitch as u64 * fb_info.height as u64);
+            console_on_framebuffer(fb_info);
+        }
+    }
     let phys = FB_SPAN.load(core::sync::atomic::Ordering::Relaxed);
     let bytes = FB_BYTES.load(core::sync::atomic::Ordering::Relaxed);
     if phys == 0 || bytes == 0 {
@@ -711,6 +715,25 @@ fn init_framebuffer() {
         serial_println!("[kern] warn: invalid framebuffer params");
         return;
     }
+    if !arch::x86_64::boot_entry::direct_mapped(
+        fb_info.addr,
+        fb_info.pitch as u64 * fb_info.height as u64,
+    ) {
+        FB_LATE.store(true, core::sync::atomic::Ordering::Relaxed);
+        serial_println!(
+            "[kern] framebuffer at {:#x} is above the boot direct map; the console waits for the frame allocator",
+            fb_info.addr
+        );
+        return;
+    }
+    console_on_framebuffer(fb_info);
+}
+
+/// Set when the framebuffer lies above the entry stub's direct map: mapping it
+/// takes page-table frames, so `remap_framebuffer_wc` builds the console
+static FB_LATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn console_on_framebuffer(fb_info: grub::FbInfo) {
     // Before the console is built: ask the monitor what it can do and set its
     // best mode, so the console is created at the running size. On a machine
     // this cannot program (every real GPU), what comes back is what firmware

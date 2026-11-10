@@ -276,71 +276,15 @@ fn dump_mmio_serial(virt: u64, len: u64) {
 }
 
 #[repr(C, packed)]
-struct Rsdp10 {
-    sig: [u8; 8], cksum: u8, oem: [u8; 6], rev: u8, rsdt: u32,
-}
-#[repr(C, packed)]
-struct Rsdp20 {
-    v10: Rsdp10, length: u32, xsdt: u64, ext_cksum: u8, rsv: [u8; 3],
-}
-#[repr(C, packed)]
 struct SdtHdr {
     sig: [u8; 4], length: u32, rev: u8, cksum: u8, oem: [u8; 6],
     table_id: [u8; 8], oem_rev: u32, creator: u32, creator_rev: u32,
 }
 
-unsafe fn find_rsdp() -> Option<u64> {
-    let hhdm = grub::hhdm();
-    let ebda_seg = unsafe { *((0x40E + hhdm) as *const u16) };
-    let ebda_phys = (ebda_seg as u64) << 4;
-    let ranges: [(u64, u64); 2] = [(ebda_phys, ebda_phys + 1024), (0xE0000, 0x100000)];
-    for (s, e) in ranges {
-        let mut a = s & !0xF;
-        while a + 20 < e {
-            let p = (a + hhdm) as *const u8;
-            let sig = unsafe { core::slice::from_raw_parts(p, 8) };
-            if sig == b"RSD PTR " { return Some(a); }
-            a += 16;
-        }
-    }
-    None
-}
-
-fn find_table(sig: &[u8; 4]) -> Option<u64> {
-    let hhdm = grub::hhdm();
-    let rsdp_phys = unsafe { find_rsdp() }?;
-    let rsdp10 = unsafe { &*((rsdp_phys + hhdm) as *const Rsdp10) };
-    let revision = rsdp10.rev;
-    let (sdt_phys, is_xsdt) = if revision >= 2 {
-        let r2 = unsafe { &*((rsdp_phys + hhdm) as *const Rsdp20) };
-        let xsdt = unsafe { core::ptr::addr_of!(r2.xsdt).read_unaligned() };
-        if xsdt != 0 { (xsdt, true) } else { (rsdp10.rsdt as u64, false) }
-    } else {
-        (rsdp10.rsdt as u64, false)
-    };
-    let hdr = unsafe { &*((sdt_phys + hhdm) as *const SdtHdr) };
-    let total = unsafe { core::ptr::addr_of!(hdr.length).read_unaligned() } as usize;
-    if total < 36 { return None; }
-    let esz = if is_xsdt { 8 } else { 4 };
-    let count = (total - 36) / esz;
-    let base = sdt_phys + hhdm + 36;
-    for i in 0..count {
-        let a = base + (i * esz) as u64;
-        let p = if is_xsdt {
-            unsafe { (a as *const u64).read_unaligned() }
-        } else {
-            unsafe { (a as *const u32).read_unaligned() as u64 }
-        };
-        let h = unsafe { &*((p + hhdm) as *const SdtHdr) };
-        if &h.sig == sig { return Some(p); }
-    }
-    None
-}
-
 fn dump_acpi() {
     let hhdm = grub::hhdm();
 
-    if let Some(madt_phys) = find_table(b"APIC") {
+    if let Some(madt_phys) = crate::arch::x86_64::acpi::find_table(b"APIC") {
         let hdr = unsafe { &*((madt_phys + hhdm) as *const SdtHdr) };
         let total = unsafe { core::ptr::addr_of!(hdr.length).read_unaligned() } as u64;
         let mut off = 36u64 + 8;
@@ -388,7 +332,7 @@ fn dump_acpi() {
         cprintln!(255, 120, 120, "[probe.madt] not found");
     }
 
-    if let Some(fadt_phys) = find_table(b"FACP") {
+    if let Some(fadt_phys) = crate::arch::x86_64::acpi::find_table(b"FACP") {
         let v = fadt_phys + hhdm;
         unsafe {
             let smi_cmd: u32  = core::ptr::read_unaligned((v + 48) as *const u32);

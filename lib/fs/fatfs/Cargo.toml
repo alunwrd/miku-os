@@ -1,0 +1,25 @@
+# fatfs: FAT32, laid down and filled once
+#
+# What an EFI system partition needs: a FAT32 volume, directories, files with
+# 8.3 names. Firmware and bootloaders read it; nothing here does.
+#
+#   `layout`  geometry and the sectors describing it, no I/O
+#   `name`    8.3 names
+#   `volume`  format, mkdir, write_file, finish, over `fshost::BlockHost`
+[package]
+name    = "fatfs"
+version = "0.1.0"
+edition = "2021"
+
+# Its own workspace, as `lib/fs/extfs` explains
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fshost    = { path = "../fshost" }
+miku-base = { path = "../../base" }
+
+[profile.release]
+opt-level = 2

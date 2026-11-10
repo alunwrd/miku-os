@@ -5,13 +5,13 @@
 # against the one built from source, and the link fails on a duplicate `sized`
 # lang item. It is invoked as `cd builder && cargo run`
 members  = ["lib/runtime/ld-miku", "lib/gfx/mayland", "lib/sdk/miku", "lib/runtime/vdso"]
-exclude  = ["builder", "lib/abi", "lib/base", "lib/buildgen", "lib/crypto", "lib/net", "lib/fs/extfs", "lib/fs/fshost", "lib/fs/btrfs", "lib/admin/mikuauth", "lib/admin/mikupkg", "lib/runtime/libmiku/hosttest", "kernel/mm/heap/hosttest"]
+exclude  = ["builder", "lib/abi", "lib/base", "lib/buildgen", "lib/crypto", "lib/net", "lib/fs/extfs", "lib/fs/fshost", "lib/fs/btrfs", "lib/fs/fatfs", "lib/admin/mikuauth", "lib/admin/mikupkg", "lib/runtime/libmiku/hosttest", "kernel/mm/heap/hosttest"]
 resolver = "2"
 
 [package]
 name        = "miku-os-release"
 license = "Apache-2.0"
-version     = "1.0.1"
+version     = "1.0.2"
 edition     = "2021"
 authors     = ["alunwrd"]
 description = "Experimental OS in Rust"
@@ -50,6 +50,8 @@ extfs                = { path = "lib/fs/extfs" }
 fshost               = { path = "lib/fs/fshost" }
 # btrfs, read-only (dev/fs-architecture.md)
 btrfs                = { path = "lib/fs/btrfs" }
+# FAT32, written only: the EFI system partition `install` makes
+fatfs                = { path = "lib/fs/fatfs" }
 volatile              = "0.2.6"
 spin                  = "0.9.8"
 x86_64                = "0.14.2"
